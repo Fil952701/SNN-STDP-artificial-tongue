@@ -94,19 +94,6 @@ Potential applications extend to neuromorphic AI, robotics, and bio-inspired sen
 
 ---
 
-## ⚡ Installation
-
-You can set up the environment either with **pip** or **conda**:
-
-[![Pip](https://img.shields.io/badge/install%20with-pip-blue?logo=python)](https://pip.pypa.io/)
-[![Conda](https://img.shields.io/badge/install%20with-conda-green?logo=anaconda)](https://docs.conda.io/)
-
-### Option 1 – pip
-```bash
-pip install -r requirements.txt
-
----
-
 ## 👤 Author
 
 **Filippo Matteini** – Pianist, AI Engineer, and Neuromorphic Computing Researcher  
@@ -123,3 +110,22 @@ This project is released under the **MIT License**.
 Feel free to use, modify, and build upon this work with proper attribution.  
 
 ---
+
+## ⚡ Installation
+
+You can set up the environment either with **pip** or **conda**:
+
+[![Pip](https://img.shields.io/badge/install%20with-pip-blue?logo=python)](https://pip.pypa.io/)
+[![Conda](https://img.shields.io/badge/install%20with-conda-green?logo=anaconda)](https://docs.conda.io/)
+
+### Option 1 – pip
+```bash
+pip install -r requirements.txt
+
+### Option 2 – conda
+If you prefer using conda, you can create the environment directly from the provided `environment.yml`:
+
+```bash
+conda env create -f environment.yml
+conda activate artificial-tongue-snn
+
