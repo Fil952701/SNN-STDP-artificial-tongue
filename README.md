@@ -96,15 +96,20 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
+---
 
 ## 📚 References
 Gerstner, W., Kistler, W. M., Naud, R., & Paninski, L. (2014). Neuronal Dynamics: From Single Neurons to Networks and Models of Cognition.
 Brian2 Documentation: https://brian2.readthedocs.io
 
+---
+
 👤 Author
 Filippo Matteini
 AI Engineer & Neuromorphic Computing Researcher
-🌐 GitHub
-🔗 LinkedIn
-🎹 Dexteris YouTube
+🌐 GitHub: https://github.com/Fil952701
+🔗 LinkedIn: https://www.linkedin.com/in/filippo-matteini-29554a355/
+🎹 Dexteris: https://www.youtube.com/@dexteris27
+
+---
 
