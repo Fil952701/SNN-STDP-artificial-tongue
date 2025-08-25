@@ -129,19 +129,28 @@ da_gain              = 1.0              # how much DA expand the positive reinfo
 ht_gain              = 1.0              # how much 5-HT expand the punishment or how much it stops LTP
 # aversive state on the entire circuit
 k_theta_HT           = 2.0              # mV bias threshold per 5-HT unit
-k_inh_HT             = 0.6              # WTA scaling per 5-HT unit
+k_inh_HT             = 0.5              # WTA scaling per 5-HT unit
 # aversive stochastic events
-p_aversion           = {6: 0.35}        # for example -> 35% of times SPICY is not good for the tongue
+p_aversion           = {6: 0.25}        # for example -> 25% of times SPICY is not good for the tongue
 da_pulse_reward      = 1.0              # burst DA if classification is correct -> reward
 ht_pulse_aversion    = 1.0              # burst 5-HT when imminent event is aversive
 ht_pulse_fp          = 0.5              # burst 5-HT extra if there are a lot of strong FP
 # Noradrenaline (NE) — arousal/attention
-tau_NE        = 500 * b.ms   # fast decay
-k_ex_NE       = 0.5          # reward scaling
-k_inh_NE      = 0.2          # shrinks WTA for SNA
-k_noise_NE    = 0.5          # low environment noise
-ne_gain_r     = 0.3          # scaling reinforcement r entity
-ne_pulse_amb  = 0.8          # burst on FP
+tau_NE               = 500 * b.ms       # fast decay
+k_ex_NE              = 0.5              # reward scaling
+k_inh_NE             = 0.2              # shrinks WTA for SNA
+k_noise_NE           = 0.5              # low environment noise
+ne_gain_r            = 0.3              # scaling reinforcement r entity
+ne_pulse_amb         = 0.8              # burst on FP
+# Histamine (HI) — novelty/exploration (slower than NE)
+tau_HI               = 1500 * b.ms
+k_ex_HI              = 0.30             # gain on synapses
+k_inh_HI             = -0.15            # HI decrease WTA
+k_theta_HI           = -1.0             # mV threshold bias per HI unit
+k_noise_HI           = 0.30             # more HI ⇒ more environment noise
+hi_gain_r            = 0.15             # reinforcement scaling with HI
+hi_pulse_nov         = 0.8              # burst on ambiguity
+hi_pulse_miss        = 1.0              # burst on error
 
 # Intrinsic homeostasis adapative threshold parameters
 target_rate          = 50 * b.Hz        # reference firing per neuron (tu 40-80 Hz rule)
@@ -174,6 +183,9 @@ col_norm_temp        = 1.0              # temperature softmax (if mode="softmax"
 col_norm_target      = None             # if None, calculating the target at the beginning of the trial
 diag_bias_gamma      = 1.10             # >1.0 = light bias to the diagonal weight before normalization
 col_floor            = 0.0              # floor (0 or light epsilon) before norm
+col_allow_upscale    = True             # light up-scaling
+col_upscale_slack    = 0.90             # if L1 < 90% target → boost
+col_scale_max        = 1.2              # max factor per step
 
 # STDP parameters
 tau                  = 30 * b.ms        # STDP time constant
@@ -198,7 +210,7 @@ verbose_rewards      = False            # dopamine reward logs
 test_emotion_mode    = "active"
 
 # Connectivity switch: "diagonal" | "dense"
-connectivity_mode = "dense"  # change to "dense" to connect all synapses in fully connected way
+connectivity_mode = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
 
 # helper to index test tastes without noise in the stimuli list
 def make_mix(ids, amp=250):
@@ -333,20 +345,22 @@ inhibitory_S.inh_scale = 1.0
 w_mon = b.StateMonitor(S, 'w', record=True)
 weight_monitors.append((w_mon, S))
 
-# DA, 5-HT, NE neuromodulators that decay over time
+# DA, 5-HT, NE, HI neuromodulators that decay over time
 mod = b.NeuronGroup(
     1,
     model='''
         dDA/dt = -DA/tau_DA : 1
         dHT/dt = -HT/tau_HT : 1
         dNE/dt = -NE/tau_NE : 1
+        dHI/dt = -HI/tau_HI : 1
     ''',
     method='exact',
-    namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE}
+    namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE, 'tau_HI' : tau_HI}
 )
 mod.DA = 0.0
 mod.HT = 0.0
 mod.NE = 0.0
+mod.HI = 0.0
 
 # 8. Building the SNN network and adding levels
 net = b.Network(
@@ -365,7 +379,7 @@ net.add(w_mon)
 theta_mon = b.StateMonitor(taste_neurons, 'theta', record=True)
 s_mon = b.StateMonitor(taste_neurons, 's', record=True)
 net.add(theta_mon, s_mon)
-mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE'], record=True)
+mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE', 'HI'], record=True)
 net.add(mod_mon)
 
 # 9. Prepare stimuli list
@@ -454,22 +468,26 @@ for input_rates, true_ids, label in training_stimuli:
     if aversive_now:
         mod.HT[:] += ht_pulse_aversion # increase caution before imminent training
 
-    # after the increasing, neuromodulators have to decay
+    # after the increasing, neuromodulators must decay
     DA_now = float(mod.DA[0])
     HT_now = float(mod.HT[0])
     NE_now = float(mod.NE[0])
+    HI_now = float(mod.HI[0])
 
-    # reward and WTA addicted to NE/5-HT
-    S.ex_scale = 1.0 + k_ex_NE * NE_now
+    # reward and WTA addicted to NE/5-HT/HI
+    S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI * HI_now)
     # whereas WTA more aggressive when 5-HT is higher, because aversion and fear must to influence the behiaviour during the train over and over
-    inhibitory_S.inh_scale = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now
+    _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI * HI_now
+    inhibitory_S.inh_scale = max(0.3, _inh) # clamp to avoid errors
 
-    # environment noise reduction with NE (clamp ≥0.05 Hz)
+    # environment noise reduction with NE and HI, HT (clamp ≥0.05 Hz)
     ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-    pg_noise.rates = baseline_hz * ne_noise_scale * np.ones(num_tastes) * b.Hz
+    hi_noise_scale = (1.0 + k_noise_HI * HI_now)
+    pg_noise.rates = baseline_hz * ne_noise_scale * hi_noise_scale * np.ones(num_tastes) * b.Hz
 
     # state gating guided by 5-HT because threshold has to be bigger if HT is higher -> behaviour of caution
-    taste_neurons.theta_bias[:] = (k_theta_HT * HT_now) * b.mV
+    # 5-HT increase bias | HI decrease bias
+    taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI * HI_now) * b.mV
 
     # 1) training stimulus with masking on no target neurons
     masked = np.zeros_like(input_rates)
@@ -552,6 +570,8 @@ for input_rates, true_ids, label in training_stimuli:
     ambiguous = (second > 0 and top/(second + 1e-9) < 1.3) or (len(winners) > 2)
     if ambiguous:
         mod.NE[:] += ne_pulse_amb
+        mod.HI[:] += hi_pulse_nov
+        inhibitory_S.inh_scale[:] = np.maximum(0.3, inhibitory_S.inh_scale[:] * 0.85)
 
     # total scores printing
     order = np.argsort(scores)
@@ -572,8 +592,9 @@ for input_rates, true_ids, label in training_stimuli:
             #r = alpha
             # reward amplified by DA dopamine and inhibited by 5-HT serotonine
             r = (alpha * (1.0 + da_gain * DA_now)) / (1.0 + ht_gain * HT_now)
-            # multiply for NE factor
+            # multiply for NE and HI factor
             r *= (1.0 + ne_gain_r * NE_now)
+            r *= (1.0 + hi_gain_r * HI_now)
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -615,6 +636,8 @@ for input_rates, true_ids, label in training_stimuli:
     # global reward if the prediction is correct
     if set(winners) == set(true_ids):
         mod.DA[:] += da_pulse_reward
+    else:
+        mod.HI[:] += hi_pulse_miss
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
     has_strong_fp = any((i not in true_ids) and (float(diff_counts[i]) >= fp_gate[i])
@@ -622,42 +645,49 @@ for input_rates, true_ids, label in training_stimuli:
     if has_strong_fp:
         mod.HT[:] += ht_pulse_fp
         mod.NE[:] += 0.5 * ne_pulse_amb # arousal on strong FP
+        mod.HI[:] += 0.3 * hi_pulse_nov
 
     # safe clip on theta for homeostasis
     theta_min, theta_max = -12*b.mV, 12*b.mV
     taste_neurons.theta[:] = np.clip((taste_neurons.theta/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
 
-    # Column normalization (incoming synaptic scaling) — DOWNSCALE-ONLY
+    # Column normalization (incoming synaptic scaling)
     if use_col_norm and connectivity_mode == "dense" and (step % col_norm_every == 0):
-       w_all = np.asarray(S.w[:], dtype=float)
-       i_all = np.asarray(S.i[:], dtype=int)
-       j_all = np.asarray(S.j[:], dtype=int)
+        w_all = np.asarray(S.w[:], dtype=float)
+        i_all = np.asarray(S.i[:], dtype=int)
+        j_all = np.asarray(S.j[:], dtype=int)
 
-       for jo in range(num_tastes - 1):  # no UNKNOWN
-          idx = np.where(j_all == jo)[0]
-          if idx.size == 0:
-             continue
-          col = w_all[idx]
+        for jo in range(num_tastes - 1):  # no UNKNOWN
+            idx = np.where(j_all == jo)[0]
+            if idx.size == 0:
+                continue
 
-          if col_floor > 0.0:
-             col = np.maximum(col, col_floor)
+            col = w_all[idx]
 
-          # light bias to the diagonal before normalization
-          if diag_bias_gamma != 1.0:
-             dloc = np.where(i_all[idx] == jo)[0]
-             if dloc.size:
-                col[dloc[0]] *= float(diag_bias_gamma)
+            if col_floor > 0.0:
+                col = np.maximum(col, col_floor)
 
-          L1 = float(np.sum(col))
-          target = col_norm_target if col_norm_target is not None else L1
+            # light bias to the diagonal before normalization
+            if diag_bias_gamma != 1.0:
+                dloc = np.where(i_all[idx] == jo)[0]
+                if dloc.size:
+                    col[dloc[0]] *= float(diag_bias_gamma)
 
-         # L1 if the target is broken
-          if L1 > target and L1 > 1e-12:
-             scale = target / L1
-             col = np.clip(col * scale, 0.0, 1.0)
-             w_all[idx] = col
+            L1 = float(np.sum(col))
+            target = col_norm_target if col_norm_target is not None else L1
 
-       S.w[:] = w_all
+            if L1 > target and L1 > 1e-12:
+                # downscale
+                scale = target / L1
+                col = np.clip(col * scale, 0.0, 1.0)
+                w_all[idx] = col
+            elif col_allow_upscale and (L1 < col_upscale_slack * target) and (L1 > 1e-12):
+                # little up-scale to the target
+                scale = min(col_scale_max, (target / L1))
+                col = np.clip(col * scale, 0.0, 1.0)
+                w_all[idx] = col
+
+        S.w[:] = w_all
 
     # light weight decay for all the weights to avoid constant saturation to w=1 -> TO REMOVE if homeostasis (in this problem HOMEOSTASIS is biologically better)
     '''if weight_decay > 0:
@@ -732,6 +762,13 @@ net.add(test_w_mon)
 
 # 11. Freezing STDP, homeostatis and input conductance
 print("Freezing STDP for TEST phase…")
+# Neuromodulator parameters in test
+k_inh_HI_test   = -0.08
+k_inh_HT_test = 0.4
+k_theta_HI_test = -0.5
+k_ex_HI_test    = 0.15
+k_noise_HI_test = 0.15
+ht_pulse_aversion = 0.5
 S.pre.code  = 'ge_post += w * g_step_exc * ex_scale'
 S.post.code = ''
 taste_neurons.v[:] = EL
@@ -759,23 +796,27 @@ if test_emotion_mode == "off":
     # neutral test
     mod.DA[:] = 0.0
     mod.HT[:] = 0.0
-    mod.NE[:] = 0.0        
+    mod.NE[:] = 0.0
+    mod.HI[:] = 0.0
     taste_neurons.theta_bias[:] = 0 * b.mV
     inhibitory_S.inh_scale = 1.0
-    S.ex_scale = 1.0   # gain reset
+    S.ex_scale = 1.0  # gain reset
     pg_noise.rates = baseline_hz * np.ones(num_tastes) * b.Hz
 else:
     # test with neuromodulators
     HT_now = float(mod.HT[0])
     NE_now = float(mod.NE[0])
-    # threshold gating (5-HT) and noradrenaline gate (NE)
-    taste_neurons.theta_bias[:] = (k_theta_HT * HT_now) * b.mV
-    S.ex_scale = 1.0 + k_ex_NE * NE_now
-    # WTA with 5-HT e NE
-    inhibitory_S.inh_scale = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now
-    # arousal
+    HI_now = float(mod.HI[0])
+    # thresholds (HT ↑ threshold, HI ↓ threshold)
+    taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI_test * HI_now) * b.mV
+    # synaptic gain
+    S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
+    # WTA (HI push the model to explore better ⇒ decrease WTA a bit)
+    _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now
+    inhibitory_S.inh_scale = max(0.3, _inh)
+    # noise (NE decrease, HI increase)
     ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-    pg_noise.rates = baseline_hz * ne_noise_scale * np.ones(num_tastes) * b.Hz
+    pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
 
 # to compute more mixtures
 inhibitory_S.namespace['g_step_inh'] = 0.5 * g_step_inh_local
@@ -783,11 +824,12 @@ inhibitory_S.delay = 0.5*b.ms
 use_rel_gate_in_test = False # in multi-label is better to deactivate
 rel_gate_ratio_test  = 0.10
 rel_cap_abs = 10.0 # absolute value for spikes
+# boosting parameters to push more weak examples
+norm_rel_ratio_test = 0.1 # winners with z_i >= 10% normalized top
+min_norm_abs_spikes = 1 # at least one real spike
+eps_ema = 1e-3 
+
 # 12. TEST PHASE
-# just for the test phase
-k_inh_NE = 0.1
-k_inh_HT = 0.4
-ht_pulse_aversion = 0.5
 print("\nStarting TEST phase...")
 results = []
 test_t0 = time.perf_counter()  # start stopwatch TEST
@@ -826,14 +868,19 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         DA_now = float(mod.DA[0])
         HT_now = float(mod.HT[0])
         NE_now = float(mod.NE[0])
-        taste_neurons.theta_bias[:] = (k_theta_HT * HT_now) * b.mV
-        S.ex_scale = 1.0 + k_ex_NE * NE_now
-        inhibitory_S.inh_scale = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now
+        HI_now = float(mod.HI[0])
+        # threshold
+        taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI_test * HI_now) * b.mV
+        # synaptic gain
+        S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
+        # WTA
+        _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now
+        inhibitory_S.inh_scale = max(0.3, _inh)
+        # noise
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-        pg_noise.rates = baseline_hz * ne_noise_scale * np.ones(num_tastes) * b.Hz
-
+        pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
         if test_emotion_mode == "active":
-            # aversive anticipation: if SPICY, 5-HT become higher before trial
+            # aversive anticipation: if SPICY, increase 5-HT
             aversive_now = any(
                 (cls in p_aversion) and (np.random.rand() < p_aversion[cls])
                 for cls in true_ids
@@ -867,24 +914,31 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     scores[unknown_id] = -1e9
     mx = scores.max()
 
-    # to calculate ambiguity
     sorted_idx = np.argsort(scores)[::-1]
     top = scores[sorted_idx[0]]
     second = scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
 
     if mx < min_spikes_for_known_test:
-       winners = [unknown_id]
+        winners = [unknown_id]
     else:
-       #rel = rel_gate_ratio_test * mx
-       rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
-       if use_rel_gate_in_test:
-          gate = lambda ik: (scores[ik] >= max(thr_per_class[ik], rel))
-       else:
-          gate = lambda ik: (scores[ik] >= thr_per_class[ik]) or (scores[ik] >= rel)
+        # absolute gate for each class
+        base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
 
-       winners = [im for im in range(num_tastes-1) if gate(im)]
-       if not winners and mx >= min_spikes_for_known_test:
-          winners = [int(np.argmax(scores))]
+        # 2) relative global gate
+        rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
+        rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel]
+
+        # 3) normalized gate for weak class
+        pos_expect = np.maximum(ema_pos_m1, eps_ema) # expected per class from trial
+        z = scores[:unknown_id] / pos_expect  # normalized score
+        z_max = float(np.max(z)) if z.size else 0.0
+        norm_winners = [i for i in range(num_tastes-1)
+                    if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes)]
+
+        winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
+
+        if not winners and mx >= min_spikes_for_known_test:
+            winners = [int(np.argmax(scores))]
 
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
@@ -894,6 +948,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     ambiguous = (second > 0 and top / (second + 1e-9) < 1.3) or (len(winners) > 2)
     if test_emotion_mode == "active" and ambiguous:
         mod.NE[:] += ne_pulse_amb
+        mod.HI[:] += 0.5 * hi_pulse_nov
+        inhibitory_S.inh_scale[:] = np.maximum(0.3, inhibitory_S.inh_scale[:] * 0.85) # if a class is weak, is not going to be suppressed in general cases except for ambiguous cases
 
     # Emotional burst in test phase
     if test_emotion_mode == "active":
@@ -905,9 +961,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         )
         if has_strong_fp:
             mod.HT[:] += ht_pulse_fp # prudence or fear increased
+
+        if set(winners) != set(true_ids):  # miss
+            mod.HI[:] += 0.5 * hi_pulse_miss
     
     if test_emotion_mode != "off":
-        msg += f" | DA={float(mod.DA[0]):.2f} HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f}"
+        msg += f" | DA={float(mod.DA[0]):.2f} HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f} HI={float(mod.HI[0]):.2f}"
     # showing the log bar    
     pbar_update(msg)
 
