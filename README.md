@@ -121,6 +121,7 @@ You can set up the environment either with **pip** or **conda**:
 ### Option 1 – pip
 ```bash
 pip install -r requirements.txt
+```
 
 ### Option 2 – conda
 If you prefer using conda, you can create the environment directly from the provided `environment.yml`:
@@ -128,4 +129,4 @@ If you prefer using conda, you can create the environment directly from the prov
 ```bash
 conda env create -f environment.yml
 conda activate artificial-tongue-snn
-
+```
