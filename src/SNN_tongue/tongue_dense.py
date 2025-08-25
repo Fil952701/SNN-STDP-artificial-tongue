@@ -593,6 +593,16 @@ for idx in range(num_tastes-1):
     thr_i = max(float(min_spikes_for_known), thr_gauss, thr_quant, thr_ema)
     thr_per_class[idx] = thr_i
 
+# safety clamp to cap negative threshold with positive example in TP case
+for idx in range(num_tastes-1):
+    pos_mu = float(ema_pos_m1[idx])
+    pos_sd = float(ema_sd(ema_pos_m1[idx], ema_pos_m2[idx]))
+    # safety if numbers are not finite
+    if not np.isfinite(pos_mu): pos_mu = float(min_spikes_for_known)
+    if not np.isfinite(pos_sd): pos_sd = 0.0
+    thr_cap = max(float(min_spikes_for_known), pos_mu - 0.5 * pos_sd)
+    thr_per_class[idx] = min(thr_per_class[idx], thr_cap)
+
 print("Per-class thresholds (hybrid μ+kσ, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class[idx]) for idx in range(num_tastes-1)})
 
