@@ -1,115 +1,112 @@
-# 🧠 Artificial Tongue SNN – Neuromorphic Taste Recognition
+# Artificial Tongue – Spiking Neural Network with STDP, Eligibility Trace and Reinforcement Learning
 
-This project implements a biologically-inspired **Spiking Neural Network (SNN)** designed to simulate an **artificial tongue** capable of recognizing and classifying **multiple tastes**.  
-It integrates **STDP plasticity**, **dopaminergic reinforcement learning**, **multi-sensory encoding**, and **competitive cross-synaptic dynamics** to mimic neural taste processing.
+This repository implements an **Artificial Tongue** using a **Spiking Neural Network (SNN)** in Brian2.  
+The model continuously learns to recognize multiple *tastes* through **STDP (Spike-Timing-Dependent Plasticity)**, **eligibility traces**, **dopaminergic reinforcement learning**, **intrinsic homeostasis**, and **lateral inhibition (Winner-Take-All dynamics)**.  
 
-The simulation is implemented using the **Brian2** library in Python and is designed for both **supervised** and **unsupervised** learning experiments.
-
----
-
-## 🚀 Features
-
-- **Multi-taste SNN architecture**  
-  Simulates recognition of multiple basic tastes:  
-  `SWEET, BITTER, SALTY, SOUR, UMAMI, FATTY, SPICY, UNKNOWN`
-- **STDP Plasticity**  
-  Implements Hebbian-based Spike-Timing-Dependent Plasticity for continuous learning.
-- **Dopaminergic Reinforcement Learning**  
-  Simulates biologically-inspired reward-based learning to strengthen correct taste associations.
-- **Competitive Cross-Synaptic Connections** *(planned)*  
-  Introduces competition between neurons to make a **specialist neuron** emerge for each taste.
-- **Winner-Takes-All (WTA) Inhibition** *(planned)*  
-  Prevents multiple neurons from dominating simultaneously by lateral inhibition.
-- **Poisson-based Sensory Input Encoding**  
-  Encodes taste intensity via probabilistic spiking input streams.
-- **Support for Multi-Taste Food Recognition** *(next step)*  
-  Will classify complex foods composed of multiple combined tastes.
-- **Planned GUI in Pygame**  
-  Interactive interface to visualize spikes, weights, and taste classification in real-time.
-
+It is conceived as a biologically-inspired simulation where each "taste neuron" corresponds to a different basic flavor, and the network evolves online while exposed to both pure and mixed taste stimuli.
 
 ---
 
-## 🔬 Methodology
+## ✨ Main Features
 
-### 1. **Sensory Encoding**
-Each taste stimulus is encoded into spike trains using a **PoissonGroup** in Brian2:
-- High taste intensity → higher spiking rate (e.g., 250 Hz).
-- Allows simulating noisy biological input like real taste buds.
-
-### 2. **Spiking Neural Network Architecture**
-- Input layer: 8 sensory neurons (1 per taste).
-- Hidden layer: Optional for competitive learning experiments.
-- Output layer: 8 taste-class neurons.
-- Dense synaptic connections between input and output neurons.
-
-### 3. **Learning Mechanisms**
-- **STDP**:  
-  Strengthens synapses based on spike timing (Hebbian learning).
-- **Dopamine-based Reinforcement**:  
-  When the network correctly predicts a taste → reward signal boosts associated weights.
-- **Punishment Mechanism** *(planned)*:  
-  Incorrect predictions will trigger synaptic decay to improve future discrimination.
-
-### 4. **Multi-Taste Recognition**
-- Allows simultaneous activation of multiple input neurons.
-- Uses **cross-synaptic dynamics** to see which neuron best specializes in each taste.
-- Planned integration of **winner-takes-all lateral inhibition** to avoid confusion between tastes.
+- **Conductance-based LIF neurons** with adaptive thresholds and intrinsic homeostasis.  
+- **STDP with eligibility traces** for temporally precise plasticity.  
+- **Reinforcement learning with dopamine signals** (positive and negative rewards).  
+- **Column normalization** and weight scaling for stable synaptic growth.  
+- **Lateral inhibition (WTA)** for competition between neurons.  
+- **Always-on simulation loop**: the system continuously processes stimuli without explicit epochs.  
+- **Multi-taste learning**: supports recognition of single tastes and mixtures.  
+- **Unknown taste detection**: outputs *UNKNOWN* when neurons do not spike consistently.  
+- **Detailed metrics**: precision, recall, F1-score, IoU, Jaccard similarity, and confusion matrix.  
+- **Visualization utilities**: plots for spikes, synaptic weight evolution, and membrane potentials.
 
 ---
 
-## 📊 Results & Progress
+## 🧪 Taste Representation
 
-| **Feature**                  | **Status** | **Notes** |
-|----------------------------|------------|-----------|
-| Single-taste recognition   | ✅ Working |
-| Multi-taste input          | ✅ Working |
-| Dopamine-based RL         | ✅ Working |
-| Synaptic punishment      | ✅ Working |
-| Cross-synaptic learning   | 🟡 In progress |
-| Winner-Takes-All          | 🟡 Planned |
-| Food recognition (multi) | 🟡 Planned |
-| Pygame GUI               | 🟡 Planned |
+The system defines **8 taste classes**:
 
----
+1. SWEET 🍬 → *"Ouh... yummy!"*  
+2. BITTER 🍵 → *"So acid!"*  
+3. SALTY 🧂 → *"Need water... now!"*  
+4. SOUR 🍋 → *"Mehhh!"*  
+5. UMAMI 🍄 → *"So delicious!"*  
+6. FATTY 🍔 → *"Oh, I'm a big fat boy!"*  
+7. SPICY 🌶️ → *"I'm a blazing dragon!"*  
+8. UNKNOWN ❓ → *"WTF!"* (catch-all when no neuron dominates)
 
-## 🧠 Technologies Used
-
-- **Python 3.11**
-- [**Brian2**](https://brian2.readthedocs.io/) → SNN simulation
-- **NumPy / Matplotlib** → Data handling & visualization
-- **Pygame** *(planned)* → Interactive GUI
+The network is trained on **pure stimuli** and **mixtures** (e.g., *SWEET + SOUR*, *BITTER + UMAMI + SPICY*), and then tested with previously unseen combinations.
 
 ---
 
-## 🛠️ Installation
+## ⚙️ Key Parameters
 
-```bash
-# Clone the repository
-git clone https://github.com/<your-username>/artificial-tongue-snn.git
-cd artificial-tongue-snn
+- **Simulation time step**: `0.1 ms` (high temporal precision).  
+- **Intrinsic homeostasis target firing**: `~50 Hz`.  
+- **STDP time constant**: `30 ms` with eligibility trace decay `50 ms`.  
+- **Training duration per stimulus**: `1000 ms`.  
+- **Test duration per stimulus**: `500 ms`.  
+- **Repetitions per taste**: 10.  
 
-# Create a virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+Hyperparameters are fully configurable (see the Python script).
 
 ---
 
-## 📚 References
-Gerstner, W., Kistler, W. M., Naud, R., & Paninski, L. (2014). Neuronal Dynamics: From Single Neurons to Networks and Models of Cognition.
-Brian2 Documentation: https://brian2.readthedocs.io
+## 📊 Training and Testing Pipeline
+
+1. **Training phase**  
+   - Pure tastes and mixtures presented with Poisson spike trains.  
+   - Weights updated via STDP + eligibility + dopamine (reward/punishment).  
+   - Column normalization stabilizes synaptic scaling.  
+
+2. **Test phase**  
+   - STDP frozen, homeostasis off.  
+   - Neurons respond to pure and mixed test stimuli.  
+   - Classification thresholds are computed using Gaussian stats, quantiles, and EMA.  
+   - Metrics (accuracy, IoU, Jaccard) are reported.  
+
+3. **Visualization**  
+   - Spike raster plots.  
+   - Weight trajectories for diagonal synapses.  
+   - Membrane potentials across neurons.  
 
 ---
 
-👤 Author
-Filippo Matteini
-AI Engineer & Neuromorphic Computing Researcher
-🌐 GitHub: https://github.com/Fil952701
-🔗 LinkedIn: https://www.linkedin.com/in/filippo-matteini-29554a355/
-🎹 Dexteris: https://www.youtube.com/@dexteris27
+## 📈 Example Outputs
+
+- **Training logs**: progress bar with % completed, elapsed time, ETA, and neuron reactions.  
+- **Test logs**: expected vs. predicted taste(s) for each mixture, with exact hit/miss reporting.  
+- **Final report**: accuracy, per-class precision/recall/F1, IoU, macro/micro metrics, and weight changes during test.  
 
 ---
 
+## 🔬 Research Context
+
+This project is part of my independent research in **neuromorphic computing** and **Spiking Neural Networks**.  
+The artificial tongue is a prototype for more general artificial sensory systems that can:  
+
+- Learn **online** in a continuous environment.  
+- Distinguish **overlapping stimuli**.  
+- Exhibit **biologically inspired plasticity** with reinforcement learning.  
+- Integrate **lateral inhibition** for exclusivity in decision-making.  
+
+Potential applications extend to neuromorphic AI, robotics, and bio-inspired sensory processing.
+
+---
+
+## 👤 Author
+
+**Filippo Matteini** – Pianist, AI Engineer, and Neuromorphic Computing Researcher  
+
+- 🎹 YouTube (Dexteris): [@dexteris27](https://www.youtube.com/@dexteris27)  
+- 💼 LinkedIn: [Filippo Matteini](https://www.linkedin.com/in/filippo-matteini-29554a355)  
+- 🖥️ GitHub: [Fil952701](https://github.com/Fil952701)  
+
+---
+
+## 📜 License
+
+This project is released under the **MIT License**.  
+Feel free to use, modify, and build upon this work with proper attribution.  
+
+---
