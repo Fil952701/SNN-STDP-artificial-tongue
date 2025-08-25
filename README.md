@@ -94,23 +94,6 @@ Potential applications extend to neuromorphic AI, robotics, and bio-inspired sen
 
 ---
 
-## 👤 Author
-
-**Filippo Matteini** – Pianist, AI Engineer, and Neuromorphic Computing Researcher  
-
-- 🎹 YouTube (Dexteris): [@dexteris27](https://www.youtube.com/@dexteris27)  
-- 💼 LinkedIn: [Filippo Matteini](https://www.linkedin.com/in/filippo-matteini-29554a355)  
-- 🖥️ GitHub: [Fil952701](https://github.com/Fil952701)  
-
----
-
-## 📜 License
-
-This project is released under the **MIT License**.  
-Feel free to use, modify, and build upon this work with proper attribution.  
-
----
-
 ## ⚡ Installation
 
 You can set up the environment either with **pip** or **conda**:
@@ -130,3 +113,22 @@ If you prefer using conda, you can create the environment directly from the prov
 conda env create -f environment.yml
 conda activate artificial-tongue-snn
 ```
+
+---
+
+## 👤 Author
+
+**Filippo Matteini** – Pianist, AI Engineer, and Neuromorphic Computing Researcher  
+
+- 🎹 YouTube (Dexteris): [@dexteris27](https://www.youtube.com/@dexteris27)  
+- 💼 LinkedIn: [Filippo Matteini](https://www.linkedin.com/in/filippo-matteini-29554a355)  
+- 🖥️ GitHub: [Fil952701](https://github.com/Fil952701)  
+
+---
+
+## 📜 License
+
+This project is released under the **MIT License**.  
+Feel free to use, modify, and build upon this work with proper attribution.  
+
+---
