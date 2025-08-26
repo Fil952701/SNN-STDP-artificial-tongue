@@ -13,7 +13,7 @@ import shutil
 # global base rate per every class -> not 500 in total to split among all the classes but 500 for everyone
 BASE_RATE_PER_CLASS = 500
 
-# time functions for timing training and test phase
+# time functions for timing training and test phase to calculate ETA
 def fmt_mmss(seconds: float) -> str:
     m, s = divmod(int(max(0.0, seconds) + 0.5), 60)
     return f"{m:02d}:{s:02d}"
@@ -175,7 +175,7 @@ beta                 = 0.03             # learning rate for negative reward
 beta_offdiag         = 0.5 * beta       # off-diag parameter
 use_offdiag_dopamine = True             # quick toggle
 
-# normalizzazione per-colonna (synaptic scaling in ingresso)
+# Normalization per-column (synaptic scaling in input)
 use_col_norm         = True             # on the normalization
 col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax"
 col_norm_every       = 1                # execute every N trial
@@ -257,8 +257,8 @@ taste_neurons = b.NeuronGroup(
 taste_neurons.theta_bias[:] = 0 * b.mV
 
 # 5. Monitors
-spike_mon = b.SpikeMonitor(taste_neurons)
-state_mon = b.StateMonitor(taste_neurons, 'v', record=True)
+spike_mon = b.SpikeMonitor(taste_neurons) # monitoring spikes and time
+state_mon = b.StateMonitor(taste_neurons, 'v', record=True) # monitoring membrane potential
 
 # 6. Poisson inputs and STDP + eligibility trace synapses
 # 1) Labelled stimulus (yes plasticity) -> stimulus Poisson (labelled)
@@ -536,11 +536,6 @@ for input_rates, true_ids, label in training_stimuli:
 
        # positive -> strong TP threshold
        pos_sd_i = float(ema_sd(ema_pos_m1[idx], ema_pos_m2[idx]))
-       '''tp_gate_i = max(
-           min_spikes_for_known * ema_factor,
-           rel * tp_gate_ratio,
-           ema_pos_m1[idx] - ema_factor * pos_sd_i
-       )'''
        tp_gate_i = max(min_spikes_for_known * ema_factor,
                 ema_pos_m1[idx] - ema_factor * pos_sd_i)
        fp_gate_i = max(thr_ema_i, rel)
@@ -589,7 +584,6 @@ for input_rates, true_ids, label in training_stimuli:
        if idx in true_ids:
           # big true positive
           if spikes_i >= tp_gate[idx]:
-            #r = alpha
             # reward amplified by DA dopamine and inhibited by 5-HT serotonine
             r = (alpha * (1.0 + da_gain * DA_now)) / (1.0 + ht_gain * HT_now)
             # multiply for NE and HI factor
@@ -598,7 +592,6 @@ for input_rates, true_ids, label in training_stimuli:
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
-            #r = -beta
             # punition amplified by 5-HT -> aversive state verified
             r = - beta * (1.0 + ht_gain * HT_now)
             # same for FP
@@ -622,7 +615,6 @@ for input_rates, true_ids, label in training_stimuli:
                    if si is None:
                       continue  # if that synapse doesn't exist
                    old_w = float(S.w[si])
-                   #delta = -beta_offdiag * float(S.elig[si])
                    delta = - beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now) * float(S.elig[si])
                    if delta != 0.0:
                       S.w[si] = float(np.clip(S.w[si] + delta, 0, 1))
@@ -735,10 +727,6 @@ for idx in range(num_tastes-1):
 print("Per-class thresholds (hybrid μ+kσ, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class[idx]) for idx in range(num_tastes-1)})
 
-# if test ≠ training
-# dur_scale = float(test_duration / training_duration)
-# thr_per_class[:unknown_id] *= dur_scale
-
 # DEBUG: printing pos and neg values for each class
 for idx in [0,2,3]: # SWEET, SALTY, SOUR
     print(taste_map[idx],
@@ -791,6 +779,7 @@ taste_neurons.theta_bias[:] = 0 * b.mV
 inhibitory_S.inh_scale = 1.0
 mod.DA[:] = 0.0
 mod.HT[:] = 0.0
+
 # "emotive state" in test phase
 if test_emotion_mode == "off":
     # neutral test
@@ -923,12 +912,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     else:
         # absolute gate for each class
         base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
-
-        # 2) relative global gate
         rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
         rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel]
-
-        # 3) normalized gate for weak class
         pos_expect = np.maximum(ema_pos_m1, eps_ema) # expected per class from trial
         z = scores[:unknown_id] / pos_expect  # normalized score
         z_max = float(np.max(z)) if z.size else 0.0
@@ -978,11 +963,9 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # output visualization
     print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
     results.append((label, expected, predicted, hit))
-
     # 4) final valutation
     if set(winners) == set(true_ids):
         exact_hits += 1
-
     # 5) final refractory period after trial
     net.run(recovery_between_trials)
 
