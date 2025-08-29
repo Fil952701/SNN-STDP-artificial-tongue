@@ -28,9 +28,9 @@ _last_pbar_len = 0
 
 # deleting residual characters and mantaining the same line for the terminal bar
 def pbar_update(msg, stream=sys.stdout):
-    cols = shutil.get_terminal_size(fallback=(100, 20)).columns
+    cols = shutil.get_terminal_size(fallback=(100, 30)).columns
     if cols and len(msg) >= cols:
-        msg = msg[:cols-1] # on the same line
+        msg = msg[:cols-1] # on the same line -> not a new line
     stream.write('\r\x1b[2K' + msg)
     stream.flush()
 
@@ -119,7 +119,7 @@ taui                 = 10*b.ms
 
 # Size of conductance kick per spike (scaling)
 g_step_exc           = 3.5 * b.nS       # excitation from inputs
-g_step_bg            = 0.3 * b.nS       # tiny background excitation
+g_step_bg            = 0.3 * b.nS       # tiny background excitation noise
 g_step_inh_local     = 1.2 * b.nS       # lateral inhibition strength
 
 # Neuromodulators (DA Dopamine: reward, 5-HT Serotonine: aversion/fear, NE Noradrenaline: arousal/attention)
@@ -143,7 +143,7 @@ k_noise_NE           = 0.5              # low environment noise
 ne_gain_r            = 0.3              # scaling reinforcement r entity
 ne_pulse_amb         = 0.8              # burst on FP
 # Histamine (HI) — novelty/exploration (slower than NE)
-tau_HI               = 1500 * b.ms
+tau_HI               = 1500 * b.ms      # slow decay
 k_ex_HI              = 0.30             # gain on synapses
 k_inh_HI             = -0.15            # HI decrease WTA
 k_theta_HI           = -1.0             # mV threshold bias per HI unit
@@ -151,6 +151,19 @@ k_noise_HI           = 0.30             # more HI ⇒ more environment noise
 hi_gain_r            = 0.15             # reinforcement scaling with HI
 hi_pulse_nov         = 0.8              # burst on ambiguity
 hi_pulse_miss        = 1.0              # burst on error
+# Acetylcholine (ACh) — contextual plasticity / different attention on train and test
+tau_ACH              = 700 * b.ms       # decay for ACh
+ach_train_level      = 0.8              # high ACh during training
+ach_test_level       = 0.10             # low ACh during test
+k_ex_ACH             = 0.25             # exictement gain with ACh
+ach_plasticity_gain  = 0.40             # ACh ↑ reward effect on Δw
+k_noise_ACH          = 0.25             # ACh noise environment reduction
+# GABA — global inhibition/stability
+tau_GABA             = 800 * b.ms       # decay for GABA
+k_inh_GABA           = 0.60             # WTA scaling with GABA
+gaba_pulse_stabilize = 0.8              # burst when activity is too much
+gaba_active_neurons  = 4                # if > k neurons are activated in the same time → stability
+gaba_total_spikes    = 120              # if total spikes per trial overcome this threshold → stability
 
 # Intrinsic homeostasis adapative threshold parameters
 target_rate          = 50 * b.Hz        # reference firing per neuron (tu 40-80 Hz rule)
@@ -207,7 +220,7 @@ min_spikes_for_known = 10               # minimum number of spikes for neuron, o
 top2_margin_ratio    = 1.4              # top/second >= 1.4 -> safe
 weight_decay         = 1e-4             # weight decay for trial
 verbose_rewards      = False            # dopamine reward logs
-test_emotion_mode    = "active"
+test_emotion_mode    = "active"         # to test with active neuromodulators
 
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
@@ -227,7 +240,7 @@ def noisy_mix(ids, amp=250, mu=noise_mu, sigma=noise_sigma):
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
     return v, ids, f"TASTE: {label} (train)"
 
-# 4. LIF conductance-based output taste neurons with intrinsic homeostatis
+# 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis
 taste_neurons = b.NeuronGroup(
     num_tastes,
     model='''
@@ -260,7 +273,7 @@ taste_neurons.theta_bias[:] = 0 * b.mV
 spike_mon = b.SpikeMonitor(taste_neurons) # monitoring spikes and time
 state_mon = b.StateMonitor(taste_neurons, 'v', record=True) # monitoring membrane potential
 
-# 6. Poisson inputs and STDP + eligibility trace synapses
+# 6. Poisson INPUT neurons and STDP + eligibility trace synapses
 # 1) Labelled stimulus (yes plasticity) -> stimulus Poisson (labelled)
 pg = b.PoissonGroup(num_tastes, rates=np.zeros(num_tastes)*b.Hz)
 
@@ -268,7 +281,7 @@ pg = b.PoissonGroup(num_tastes, rates=np.zeros(num_tastes)*b.Hz)
 baseline_hz = 0.5  # 0.5–1 Hz
 pg_noise = b.PoissonGroup(num_tastes, rates=baseline_hz*np.ones(num_tastes)*b.Hz)
 
-# STDP Synapses with eligibility trace, Noradrenaline NE, lateral inhibition WTA and LIF conductance
+# STDP Synapses with eligibility trace, Noradrenaline NE, lateral inhibition WTA and EMA
 S = b.Synapses(
     pg, taste_neurons,
     model='''
@@ -345,7 +358,7 @@ inhibitory_S.inh_scale = 1.0
 w_mon = b.StateMonitor(S, 'w', record=True)
 weight_monitors.append((w_mon, S))
 
-# DA, 5-HT, NE, HI neuromodulators that decay over time
+# DA, 5-HT, NE, HI, ACh, GABA neuromodulators that decay over time
 mod = b.NeuronGroup(
     1,
     model='''
@@ -353,14 +366,19 @@ mod = b.NeuronGroup(
         dHT/dt = -HT/tau_HT : 1
         dNE/dt = -NE/tau_NE : 1
         dHI/dt = -HI/tau_HI : 1
+        dACH/dt = -ACH/tau_ACH : 1
+        dGABA/dt = -GABA/tau_GABA : 1
     ''',
     method='exact',
-    namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE, 'tau_HI' : tau_HI}
+    namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE, 
+               'tau_HI' : tau_HI, 'tau_ACH' : tau_ACH, 'tau_GABA' : tau_GABA}
 )
 mod.DA = 0.0
 mod.HT = 0.0
 mod.NE = 0.0
 mod.HI = 0.0
+mod.ACH  = 0.0
+mod.GABA = 0.0
 
 # 8. Building the SNN network and adding levels
 net = b.Network(
@@ -372,14 +390,14 @@ net = b.Network(
     inhibitory_S,
     spike_mon,
     state_mon,
-    mod # 5-HT serotonine neurons installed in the net
+    mod # neuromodulator neurons installed into the net
 )
 # monitoring all neuromodulators
 net.add(w_mon)
 theta_mon = b.StateMonitor(taste_neurons, 'theta', record=True)
 s_mon = b.StateMonitor(taste_neurons, 's', record=True)
 net.add(theta_mon, s_mon)
-mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE', 'HI'], record=True)
+mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE', 'HI', 'ACH', 'GABA'], record=True)
 net.add(mod_mon)
 
 # 9. Prepare stimuli list
@@ -468,22 +486,28 @@ for input_rates, true_ids, label in training_stimuli:
     if aversive_now:
         mod.HT[:] += ht_pulse_aversion # increase caution before imminent training
 
+    # ACh must to be high during in training for efficient plasticity
+    mod.ACH[:] = ach_train_level
+
     # after the increasing, neuromodulators must decay
     DA_now = float(mod.DA[0])
     HT_now = float(mod.HT[0])
     NE_now = float(mod.NE[0])
     HI_now = float(mod.HI[0])
+    ACH_now = float(mod.ACH[0])
+    GABA_now = float(mod.GABA[0])
 
-    # reward and WTA addicted to NE/5-HT/HI
-    S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI * HI_now)
-    # whereas WTA more aggressive when 5-HT is higher, because aversion and fear must to influence the behiaviour during the train over and over
-    _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI * HI_now
+    # reward gain and WTA addicted to NE/HI/ACh
+    S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI * HI_now) * (1.0 + k_ex_ACH * ACH_now)
+    # inhibition with 5-HT/GABA/HI -> whereas WTA more aggressive when 5-HT is higher, because aversion and fear must to influence the behiaviour during the train over and over
+    _inh = (1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI * HI_now + k_inh_GABA * GABA_now)
     inhibitory_S.inh_scale = max(0.3, _inh) # clamp to avoid errors
 
-    # environment noise reduction with NE and HI, HT (clamp ≥0.05 Hz)
+    # environment noise reduction with ACh, NE and HI, HT (clamp ≥0.05 Hz)
     ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
     hi_noise_scale = (1.0 + k_noise_HI * HI_now)
-    pg_noise.rates = baseline_hz * ne_noise_scale * hi_noise_scale * np.ones(num_tastes) * b.Hz
+    ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
+    pg_noise.rates = baseline_hz * ne_noise_scale * hi_noise_scale * ach_noise_scale * np.ones(num_tastes) * b.Hz
 
     # state gating guided by 5-HT because threshold has to be bigger if HT is higher -> behaviour of caution
     # 5-HT increase bias | HI decrease bias
@@ -498,6 +522,11 @@ for input_rates, true_ids, label in training_stimuli:
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+    # to manage GABA during trial if there are too many spikes
+    total_spikes  = float(np.sum(diff_counts[:unknown_id]))
+    active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
+    if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
+        mod.GABA[:] += gaba_pulse_stabilize
     # collect all positive and negative counts
     for idx in range(num_tastes-1):
         if idx in true_ids:
@@ -584,11 +613,9 @@ for input_rates, true_ids, label in training_stimuli:
        if idx in true_ids:
           # big true positive
           if spikes_i >= tp_gate[idx]:
-            # reward amplified by DA dopamine and inhibited by 5-HT serotonine
-            r = (alpha * (1.0 + da_gain * DA_now)) / (1.0 + ht_gain * HT_now)
-            # multiply for NE and HI factor
-            r *= (1.0 + ne_gain_r * NE_now)
-            r *= (1.0 + hi_gain_r * HI_now)
+            # reward amplified by DA dopamine ACh acetylcholine and inhibited by 5-HT serotonine
+            r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * HT_now)
+            r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -638,6 +665,7 @@ for input_rates, true_ids, label in training_stimuli:
         mod.HT[:] += ht_pulse_fp
         mod.NE[:] += 0.5 * ne_pulse_amb # arousal on strong FP
         mod.HI[:] += 0.3 * hi_pulse_nov
+        mod.GABA[:] += 0.3 * gaba_pulse_stabilize
 
     # safe clip on theta for homeostasis
     theta_min, theta_max = -12*b.mV, 12*b.mV
@@ -821,6 +849,8 @@ eps_ema = 1e-3
 # 12. TEST PHASE
 print("\nStarting TEST phase...")
 results = []
+# low ACh in test phase
+mod.ACH[:] = ach_test_level
 test_t0 = time.perf_counter()  # start stopwatch TEST
 # Scale decoder thresholds to the test window
 dur_scale = float(test_duration / training_duration)
@@ -858,23 +888,21 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         HT_now = float(mod.HT[0])
         NE_now = float(mod.NE[0])
         HI_now = float(mod.HI[0])
+        ACH_now = float(mod.ACH[0]); 
+        GABA_now = float(mod.GABA[0])
         # threshold
         taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI_test * HI_now) * b.mV
-        # synaptic gain
-        S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
-        # WTA
-        _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now
-        inhibitory_S.inh_scale = max(0.3, _inh)
+        # synaptic gain and inhibition as in training phase
+        S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now) * (1.0 + k_ex_ACH * ACH_now)
+        _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now + k_inh_GABA * GABA_now
+        inhibitory_S.inh_scale = max(0.3, _inh) # same clamp to avoid explosions
         # noise
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-        pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
-        if test_emotion_mode == "active":
-            # aversive anticipation: if SPICY, increase 5-HT
-            aversive_now = any(
-                (cls in p_aversion) and (np.random.rand() < p_aversion[cls])
-                for cls in true_ids
-            )
-            if aversive_now:
+        ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
+        pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
+        if test_emotion_mode == "active": # aversive anticipation: if SPICY, increase 5-HT 
+            aversive_now = any( (cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids ) 
+            if aversive_now: 
                 mod.HT[:] += ht_pulse_aversion
 
     # 1) stimulus on target classes
@@ -884,6 +912,11 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     prev_counts = spike_mon.count[:].copy()
     net.run(test_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+    # GABA stabilization as in training phase
+    total_spikes  = float(np.sum(diff_counts[:unknown_id]))
+    active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
+    if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
+        mod.GABA[:] += gaba_pulse_stabilize
     # maintaining EMA during test phase
     if decoder_adapt_on_test:
         for idxs in range(num_tastes-1):
@@ -951,7 +984,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             mod.HI[:] += 0.5 * hi_pulse_miss
     
     if test_emotion_mode != "off":
-        msg += f" | DA={float(mod.DA[0]):.2f} HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f} HI={float(mod.HI[0]):.2f}"
+        msg += f" | DA={float(mod.DA[0]):.2f} HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f} HI={float(mod.HI[0]):.2f} ACH={float(mod.ACH[0]):.2f} GABA={float(mod.GABA[0]):.2f}"
     # showing the log bar    
     pbar_update(msg)
 
