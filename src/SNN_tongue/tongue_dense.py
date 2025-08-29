@@ -1,4 +1,4 @@
-# SNN with STDP + eligibility trace to simulate an artificial tongue
+# SNN with STDP + eligibility trace to simulate an artificial tongue # that continuously learns to recognize multiple tastes (always-on). 
 # that continuously learns to recognize multiple tastes (always-on).
 
 import brian2 as b
@@ -179,7 +179,7 @@ q_neg                = 0.99             # negative quantile
 # Multi-label RL + EMA decoder
 ema_lambda            = 0.05            # 0 < λ ≤ 1
 tp_gate_ratio         = 0.30            # threshold to reward winner classes
-fp_gate_warmup_steps  = 20              # delay punitions to loser classes if EMA didn't stabilize them yet
+fp_gate_warmup_steps  = 50              # delay punitions to loser classes if EMA didn't stabilize them yet
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.5             # EMA factor to punish more easy samples
 
@@ -191,10 +191,10 @@ use_offdiag_dopamine = True             # quick toggle
 # Normalization per-column (synaptic scaling in input)
 use_col_norm         = True             # on the normalization
 col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax"
-col_norm_every       = 1                # execute every N trial
+col_norm_every       = 3                # execute norm every N trial
 col_norm_temp        = 1.0              # temperature softmax (if mode="softmax")
 col_norm_target      = None             # if None, calculating the target at the beginning of the trial
-diag_bias_gamma      = 1.10             # >1.0 = light bias to the diagonal weight before normalization
+diag_bias_gamma      = 1.30             # >1.0 = light bias to the diagonal weight before normalization
 col_floor            = 0.0              # floor (0 or light epsilon) before norm
 col_allow_upscale    = True             # light up-scaling
 col_upscale_slack    = 0.90             # if L1 < 90% target → boost
@@ -342,8 +342,8 @@ else:  # dense
 # init weights
 if connectivity_mode == "dense":
     # initial advantage for true connections, minimal cross-talk
-    S.w['i==j'] = '0.30 + 0.20*rand()'  # 0.30–0.50 value
-    S.w['i!=j'] = '0.02 + 0.04*rand()'  # 0.02–0.06 value
+    S.w['i==j'] = '0.35 + 0.25*rand()'  # 0.30–0.50 value
+    S.w['i!=j'] = '0.01 + 0.03*rand()'  # 0.02–0.06 value
 else:
     S.w = '0.2 + 0.8*rand()'
 
@@ -372,7 +372,7 @@ inhibitory_S = b.Synapses(taste_neurons,
                     delay=0.2*b.ms,
                     namespace=dict(g_step_inh=g_step_inh_local))
 inhibitory_S.connect('i != j')
-inhibitory_S.inh_scale = 1.0
+inhibitory_S.inh_scale = 0.9
 
 w_mon = b.StateMonitor(S, 'w', record=True)
 weight_monitors.append((w_mon, S))
@@ -638,6 +638,13 @@ for input_rates, true_ids, label in training_stimuli:
     order = np.argsort(scores)
     dbg = [(taste_map[idx], int(scores[idx])) for idx in order[::-1]]
 
+    # matches evaluation
+    if step % 5 == 0:
+        T = set(true_ids); P = set(winners)
+        jacc = len(T & P) / len(T | P) if (T | P) else 1.0
+        print(f"[match] T={sorted(list(T))} P={sorted(list(P))} J={jacc:.2f} "
+          f"top={top:.0f} second={second:.0f} thr_tp={int(np.mean(tp_gate))} thr_fp={int(np.mean(fp_gate))}")
+
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
     for idx in range(num_tastes-1):
@@ -651,8 +658,11 @@ for input_rates, true_ids, label in training_stimuli:
           # big true positive
           if spikes_i >= tp_gate[idx]:
             # reward amplified by DA dopamine ACh acetylcholine and inhibited by 5-HT serotonine
-            r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * HT_now)
+            ht_eff = min(HT_now, 0.5)   # massimo 0.5 unità di serotonina come penalità
+            r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * ht_eff)
             r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
+            conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)  # già calcoli top/second
+            r *= 0.5 + 0.5 * conf   # 0.5–1.0
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -690,8 +700,20 @@ for input_rates, true_ids, label in training_stimuli:
     
     # burst neuromodulators DA and 5-HT for the next trial as in a human-inspired biology brain
     # global reward if the prediction is correct
-    if set(winners) == set(true_ids):
+    '''if set(winners) == set(true_ids):
         mod.DA[:] += da_pulse_reward
+    else:
+        mod.HI[:] += hi_pulse_miss'''
+
+    # qualità = Jaccard(T, P)
+    T = set(true_ids); P = set(winners)
+    jacc = len(T & P) / len(T | P) if (T | P) else 1.0
+
+    if jacc >= 0.67:
+        mod.DA[:] += da_pulse_reward * jacc         # gratifica scalata
+    elif jacc > 0.0:
+        mod.DA[:] += 0.4 * da_pulse_reward * jacc   # piccola gratifica parziale
+        mod.HI[:] += 0.5 * hi_pulse_miss
     else:
         mod.HI[:] += hi_pulse_miss
 
@@ -879,7 +901,7 @@ use_rel_gate_in_test = False # in multi-label is better to deactivate
 rel_gate_ratio_test  = 0.10
 rel_cap_abs = 10.0 # absolute value for spikes
 # boosting parameters to push more weak examples
-norm_rel_ratio_test = 0.1 # winners with z_i >= 10% normalized top
+norm_rel_ratio_test = 0.15 # winners with z_i >= 15% normalized top
 min_norm_abs_spikes = 1 # at least one real spike
 eps_ema = 1e-3 
 
@@ -991,15 +1013,20 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # absolute gate for each class
         base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
         rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
-        rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel]
-        pos_expect = np.maximum(ema_pos_m1, eps_ema) # expected per class from trial
-        z = scores[:unknown_id] / pos_expect  # normalized score
+        rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel] if use_rel_gate_in_test else []
+        pos_expect = np.maximum(ema_pos_m1, eps_ema)
+        z = scores[:unknown_id] / pos_expect
         z_max = float(np.max(z)) if z.size else 0.0
-        norm_winners = [i for i in range(num_tastes-1)
-                    if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes)]
+
+        norm_winners = []
+        for i in range(num_tastes-1):
+            if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes):
+                # mini-soglia: almeno il 25% della soglia assoluta della classe
+                mini = 0.25 * thr_per_class[i]
+                if scores[i] >= mini:
+                    norm_winners.append(i)
 
         winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
-
         if not winners and mx >= min_spikes_for_known_test:
             winners = [int(np.argmax(scores))]
 
