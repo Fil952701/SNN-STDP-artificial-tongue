@@ -225,6 +225,25 @@ test_emotion_mode    = "active"         # to test with active neuromodulators
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
 
+# helpers to define toggles per ablation
+def set_ach(on=True):
+    global ach_train_level, ach_plasticity_gain, ach_test_level, k_ex_ACH, k_noise_ACH
+    if on:
+        ach_train_level, ach_plasticity_gain, ach_test_level = 0.8, 0.40, 0.10
+        k_ex_ACH, k_noise_ACH = 0.25, 0.25
+    else:
+        ach_train_level, ach_plasticity_gain, ach_test_level = 0.0, 0.0, 0.0
+        k_ex_ACH, k_noise_ACH = 0.0, 0.0
+
+def set_gaba(on=True):
+    global k_inh_GABA, gaba_pulse_stabilize, gaba_active_neurons, gaba_total_spikes
+    if on:
+        k_inh_GABA, gaba_pulse_stabilize = 0.60, 0.8
+        gaba_active_neurons, gaba_total_spikes = 4, 120
+    else:
+        k_inh_GABA, gaba_pulse_stabilize = 0.0, 0.0
+        gaba_active_neurons, gaba_total_spikes = 9999, 10**9 # trigger deactivation
+
 # helper to index test tastes without noise in the stimuli list
 def make_mix(ids, amp=250):
     v = np.zeros(num_tastes)
@@ -419,13 +438,22 @@ for _ in range(n_repeats): # N repeats for every training taste
     mixture_train.append(noisy_mix([0, 6]))    # SWEET + SPICY
     mixture_train.append(noisy_mix([1, 4, 6])) # BITTER + UMAMI + SPICY
 
-# 9C: test set
+# new random couples of tastes and mixtures to stress more the net
+extra_mixes = [
+    [0,4], [1,2], [3,5], [2,6],
+    [0,1,4], [2,3,6], [0,2,4,6]
+]
+for _ in range(n_repeats):
+    for mix in extra_mixes:
+        mixture_train.append(noisy_mix(mix, amp=np.random.randint(180, 321)))
+
+# 9C: test set -> couples and mixtures never seen during training
 test_stimuli = [
-    make_mix([0, 3]),   # SWEET + SOUR
-    make_mix([0, 2]),   # SWEET + SALTY
-    make_mix([2, 4]),   # SALTY + UMAMI
-    make_mix([0, 6]),   # SWEET + SPICY
-    make_mix([1, 4, 6]) # BITTER + UMAMI + SPICY
+    make_mix([0,4]),      # SWEET + UMAMI
+    make_mix([1,2]),      # BITTER + SALTY
+    make_mix([3,5]),      # SOUR + FATTY
+    make_mix([0,2,4,6]),  # 4-way
+    make_mix([2,6]),      # SALTY + SPICY
 ]
 # total stimuli
 training_stimuli = pure_train + mixture_train
@@ -459,6 +487,9 @@ if use_col_norm and connectivity_mode == "dense" and col_norm_target is None:
     if verbose_rewards:
         print(f"col_norm_target auto={col_norm_target:.3f} (fanin={fanin}, init_mean={init_mean:.3f})")
 
+# ablation conditions
+# set_ach(False)   # ablation ACh
+# set_gaba(False)  # ablation GABA
 for input_rates, true_ids, label in training_stimuli:
     step += 1 
     # progress bar + chrono + ETA
@@ -527,6 +558,12 @@ for input_rates, true_ids, label in training_stimuli:
     active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
     if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
         mod.GABA[:] += gaba_pulse_stabilize
+    # periodic ablation debug
+    if step % 5 == 0:
+        print(f"\n[dbg] step={step} spikes_tot={total_spikes:.0f} active={active_neurs} "
+          f"WTA={float(np.mean(inhibitory_S.inh_scale[:])):.2f} "
+          f"DA={DA_now:.2f} HT={HT_now:.2f} NE={NE_now:.2f} HI={HI_now:.2f} "
+          f"ACH={ACH_now:.2f} GABA={GABA_now:.2f}")
     # collect all positive and negative counts
     for idx in range(num_tastes-1):
         if idx in true_ids:
@@ -864,6 +901,12 @@ recovery_between_trials = 100 * b.ms  # refractory recovery
 exact_hits = 0
 total_test = len(test_stimuli)
 
+# function to inject UNKNOWN inside test set and confuse the net
+def add_unknown(rate_vec, unk_min=20, unk_max=60):
+    v = rate_vec.copy()
+    v[unknown_id] = np.random.randint(unk_min, unk_max+1)
+    return v
+
 for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     taste_neurons.ge[:] = 0 * b.nS
     taste_neurons.gi[:] = 0 * b.nS
@@ -905,6 +948,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             if aversive_now: 
                 mod.HT[:] += ht_pulse_aversion
 
+    # 0) inject UNKNOWN taste during test phase
+    _rates_vec = add_unknown(_rates_vec, 20, 60)
     # 1) stimulus on target classes
     set_stimulus_vect_norm(_rates_vec, total_rate=BASE_RATE_PER_CLASS * len(true_ids))
 
@@ -1027,7 +1072,7 @@ jaccard_per_case = []
 for _, exp_labels, pred_labels, _ in results:
     T = {label_to_id[lbl] for lbl in exp_labels if label_to_id[lbl] != unknown_id}
     P = {label_to_id[lbl] for lbl in pred_labels if label_to_id[lbl] != unknown_id}
-
+    # expected vs predicted
     inter = T & P
     union = T | P
     jaccard_per_case.append(len(inter) / len(union) if len(union) > 0 else 1.0)
@@ -1089,7 +1134,7 @@ if jaccard_per_case:
     print("\nJaccard per test-case:", [f"{j:.2f}" for j in jaccard_per_case])
     print(f"Average Jaccard (set vs set): {mean_jaccard_cases:.2f}")
 
-# weight changes during test confrontation
+# weight changes during test confrontation -> they don't change because STDP frozen during test phase
 print("\nWeight changes during unsupervised test:")
 for k in range(num_tastes-1):
     if k in diag_idx:
