@@ -110,24 +110,23 @@ gL                   =  10 * b.nS
 EL                   = -70 * b.mV
 Vth                  = -52 * b.mV
 Vreset               = -60 * b.mV
-
 # Synaptic reversal & time constants
 Ee                   = 0*b.mV
 Ei                   = -80*b.mV
 taue                 = 10*b.ms
 taui                 = 10*b.ms
-
 # Size of conductance kick per spike (scaling)
 g_step_exc           = 3.5 * b.nS       # excitation from inputs
 g_step_bg            = 0.3 * b.nS       # tiny background excitation noise
 g_step_inh_local     = 1.2 * b.nS       # lateral inhibition strength
 
 # Neuromodulators (DA Dopamine: reward, 5-HT Serotonine: aversion/fear, NE Noradrenaline: arousal/attention)
+# Dopamine (DA) - reward gain
 tau_DA               = 300 * b.ms       # fast decay: short gratification
 tau_HT               = 2 * b.second     # slow decay: prudence, residual fear
 da_gain              = 1.0              # how much DA expand the positive reinforcement
 ht_gain              = 1.0              # how much 5-HT expand the punishment or how much it stops LTP
-# aversive state on the entire circuit
+# Serotonine (5-HT) - aversive state on the entire circuit
 k_theta_HT           = 2.0              # mV bias threshold per 5-HT unit
 k_inh_HT             = 0.5              # WTA scaling per 5-HT unit
 # aversive stochastic events
@@ -190,7 +189,7 @@ use_offdiag_dopamine = True             # quick toggle
 
 # Normalization per-column (synaptic scaling in input)
 use_col_norm         = True             # on the normalization
-col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax"
+col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax" -> synaptic scaling that mantains input scale per post neuron to avoid unfair competition
 col_norm_every       = 3                # execute norm every N trial
 col_norm_temp        = 1.0              # temperature softmax (if mode="softmax")
 col_norm_target      = None             # if None, calculating the target at the beginning of the trial
@@ -200,7 +199,7 @@ col_allow_upscale    = True             # light up-scaling
 col_upscale_slack    = 0.90             # if L1 < 90% target → boost
 col_scale_max        = 1.2              # max factor per step
 
-# STDP parameters
+# STDP and environment parameters
 tau                  = 30 * b.ms        # STDP time constant
 Te                   = 50 * b.ms        # eligibility trace decay time constant
 A_plus               = 0.01             # dimensionless
@@ -337,7 +336,8 @@ taste_neurons.homeo_on = 1.0 # ON in training
 if connectivity_mode == "diagonal":
     S.connect('i == j and i != unknown_id') # diagonal-connected
 else:  # dense
-    S.connect('i != unknown_id') # fully-connected
+    #S.connect('i != unknown_id') # fully-connected
+    S.connect('i != unknown_id and j != unknown_id') # fully-connected without UNKNOWN
 
 # init weights
 if connectivity_mode == "dense":
@@ -413,6 +413,8 @@ net = b.Network(
 )
 # monitoring all neuromodulators
 net.add(w_mon)
+inh_mon = b.StateMonitor(inhibitory_S, 'inh_scale', record=True)
+net.add(inh_mon)
 theta_mon = b.StateMonitor(taste_neurons, 'theta', record=True)
 s_mon = b.StateMonitor(taste_neurons, 's', record=True)
 net.add(theta_mon, s_mon)
@@ -559,11 +561,11 @@ for input_rates, true_ids, label in training_stimuli:
     if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
         mod.GABA[:] += gaba_pulse_stabilize
     # periodic ablation debug
-    if step % 5 == 0:
+    '''if step % 5 == 0:
         print(f"\n[dbg] step={step} spikes_tot={total_spikes:.0f} active={active_neurs} "
           f"WTA={float(np.mean(inhibitory_S.inh_scale[:])):.2f} "
           f"DA={DA_now:.2f} HT={HT_now:.2f} NE={NE_now:.2f} HI={HI_now:.2f} "
-          f"ACH={ACH_now:.2f} GABA={GABA_now:.2f}")
+          f"ACH={ACH_now:.2f} GABA={GABA_now:.2f}")'''
     # collect all positive and negative counts
     for idx in range(num_tastes-1):
         if idx in true_ids:
@@ -639,11 +641,11 @@ for input_rates, true_ids, label in training_stimuli:
     dbg = [(taste_map[idx], int(scores[idx])) for idx in order[::-1]]
 
     # matches evaluation
-    if step % 5 == 0:
+    '''if step % 5 == 0:
         T = set(true_ids); P = set(winners)
         jacc = len(T & P) / len(T | P) if (T | P) else 1.0
         print(f"[match] T={sorted(list(T))} P={sorted(list(P))} J={jacc:.2f} "
-          f"top={top:.0f} second={second:.0f} thr_tp={int(np.mean(tp_gate))} thr_fp={int(np.mean(fp_gate))}")
+          f"top={top:.0f} second={second:.0f} thr_tp={int(np.mean(tp_gate))} thr_fp={int(np.mean(fp_gate))}")'''
 
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
@@ -929,6 +931,8 @@ def add_unknown(rate_vec, unk_min=20, unk_max=60):
     v[unknown_id] = np.random.randint(unk_min, unk_max+1)
     return v
 
+all_scores = []
+all_targets = []
 for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     taste_neurons.ge[:] = 0 * b.nS
     taste_neurons.gi[:] = 0 * b.nS
@@ -979,6 +983,19 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     prev_counts = spike_mon.count[:].copy()
     net.run(test_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+
+    scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
+    # z-score: z = scores / np.maximum(ema_pos_m1, 1e-9)
+    score_vec = scores
+
+    y_true = np.zeros(unknown_id, dtype=int)
+    for tdx in true_ids:
+        if tdx != unknown_id:
+            y_true[tdx] = 1
+
+    all_scores.append(score_vec.copy())
+    all_targets.append(y_true.copy())
+
     # GABA stabilization as in training phase
     total_spikes  = float(np.sum(diff_counts[:unknown_id]))
     active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
@@ -1168,6 +1185,112 @@ for k in range(num_tastes-1):
         si = diag_idx[k]
         print(f"  {taste_map[k]}→{taste_map[k]}: Δw = {float(S.w[si] - w_before_test[si]):+.4f}")
 
+# PR-/ROC-AUC management
+S_scores = np.vstack(all_scores)   # shape: (N_trials, C)
+Y_scores = np.vstack(all_targets)  # shape: (N_trials, C)
+n_classes_scores = S_scores.shape[1]
+# class support pos/neg and AP baseline ≈ pos/N
+print("\n- Supports and AP baseline for every class -")
+for c in range(Y_scores.shape[1]):
+    n_pos = int(Y_scores[:, c].sum())
+    n_neg = int(Y_scores.shape[0] - n_pos)
+    base_ap = (n_pos / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else float('nan')
+    print(f"{taste_map[c]:>6s}: support +={n_pos}, -={n_neg}, baseline AP≈{base_ap:.3f}")
+C_scores = S_scores.shape[1]
+
+def roc_points(y, s):
+    # y ∈ {0,1}, s = continual scores
+    order = np.argsort(-s)
+    y = y[order]
+    P = int(y.sum()); N = len(y) - P
+    tps = np.cumsum(y)
+    fps = np.cumsum(1 - y)
+    TPR = tps / (P if P > 0 else 1)
+    FPR = fps / (N if N > 0 else 1)
+    # key points
+    TPR = np.concatenate(([0.0], TPR, [1.0]))
+    FPR = np.concatenate(([0.0], FPR, [1.0]))
+    auc = float(np.trapz(TPR, FPR))
+    return FPR, TPR, auc
+
+def pr_auc(y, s):
+    y = np.asarray(y, dtype=int)
+    s = np.asarray(s, dtype=float)
+    P = int(y.sum())
+    N = len(y) - P
+    if P == 0 or N == 0:
+        return float('nan')
+    order = np.argsort(-s)
+    y = y[order]
+    tp = np.cumsum(y)
+    fp = np.cumsum(1 - y)
+    prec = tp / np.maximum(tp + fp, 1)
+    rec  = tp / P
+    # envelope: precision doesn't grow when recall grows up
+    prec = np.maximum.accumulate(prec[::-1])[::-1]
+    # key points
+    rec  = np.concatenate(([0.0], rec, [1.0]))
+    prec = np.concatenate(([1.0], prec, [prec[-1]]))
+    return float(np.trapz(prec, rec))
+
+def average_precision(y, s):
+    y = np.asarray(y, dtype=int)
+    s = np.asarray(s, dtype=float)
+    P = int(y.sum())
+    if P == 0:
+        return float('nan')
+    order = np.argsort(-s)
+    y = y[order]
+    tp = 0
+    ap = 0.0
+    for idx, yi in enumerate(y, start=1):
+        if yi == 1:
+            tp += 1
+            ap += tp / idx
+    return ap / P
+
+roc_auc_per_class = []
+pr_auc_per_class  = []
+ap_per_class      = []
+
+for c in range(C_scores):
+    y = Y_scores[:, c]; s = S_scores[:, c]
+
+    # ROC-AUC at least one positive and one negative
+    if np.unique(y).size < 2:
+        roc_auc_per_class.append(np.nan)
+    else:
+        _, _, auc_roc = roc_points(y, s)
+        roc_auc_per_class.append(auc_roc)
+
+    # PR-AUC and AP at least one positive
+    if y.sum() == 0:
+        pr_auc_per_class.append(np.nan)
+        ap_per_class.append(np.nan)
+    else:
+        pr_auc_per_class.append(pr_auc(y, s))
+        ap_per_class.append(average_precision(y, s))
+
+# Macro: average without NaN
+macro_roc_auc = float(np.nanmean(roc_auc_per_class)) if len(roc_auc_per_class) else float('nan')
+macro_pr_auc  = float(np.nanmean(pr_auc_per_class))  if len(pr_auc_per_class)  else float('nan')
+macro_mAP     = float(np.nanmean(ap_per_class))      if len(ap_per_class)      else float('nan')
+
+# Micro-average: all the classes
+y_micro = Y_scores.ravel()
+s_micro = S_scores.ravel()
+_, _, micro_roc_auc = roc_points(y_micro, s_micro)
+micro_pr_auc        = pr_auc(y_micro, s_micro)
+micro_mAP           = average_precision(y_micro, s_micro)
+
+print("\n— AUC scores —")
+print("Per-class ROC-AUC:", [f"{x:.3f}" if np.isfinite(x) else "—" for x in roc_auc_per_class])
+print("Per-class PR-AUC: ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in pr_auc_per_class])
+print("Per-class AP:     ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in ap_per_class])
+print(f"Macro ROC-AUC={macro_roc_auc:.3f} | Macro PR-AUC={macro_pr_auc:.3f} | Macro mAP={macro_mAP:.3f}")
+print(f"Micro ROC-AUC={micro_roc_auc:.3f} | Micro PR-AUC={micro_pr_auc:.3f} | Micro mAP={micro_mAP:.3f}")
+
+# end test
 print("\nEnded TEST phase successfully!")
 
 # 13. Plots
@@ -1214,5 +1337,73 @@ plt.xlabel("Time (ms)")
 plt.ylabel("v")
 plt.title("Membrane potentials during always-on loop")
 plt.legend(loc="upper right")
+plt.tight_layout()
+plt.show()
+
+# d) Neuromodulators/WTA plot
+# d1) Neuromodulators
+plt.figure(figsize=(10,3))
+for k in ['DA','HT','NE','HI','ACH','GABA']:
+    plt.plot(mod_mon.t/b.ms, getattr(mod_mon, k)[0], label=k)
+plt.legend(); 
+plt.title('Neuromodulators through the time');
+plt.legend(loc="upper right") 
+plt.xlabel('ms'); 
+plt.tight_layout(); 
+plt.show()
+
+plt.figure(figsize=(6,3))
+# extimation of the average WTA movement
+# d2) WTA / inh_scale
+plt.figure(figsize=(8,3))
+
+t = inh_mon.t / b.ms
+# temporal average
+y0 = np.asarray(inh_mon.inh_scale)[0]  # sinapse 0
+
+y_mean_over_syn = np.mean(np.asarray(inh_mon.inh_scale), axis=0)
+
+plt.plot(t, y0, label='inh_scale: syn 0')
+plt.plot(t, y_mean_over_syn, label='mean over synapses')
+
+# linea orizzontale con la media temporale (indicatore sintetico)
+plt.axhline(y_mean_over_syn.mean(), linestyle='--', linewidth=1,
+            label=f'time mean={y_mean_over_syn.mean():.2f}')
+
+plt.title('WTA (inh\\_scale) nel tempo')
+plt.xlabel('ms')
+plt.ylabel('inh\\_scale')
+plt.legend(loc='upper right')
+plt.tight_layout()
+plt.show()
+
+# e) pos/neg EMA plot
+for c in range(num_tastes-1):
+    pos = np.array(pos_counts[c]); neg = np.array(neg_counts[c])
+    plt.figure(figsize=(5,3))
+    plt.hist(neg, bins=20, alpha=0.6, label='neg')
+    plt.hist(pos, bins=20, alpha=0.6, label='pos')
+    plt.axvline(thr_per_class[c], ls='--')
+    plt.title(f'{taste_map[c]}  | thr={int(thr_per_class[c])}')
+    plt.xlabel('#spike per trial'); 
+    plt.ylabel('freq'); 
+    plt.legend(loc="upper right"); 
+    plt.tight_layout(); 
+    plt.show()
+
+# f) Cross-talk off-diagonal weights
+W = np.zeros((num_tastes, num_tastes))
+Si = np.array(syn.i[:])
+Sj = np.array(syn.j[:])
+Sw = np.array(syn.w[:])
+for ii, jj, ww in zip(Si, Sj, Sw):
+    W[int(ii), int(jj)] = float(ww)
+
+plt.figure(figsize=(6,5))
+plt.imshow(W[:unknown_id, :unknown_id], aspect='equal')
+plt.xticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)], rotation=45)
+plt.yticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)])
+plt.colorbar(label='w')
+plt.title('Weights matrix (note→note)')
 plt.tight_layout()
 plt.show()
