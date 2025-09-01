@@ -659,7 +659,7 @@ for input_rates, true_ids, label in training_stimuli:
           # big true positive
           if spikes_i >= tp_gate[idx]:
             # reward amplified by DA dopamine ACh acetylcholine and inhibited by 5-HT serotonine
-            ht_eff = min(HT_now, 0.5)   # max 0.5 Serotonine unit as penalty
+            ht_eff = min(HT_now, 0.5)   # max 0.5 serotonine unit as penalty
             r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * ht_eff)
             r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
             conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
@@ -684,7 +684,7 @@ for input_rates, true_ids, label in training_stimuli:
             for q in range(num_tastes-1):
                 if q == p:
                    continue
-                # punish only if: hot EMA and q break the big FP threshold
+                # punish only if: hot EMA and q break the big FP threshold -> big FP case
                 if step > fp_gate_warmup_steps and float(diff_counts[q]) >= fp_gate[q]:
                    si = ij_to_si.get((p, q), None)
                    if si is None:
@@ -706,14 +706,14 @@ for input_rates, true_ids, label in training_stimuli:
     else:
         mod.HI[:] += hi_pulse_miss'''
 
-    # qualità = Jaccard(T, P)
+    # quality = Jaccard(T, P)
     T = set(true_ids); P = set(winners)
     jacc = len(T & P) / len(T | P) if (T | P) else 1.0
 
     if jacc >= 0.67:
-        mod.DA[:] += da_pulse_reward * jacc         # gratifica scalata
+        mod.DA[:] += da_pulse_reward * jacc # scaled reward
     elif jacc > 0.0:
-        mod.DA[:] += 0.4 * da_pulse_reward * jacc   # piccola gratifica parziale
+        mod.DA[:] += 0.4 * da_pulse_reward * jacc # partial reward
         mod.HI[:] += 0.5 * hi_pulse_miss
     else:
         mod.HI[:] += hi_pulse_miss
