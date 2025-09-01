@@ -336,7 +336,6 @@ taste_neurons.homeo_on = 1.0 # ON in training
 if connectivity_mode == "diagonal":
     S.connect('i == j and i != unknown_id') # diagonal-connected
 else:  # dense
-    #S.connect('i != unknown_id') # fully-connected
     S.connect('i != unknown_id and j != unknown_id') # fully-connected without UNKNOWN
 
 # init weights
@@ -442,8 +441,8 @@ for _ in range(n_repeats): # N repeats for every training taste
 
 # new random couples of tastes and mixtures to stress more the net
 extra_mixes = [
-    [0,4], [1,2], [3,5], [2,6],
-    [0,1,4], [2,3,6], [0,2,4,6]
+    [1,4], [1,5], [3,4], [0,6],
+    [2,3,4], [3,5,6], [1,3,4,6]
 ]
 for _ in range(n_repeats):
     for mix in extra_mixes:
@@ -464,10 +463,10 @@ random.shuffle(training_stimuli) # continually randomize the stimuli without ada
 # decoder parameters initialization
 pos_counts = {idx: [] for idx in range(num_tastes-1)}
 neg_counts = {idx: [] for idx in range(num_tastes-1)}
-ema_neg_m1 = np.zeros(num_tastes-1)  # E[x]
-ema_neg_m2 = np.zeros(num_tastes-1)  # E[x^2]
-ema_pos_m1 = np.zeros(num_tastes-1)
-ema_pos_m2 = np.zeros(num_tastes-1)
+ema_neg_m1 = np.zeros(num_tastes-1)  # E[x] neg
+ema_neg_m2 = np.zeros(num_tastes-1)  # E[x^2] neg
+ema_pos_m1 = np.zeros(num_tastes-1)  # E[x] pos
+ema_pos_m2 = np.zeros(num_tastes-1)  # E[x^2] pos
 
 # 10. Main "always-on" loop
 print("\nStarting TRAINING phase...")
@@ -546,7 +545,7 @@ for input_rates, true_ids, label in training_stimuli:
     # 5-HT increase bias | HI decrease bias
     taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI * HI_now) * b.mV
 
-    # 1) training stimulus with masking on no target neurons
+    # 1) training stimulus with masking on no-target neurons
     masked = np.zeros_like(input_rates)
     masked[true_ids] = input_rates[true_ids]
     set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids))
@@ -555,7 +554,7 @@ for input_rates, true_ids, label in training_stimuli:
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
-    # to manage GABA during trial if there are too many spikes
+    # to manage GABA during trial if there are too many spikes -> stabilizing the net
     total_spikes  = float(np.sum(diff_counts[:unknown_id]))
     active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
     if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
@@ -608,7 +607,7 @@ for input_rates, true_ids, label in training_stimuli:
                 ema_pos_m1[idx] - ema_factor * pos_sd_i)
        fp_gate_i = max(thr_ema_i, rel)
 
-       # safety clamp
+       # safety clamp for infinite values
        if not np.isfinite(tp_gate_i): tp_gate_i = 0.0
        if not np.isfinite(fp_gate_i): fp_gate_i = 0.0
 
@@ -622,12 +621,12 @@ for input_rates, true_ids, label in training_stimuli:
     margin_ok = (second <= 0) or (top / (second + 1e-9) >= top2_margin_ratio)
     winners = []
     if top >= min_spikes_for_known and second > 0 and (top / (second + 1e-9) >= top2_margin_ratio):
-        winners = [int(sorted_idx[0])] # only one dominant taste
+        winners = [int(sorted_idx[0])] # only one dominant taste -> single taste case
     else:
         thr = threshold_ratio * mx
         winners = [idx for idx,c in enumerate(scores) if c >= thr]
         if not winners:
-            winners = [int(np.argmax(scores))] # tastes > 1
+            winners = [int(np.argmax(scores))] # winner tastes > 1 -> mixture case
 
     # burst NE
     ambiguous = (second > 0 and top/(second + 1e-9) < 1.3) or (len(winners) > 2)
@@ -660,10 +659,10 @@ for input_rates, true_ids, label in training_stimuli:
           # big true positive
           if spikes_i >= tp_gate[idx]:
             # reward amplified by DA dopamine ACh acetylcholine and inhibited by 5-HT serotonine
-            ht_eff = min(HT_now, 0.5)   # massimo 0.5 unità di serotonina come penalità
+            ht_eff = min(HT_now, 0.5)   # max 0.5 Serotonine unit as penalty
             r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * ht_eff)
             r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
-            conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)  # già calcoli top/second
+            conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
             r *= 0.5 + 0.5 * conf   # 0.5–1.0
        else:
          # big FP (after warm-up EMA)
@@ -1352,7 +1351,7 @@ plt.xlabel('ms');
 plt.tight_layout(); 
 plt.show()
 
-plt.figure(figsize=(6,3))
+#plt.figure(figsize=(6,3))
 # extimation of the average WTA movement
 # d2) WTA / inh_scale
 plt.figure(figsize=(8,3))
