@@ -73,12 +73,14 @@ def pbar_done(stream=sys.stdout):
     stream.flush()
     _last_pbar_len = 0
 
-# Rates vector helper with normalization
-def set_stimulus_vect_norm(rate_vec, total_rate=None):
-    r = np.asarray(rate_vec, dtype=float).copy()
+# Rates vector helper with normalization including UNKNOWN only when it is needed
+def set_stimulus_vect_norm(rate_vec, total_rate=None, include_unknown=False):
+    r = np.asarray(rate_vec, float).copy()
+    unk = r[unknown_id] if include_unknown else 0.0
     r[unknown_id] = 0.0
     if total_rate is not None and r.sum() > 0:
         r *= float(total_rate) / r.sum()
+    r[unknown_id] = unk
     pg.rates = r * b.Hz
 
 # Rates vector helper without normalization
