@@ -1102,7 +1102,6 @@ taste_neurons.ge[:] = 0 * b.nS
 taste_neurons.gi[:] = 0 * b.nS
 taste_neurons.s[:]  = 0
 taste_neurons.wfast[:] = 0 * b.mV
-pg_noise.rates = 0 * b.Hz # noise silenced test
 S.Apre[:] = 0
 S.Apost[:] = 0
 S.elig[:] = 0
@@ -1134,7 +1133,7 @@ if test_emotion_mode == "off":
     taste_neurons.theta_bias[:] = 0 * b.mV
     inhibitory_S.inh_scale = 1.0
     S.ex_scale = 1.0  # gain reset
-    pg_noise.rates = baseline_hz * np.ones(num_tastes) * b.Hz
+    pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
 else:
     # test with neuromodulators
     HT_now = float(mod.HT[0])
@@ -1252,12 +1251,17 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     if drv_now > thr_now:
         mod.HT[:] += 0.25
 
+    # 3) take the winners using per-class thresholds
+    scores = diff_counts.astype(float)
+    scores[unknown_id] = -1e9
+    mx = scores.max()
+
     y_true = np.zeros(unknown_id, dtype=int)
     for tdx in true_ids:
         if tdx != unknown_id:
             y_true[tdx] = 1
 
-    all_scores.append(scores.copy())
+    all_scores.append(scores[:unknown_id].copy())
     all_targets.append(y_true.copy())
 
     # GABA stabilization as in training phase
@@ -1279,10 +1283,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 thr_ema = ema_neg_m1[idxs] + k_sigma * sd_ema
                 thr_per_class[idxs] = max(thr_per_class[idxs], thr_ema)
 
-    # 3) take the winners using per-class thresholds
-    scores = diff_counts.astype(float)
-    scores[unknown_id] = -1e9
-    mx = scores.max()
 
     sorted_idx = np.argsort(scores)[::-1]
     top = scores[sorted_idx[0]]
