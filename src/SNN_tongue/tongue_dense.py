@@ -113,7 +113,7 @@ taste_labels = ["SWEET", "BITTER", "SALTY", "SOUR", "UMAMI",
                  "FATTY", "SPICY", "UNKNOWN"]
 taste_reactions = {
     0: "Ouh... yummy!",
-    1: "So acid!",
+    1: "So bitter!",
     2: "Need water... now!",
     3: "Mehhh!",
     4: "So delicious!",
@@ -299,37 +299,37 @@ def set_gaba(on=True):
 
 # helper to index test tastes without noise in the stimuli list
 def make_mix(ids, amp=250):
-    v = np.zeros(num_tastes)
-    for idx in ids: v[idx] = amp
+    vix= np.zeros(num_tastes)
+    for idx in ids: vix[idx] = amp
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
-    return v, ids, f"TASTE: {label}"
+    return vix, ids, f"TASTE: {label}"
 
 # helper to index training tastes in the stimuli list
 def noisy_mix(ids, amp=250, mu=noise_mu, sigma=noise_sigma):
-    v = np.clip(np.random.normal(mu, sigma, num_tastes), 0, None)
+    vix = np.clip(np.random.normal(mu, sigma, num_tastes), 0, None)
     for idx in ids:
-        v[idx] = amp
+        vix[idx] = amp
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
-    return v, ids, f"TASTE: {label} (train)"
+    return vix, ids, f"TASTE: {label} (train)"
 
 # --- test generators OOD/NULL (expected = UNKNOWN) ---
 def make_null(low=5, high=20):
-    v = np.random.randint(low, high+1, size=num_tastes).astype(float)
-    v[unknown_id] = 0.0
-    return v, [unknown_id], "NULL (only low background)"
+    vix = np.random.randint(low, high+1, size=num_tastes).astype(float)
+    vix[unknown_id] = 0.0
+    return vix, [unknown_id], "NULL (only low background)"
 
 def make_ood_diffuse(low=20, high=80):
     # no dominant class
-    v = np.random.uniform(low, high, size=num_tastes)
-    v[unknown_id] = 0.0
-    return v, [unknown_id], "OOD (diffuse low-mid rates)"
+    vix = np.random.uniform(low, high, size=num_tastes)
+    vix[unknown_id] = 0.0
+    return vix, [unknown_id], "OOD (diffuse low-mid rates)"
 
 def make_ood_many(low=60, high=130, k=5):
     # many average-low canals
-    v = np.zeros(num_tastes)
+    vix = np.zeros(num_tastes)
     picks = np.random.choice(np.arange(num_tastes-1), size=k, replace=False)
-    v[picks] = np.random.uniform(low, high, size=k)
-    return v, [unknown_id], f"OOD (many-{k} mid amps)"
+    vix[picks] = np.random.uniform(low, high, size=k)
+    return vix, [unknown_id], f"OOD (many-{k} mid amps)"
 
 # 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis and dynamic SPICY aversion
 taste_neurons = b.NeuronGroup(
@@ -435,15 +435,16 @@ S = b.Synapses(
         dApost/dt     = -Apost/tau  : 1 (event-driven)
         delig/dt      = -elig/Te    : 1 (clock-driven)
         ex_scale      : 1
+        stdp_on       : 1
     ''',
     on_pre='''
         ge_post += w * g_step_exc * ex_scale
-        Apre    += A_plus
-        elig    += Apost
+        Apre    += stdp_on * A_plus
+        elig    += stdp_on * Apost
     ''',
     on_post='''
-        Apost   += A_minus
-        elig    += Apre
+        Apost   += stdp_on * A_minus
+        elig    += stdp_on * Apre
     ''',
     method='exact',
     namespace={
@@ -683,6 +684,7 @@ taste_neurons.thr_lo[:unknown_id] = taste_neurons.thr0_lo[:unknown_id]
 
 # 10. Main "always-on" loop
 print("\nStarting TRAINING phase...")
+S.stdp_on[:] = 1.0
 S.Apre[:]  = 0
 S.Apost[:] = 0
 S.elig[:]  = 0
@@ -730,12 +732,6 @@ for input_rates, true_ids, label in training_stimuli:
     taste_neurons.taste_drive[:] = 0.0
     taste_neurons.av_over[:]  = 0.0
     taste_neurons.av_under[:] = 0.0
-
-    # 5-HT anticipatory serotonine -> aversive episode happened?
-    '''aversive_now = any((cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids)
-    # if there was a possible aversive episode
-    if aversive_now:
-        mod.HT[:] += ht_pulse_aversion # increase caution before imminent training'''
 
     # ACh must to be high during in training for efficient plasticity
     mod.ACH[:] = ach_train_level
@@ -791,12 +787,7 @@ for input_rates, true_ids, label in training_stimuli:
     active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
     if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
         mod.GABA[:] += gaba_pulse_stabilize
-    # periodic ablation debug
-    '''if step % 5 == 0:
-        print(f"\n[dbg] step={step} spikes_tot={total_spikes:.0f} active={active_neurs} "
-          f"WTA={float(np.mean(inhibitory_S.inh_scale[:])):.2f} "
-          f"DA={DA_now:.2f} HT={HT_now:.2f} NE={NE_now:.2f} HI={HI_now:.2f} "
-          f"ACH={ACH_now:.2f} GABA={GABA_now:.2f}")'''
+
     # collect all positive and negative counts
     for idx in range(num_tastes-1):
         if idx in true_ids:
@@ -870,13 +861,6 @@ for input_rates, true_ids, label in training_stimuli:
     order = np.argsort(scores)
     dbg = [(taste_map[idx], int(scores[idx])) for idx in order[::-1]]
 
-    # matches evaluation
-    '''if step % 5 == 0:
-        T = set(true_ids); P = set(winners)
-        jacc = len(T & P) / len(T | P) if (T | P) else 1.0
-        print(f"[match] T={sorted(list(T))} P={sorted(list(P))} J={jacc:.2f} "
-          f"top={top:.0f} second={second:.0f} thr_tp={int(np.mean(tp_gate))} thr_fp={int(np.mean(fp_gate))}")'''
-
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
     for idx in range(num_tastes-1):
@@ -931,12 +915,6 @@ for input_rates, true_ids, label in training_stimuli:
                    S.elig[si] = 0.0
     
     # burst neuromodulators DA and 5-HT for the next trial as in a human-inspired biology brain
-    # global reward if the prediction is correct
-    '''if set(winners) == set(true_ids):
-        mod.DA[:] += da_pulse_reward
-    else:
-        mod.HI[:] += hi_pulse_miss'''
-
     # quality = Jaccard(T, P)
     T = set(true_ids); P = set(winners)
     jacc = len(T & P) / len(T | P) if (T | P) else 1.0
@@ -1016,10 +994,6 @@ for input_rates, true_ids, label in training_stimuli:
 
         S.w[:] = w_all
 
-    # light weight decay for all the weights to avoid constant saturation to w=1 -> TO REMOVE if homeostasis (in this problem HOMEOSTASIS is biologically better)
-    '''if weight_decay > 0:
-        S.w[:] = np.clip(S.w[:] * (1 - weight_decay), 0, 1)'''
-
     # 5) eligibility trace decay among trials
     net.run(pause_duration)
     S.elig[:] = 0
@@ -1062,11 +1036,46 @@ for idx in range(num_tastes-1):
 print("Per-class thresholds (hybrid μ+kσ, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class[idx]) for idx in range(num_tastes-1)})
 
-# DEBUG: printing pos and neg values for each class
-for idx in [0,2,3]: # SWEET, SALTY, SOUR
-    print(taste_map[idx],
-          "pos μ,σ=", np.mean(pos_counts[idx]), np.std(pos_counts[idx]),
-          "neg μ,σ=", np.mean(neg_counts[idx]), np.std(neg_counts[idx]))
+# OOD/NULL calibration: increase threshold on OOD queues
+def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms):
+    saved_stdp = float(S.stdp_on[0])
+    S.stdp_on[:] = 0.0
+    saved_noise = pg_noise.rates
+    pg_noise.rates = 0 * b.Hz
+    tmp = [[] for _ in range(num_tastes-1)]
+
+    # NULL
+    for _ in range(n_null):
+        vix, _, _ = make_null()
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
+        if gap > 0* b.ms: net.run(gap)
+
+    # OOD
+    for _ in range(n_ood):
+        vix, _, _ = make_ood_diffuse()
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
+        if gap > 0* b.ms: net.run(gap)
+
+    # at least -> 99.5° percentile
+    for idx in range(num_tastes-1):
+        if tmp[idx]:
+            thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.995)))
+
+    pg_noise.rates = saved_noise
+    S.stdp_on[:] = saved_stdp
+
+# call that function
+ood_calibration(n_null=8, n_ood=16, dur=200*b.ms, gap=0*b.ms)
 
 # printing scaled weights after training
 print(f"Target weights after training:")
@@ -1086,7 +1095,7 @@ net.add(test_w_mon)
 # 11. Freezing STDP, homeostatis and input conductance
 print("Freezing STDP for TEST phase…")
 # to manage baseline_hz noise during test phase
-use_test_noise = True
+use_test_noise = False
 test_baseline_hz = baseline_hz if use_test_noise else 0.0
 # Neuromodulator parameters in test
 k_inh_HI_test   = -0.08
@@ -1094,9 +1103,7 @@ k_inh_HT_test = 0.4
 k_theta_HI_test = -0.5
 k_ex_HI_test    = 0.15
 k_noise_HI_test = 0.15
-ht_pulse_aversion = 0.5
-S.pre.code  = 'ge_post += w * g_step_exc * ex_scale'
-S.post.code = ''
+ht_pulse_aversion_test = 0.5
 taste_neurons.v[:] = EL
 taste_neurons.ge[:] = 0 * b.nS
 taste_neurons.gi[:] = 0 * b.nS
@@ -1110,7 +1117,7 @@ taste_neurons.homeo_on = 0.0
 th = taste_neurons.theta[:]
 th = th - np.mean(th) # centered
 theta_min, theta_max = -10*b.mV, 10*b.mV
-taste_neurons.theta[:] = np.clip(th, theta_min, theta_max)
+taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
 # deactivate state effect for DA and 5-HT for clean test phase
 taste_neurons.theta_bias[:] = 0 * b.mV
 inhibitory_S.inh_scale = 1.0
@@ -1163,9 +1170,12 @@ eps_ema = 1e-3
 
 # 12. TEST PHASE
 print("\nStarting TEST phase...")
+S.stdp_on[:] = 0.0
 results = []
 # low ACh in test phase
+#ach_test_level = 0.0
 mod.ACH[:] = ach_test_level
+pg_noise.rates = 0 * b.Hz
 test_t0 = time.perf_counter()  # start stopwatch TEST
 # Scale decoder thresholds to the test window
 dur_scale = float(test_duration / training_duration)
@@ -1220,10 +1230,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
         ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
         pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
-        '''if test_emotion_mode == "active": # aversive anticipation: if SPICY, increase 5-HT 
-            aversive_now = any( (cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids ) 
-            if aversive_now: 
-                mod.HT[:] += ht_pulse_aversion'''
 
     # 1) stimulus on target classes with UNKNOWN inputs
     if len(true_ids) == 1 and true_ids[0] == unknown_id:
@@ -1252,60 +1258,48 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         mod.HT[:] += 0.25
 
     # 3) take the winners using per-class thresholds
+    # --- decisione robusta con filtro OOD/NULL ---
     scores = diff_counts.astype(float)
     scores[unknown_id] = -1e9
     mx = scores.max()
 
-    y_true = np.zeros(unknown_id, dtype=int)
-    for tdx in true_ids:
-        if tdx != unknown_id:
-            y_true[tdx] = 1
-
-    all_scores.append(scores[:unknown_id].copy())
-    all_targets.append(y_true.copy())
-
-    # GABA stabilization as in training phase
-    total_spikes  = float(np.sum(diff_counts[:unknown_id]))
-    active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
-    if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
-        mod.GABA[:] += gaba_pulse_stabilize
-    # maintaining EMA during test phase
-    if decoder_adapt_on_test:
-        for idxs in range(num_tastes-1):
-            if idxs in true_ids:
-                ema_pos_m1[idxs], ema_pos_m2[idxs] = ema_update(ema_pos_m1[idxs], ema_pos_m2[idxs],
-                                                          float(diff_counts[idxs]), ema_lambda)
-            else:
-                ema_neg_m1[idxs], ema_neg_m2[idxs] = ema_update(ema_neg_m1[idxs], ema_neg_m2[idxs],
-                                                          float(diff_counts[idxs]), ema_lambda)
-                # increment threshold if FP grow up
-                sd_ema = ema_sd(ema_neg_m1[idxs], ema_neg_m2[idxs])
-                thr_ema = ema_neg_m1[idxs] + k_sigma * sd_ema
-                thr_per_class[idxs] = max(thr_per_class[idxs], thr_ema)
-
+    all_scores.append(scores[:unknown_id].astype(float))
+    tgt = np.zeros(num_tastes-1, dtype=int)
+    for tid in true_ids:
+        if tid != unknown_id:
+            tgt[tid] = 1
+    all_targets.append(tgt)
 
     sorted_idx = np.argsort(scores)[::-1]
-    top = scores[sorted_idx[0]]
-    second = scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
+    top_idx = int(sorted_idx[0])
+    top = float(scores[top_idx])
+    second = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
+    sep = (top - second) / (top + 1e-9)  # relative separation
 
-    base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
-    rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
-    rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel] if use_rel_gate_in_test else []
+    # scaled z-score during test
+    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+    z = scores[:unknown_id] / pos_expect_test
 
-    pos_expect = np.maximum(ema_pos_m1, eps_ema)
-    z = scores[:unknown_id] / pos_expect
-    z_max = float(np.max(z)) if z.size else 0.0
-    norm_winners = []
-    for i in range(num_tastes-1):
-        if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes):
-            mini = 0.25 * thr_per_class[i]
-            if scores[i] >= mini:
-                norm_winners.append(i)
+    # hyperparameters
+    z_min = 0.50                        
+    sep_min = 0.25                       # just during the fallback
+    abs_margin_test = max(2.0, 5.0 * float(test_duration / training_duration))
 
-    winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
+    # multi-label candidates: threshold per-class + z-score
+    strict_winners = [
+        i for i in range(num_tastes-1)
+        if (scores[i] >= (thr_per_class[i] + abs_margin_test)) and (z[i] >= z_min)
+    ]
 
-    # reject rules
-    if (mx < min_spikes_for_known_test) or (len(winners) == 0):
+    winners = strict_winners
+
+    # fallback: if nobody pass, we only take the winner if is really winner
+    if not winners:
+        if (scores[top_idx] >= thr_per_class[top_idx] + abs_margin_test) and (z[top_idx] >= z_min) and (sep >= sep_min):
+            winners = [top_idx]
+
+    # avoiding if it is so weak
+    if (top < min_spikes_for_known_test) or (len(winners) == 0):
         winners = [unknown_id]
 
     order = np.argsort(scores)
@@ -1439,119 +1433,114 @@ if jaccard_per_case:
     print("\nJaccard per test-case:", [f"{j:.2f}" for j in jaccard_per_case])
     print(f"Average Jaccard (set vs set): {mean_jaccard_cases:.2f}")
 
-# weight changes during test confrontation -> they don't change because STDP frozen during test phase
-print("\nWeight changes during unsupervised test:")
-for k in range(num_tastes-1):
-    if k in diag_idx:
-        si = diag_idx[k]
-        print(f"  {taste_map[k]}→{taste_map[k]}: Δw = {float(S.w[si] - w_before_test[si]):+.4f}")
-
 # PR-/ROC-AUC management
-S_scores = np.vstack(all_scores)   # shape: (N_trials, C)
-Y_scores = np.vstack(all_targets)  # shape: (N_trials, C)
-n_classes_scores = S_scores.shape[1]
-# class support pos/neg and AP baseline ≈ pos/N
-print("\n- Supports and AP baseline for every class -")
-for c in range(Y_scores.shape[1]):
-    n_pos = int(Y_scores[:, c].sum())
-    n_neg = int(Y_scores.shape[0] - n_pos)
-    base_ap = (n_pos / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else float('nan')
-    print(f"{taste_map[c]:>6s}: support +={n_pos}, -={n_neg}, baseline AP≈{base_ap:.3f}")
-C_scores = S_scores.shape[1]
+if len(all_scores) > 0 and len(all_targets) > 0:
+    S_scores = np.vstack(all_scores)   # shape: (N_trials, C)
+    Y_scores = np.vstack(all_targets)  # shape: (N_trials, C)
+    # class support pos/neg and AP baseline ≈ pos/N
+    print("\n- Supports and AP baseline for every class -")
+    for c in range(Y_scores.shape[1]):
+        n_pos = int(Y_scores[:, c].sum())
+        n_neg = int(Y_scores.shape[0] - n_pos)
+        base_ap = (n_pos / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else float('nan')
+        print(f"{taste_map[c]:>6s}: support +={n_pos}, -={n_neg}, baseline AP≈{base_ap:.3f}")
 
-def roc_points(y, s):
-    # y ∈ {0,1}, s = continual scores
-    order = np.argsort(-s)
-    y = y[order]
-    P = int(y.sum()); N = len(y) - P
-    tps = np.cumsum(y)
-    fps = np.cumsum(1 - y)
-    TPR = tps / (P if P > 0 else 1)
-    FPR = fps / (N if N > 0 else 1)
-    # key points
-    TPR = np.concatenate(([0.0], TPR, [1.0]))
-    FPR = np.concatenate(([0.0], FPR, [1.0]))
-    auc = float(np.trapz(TPR, FPR))
-    return FPR, TPR, auc
+    def roc_points(y, s):
+        # y ∈ {0,1}, s = continual scores
+        order = np.argsort(-s)
+        y = y[order]
+        P = int(y.sum()); N = len(y) - P
+        tps = np.cumsum(y)
+        fps = np.cumsum(1 - y)
+        TPR = tps / (P if P > 0 else 1)
+        FPR = fps / (N if N > 0 else 1)
+        # key points
+        TPR = np.concatenate(([0.0], TPR, [1.0]))
+        FPR = np.concatenate(([0.0], FPR, [1.0]))
+        auc = float(np.trapz(TPR, FPR))
+        return FPR, TPR, auc
 
-def pr_auc(y, s):
-    y = np.asarray(y, dtype=int)
-    s = np.asarray(s, dtype=float)
-    P = int(y.sum())
-    N = len(y) - P
-    if P == 0 or N == 0:
-        return float('nan')
-    order = np.argsort(-s)
-    y = y[order]
-    tp = np.cumsum(y)
-    fp = np.cumsum(1 - y)
-    prec = tp / np.maximum(tp + fp, 1)
-    rec  = tp / P
-    # envelope: precision doesn't grow when recall grows up
-    prec = np.maximum.accumulate(prec[::-1])[::-1]
-    # key points
-    rec  = np.concatenate(([0.0], rec, [1.0]))
-    prec = np.concatenate(([1.0], prec, [prec[-1]]))
-    return float(np.trapz(prec, rec))
+    def pr_auc(y, s):
+        y = np.asarray(y, dtype=int)
+        s = np.asarray(s, dtype=float)
+        P = int(y.sum())
+        N = len(y) - P
+        if P == 0 or N == 0:
+            return float('nan')
+        order = np.argsort(-s)
+        y = y[order]
+        tp = np.cumsum(y)
+        fp = np.cumsum(1 - y)
+        prec = tp / np.maximum(tp + fp, 1)
+        rec  = tp / P
+        # envelope: precision doesn't grow when recall grows up
+        prec = np.maximum.accumulate(prec[::-1])[::-1]
+        # key points
+        rec  = np.concatenate(([0.0], rec, [1.0]))
+        prec = np.concatenate(([1.0], prec, [prec[-1]]))
+        return float(np.trapz(prec, rec))
 
-def average_precision(y, s):
-    y = np.asarray(y, dtype=int)
-    s = np.asarray(s, dtype=float)
-    P = int(y.sum())
-    if P == 0:
-        return float('nan')
-    order = np.argsort(-s)
-    y = y[order]
-    tp = 0
-    ap = 0.0
-    for idx, yi in enumerate(y, start=1):
-        if yi == 1:
-            tp += 1
-            ap += tp / idx
-    return ap / P
+    def average_precision(y, s):
+        y = np.asarray(y, dtype=int)
+        s = np.asarray(s, dtype=float)
+        P = int(y.sum())
+        if P == 0:
+            return float('nan')
+        order = np.argsort(-s)
+        y = y[order]
+        tp = 0
+        ap = 0.0
+        for idx, yi in enumerate(y, start=1):
+            if yi == 1:
+                tp += 1
+                ap += tp / idx
+        return ap / P
 
-roc_auc_per_class = []
-pr_auc_per_class  = []
-ap_per_class      = []
+    C_scores = S_scores.shape[1]
+    roc_auc_per_class = []
+    pr_auc_per_class  = []
+    ap_per_class      = []
 
-for c in range(C_scores):
-    y = Y_scores[:, c]; s = S_scores[:, c]
+    for c in range(C_scores):
+        y = Y_scores[:, c]; s = S_scores[:, c]
 
-    # ROC-AUC at least one positive and one negative
-    if np.unique(y).size < 2:
-        roc_auc_per_class.append(np.nan)
-    else:
-        _, _, auc_roc = roc_points(y, s)
-        roc_auc_per_class.append(auc_roc)
+        # ROC-AUC at least one positive and one negative
+        if np.unique(y).size < 2:
+            roc_auc_per_class.append(np.nan)
+        else:
+            _, _, auc_roc = roc_points(y, s)
+            roc_auc_per_class.append(auc_roc)
 
-    # PR-AUC and AP at least one positive
-    if y.sum() == 0:
-        pr_auc_per_class.append(np.nan)
-        ap_per_class.append(np.nan)
-    else:
-        pr_auc_per_class.append(pr_auc(y, s))
-        ap_per_class.append(average_precision(y, s))
+        # PR-AUC and AP at least one positive
+        if y.sum() == 0:
+            pr_auc_per_class.append(np.nan)
+            ap_per_class.append(np.nan)
+        else:
+            pr_auc_per_class.append(pr_auc(y, s))
+            ap_per_class.append(average_precision(y, s))
 
-# Macro: average without NaN
-macro_roc_auc = float(np.nanmean(roc_auc_per_class)) if len(roc_auc_per_class) else float('nan')
-macro_pr_auc  = float(np.nanmean(pr_auc_per_class))  if len(pr_auc_per_class)  else float('nan')
-macro_mAP     = float(np.nanmean(ap_per_class))      if len(ap_per_class)      else float('nan')
+    # Macro: average without NaN
+    macro_roc_auc = float(np.nanmean(roc_auc_per_class)) if len(roc_auc_per_class) else float('nan')
+    macro_pr_auc  = float(np.nanmean(pr_auc_per_class))  if len(pr_auc_per_class)  else float('nan')
+    macro_mAP     = float(np.nanmean(ap_per_class))      if len(ap_per_class)      else float('nan')
 
-# Micro-average: all the classes
-y_micro = Y_scores.ravel()
-s_micro = S_scores.ravel()
-_, _, micro_roc_auc = roc_points(y_micro, s_micro)
-micro_pr_auc        = pr_auc(y_micro, s_micro)
-micro_mAP           = average_precision(y_micro, s_micro)
+    # Micro-average: all the classes
+    y_micro = Y_scores.ravel()
+    s_micro = S_scores.ravel()
+    _, _, micro_roc_auc = roc_points(y_micro, s_micro)
+    micro_pr_auc        = pr_auc(y_micro, s_micro)
+    micro_mAP           = average_precision(y_micro, s_micro)
 
-print("\n— AUC scores —")
-print("Per-class ROC-AUC:", [f"{x:.3f}" if np.isfinite(x) else "—" for x in roc_auc_per_class])
-print("Per-class PR-AUC: ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in pr_auc_per_class])
-print("Per-class AP:     ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in ap_per_class])
-print(f"Macro ROC-AUC={macro_roc_auc:.3f} | Macro PR-AUC={macro_pr_auc:.3f} | Macro mAP={macro_mAP:.3f}")
-print(f"Micro ROC-AUC={micro_roc_auc:.3f} | Micro PR-AUC={micro_pr_auc:.3f} | Micro mAP={micro_mAP:.3f}")
+    print("\n— AUC scores —")
+    print("Per-class ROC-AUC:", [f"{x:.3f}" if np.isfinite(x) else "—" for x in roc_auc_per_class])
+    print("Per-class PR-AUC: ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in pr_auc_per_class])
+    print("Per-class AP:     ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in ap_per_class])
+    print(f"Macro ROC-AUC={macro_roc_auc:.3f} | Macro PR-AUC={macro_pr_auc:.3f} | Macro mAP={macro_mAP:.3f}")
+    print(f"Micro ROC-AUC={micro_roc_auc:.3f} | Micro PR-AUC={micro_pr_auc:.3f} | Micro mAP={micro_mAP:.3f}")
+else:
+    print("\n[INFO] Skipping AUC metrics: no stored per-trial score arrays.")
 
-# Rejection (UNKNOWN) metrics
+# Rejection UNKNOWN metrics
 unknown_trials = sum(1 for _, exp, _, _ in results if exp == ['UNKNOWN'])
 unknown_ok = sum(1 for _, exp, pred, _ in results if exp == ['UNKNOWN'] and ('UNKNOWN' in pred))
 if unknown_trials > 0:
@@ -1566,6 +1555,13 @@ unknown_strict_ok = sum(
 )
 if unknown_trials > 0:
     print(f"Rejection accuracy (STRICT): {unknown_strict_ok}/{unknown_trials} = {unknown_strict_ok/unknown_trials:.2%}")
+
+# weight changes during test confrontation -> they don't change because STDP frozen during test phase
+print("\nWeight changes during unsupervised test:")
+for k in range(num_tastes-1):
+    if k in diag_idx:
+        si = diag_idx[k]
+        print(f"  {taste_map[k]}→{taste_map[k]}: Δw = {float(S.w[si] - w_before_test[si]):+.4f}")
 
 # end test
 print("\nEnded TEST phase successfully!")
