@@ -1258,7 +1258,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         mod.HT[:] += 0.25
 
     # 3) take the winners using per-class thresholds
-    # --- decisione robusta con filtro OOD/NULL ---
+    # strong decision with OOD and NULL
     scores = diff_counts.astype(float)
     scores[unknown_id] = -1e9
     mx = scores.max()
@@ -1282,7 +1282,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # hyperparameters
     z_min = 0.50                        
-    sep_min = 0.25                       # just during the fallback
+    sep_min = 0.25 # just during the fallback
     abs_margin_test = max(2.0, 5.0 * float(test_duration / training_duration))
 
     # multi-label candidates: threshold per-class + z-score
