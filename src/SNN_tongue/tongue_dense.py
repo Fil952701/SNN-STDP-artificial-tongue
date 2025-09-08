@@ -848,7 +848,7 @@ for input_rates, true_ids, label in training_stimuli:
 
     # selecting all the spiking winning neurons >= threshold_ratio
     sorted_idx = np.argsort(scores)[::-1]
-    top, second = scores[sorted_idx[0]], (scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0)
+    top = scores[sorted_idx[0]]
     second = scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
     margin_ok = (second <= 0) or (top / (second + 1e-9) >= top2_margin_ratio)
     winners = []
@@ -1086,7 +1086,9 @@ net.add(test_w_mon)
 
 # 11. Freezing STDP, homeostatis and input conductance
 print("Freezing STDP for TEST phase…")
-#baseline_hz = 0.0
+# to manage baseline_hz noise during test phase
+use_test_noise = True
+test_baseline_hz = baseline_hz if use_test_noise else 0.0
 # Neuromodulator parameters in test
 k_inh_HI_test   = -0.08
 k_inh_HT_test = 0.4
@@ -1148,7 +1150,7 @@ else:
     inhibitory_S.inh_scale = max(0.3, _inh)
     # noise (NE decrease, HI increase)
     ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-    pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
+    pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
 
 # to compute more mixtures
 inhibitory_S.namespace['g_step_inh'] = 0.5 * g_step_inh_local
@@ -1219,14 +1221,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # noise
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
         ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
-        pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
+        pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
         '''if test_emotion_mode == "active": # aversive anticipation: if SPICY, increase 5-HT 
             aversive_now = any( (cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids ) 
             if aversive_now: 
                 mod.HT[:] += ht_pulse_aversion'''
 
-    # 0) inject UNKNOWN taste during test phase
-    #_rates_vec = add_unknown(_rates_vec, 20, 60)
     # 1) stimulus on target classes with UNKNOWN inputs
     if len(true_ids) == 1 and true_ids[0] == unknown_id:
         # OOD/NULL → no normalization
@@ -1255,14 +1255,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
     # z-score: z = scores / np.maximum(ema_pos_m1, 1e-9)
-    score_vec = scores
-
     y_true = np.zeros(unknown_id, dtype=int)
     for tdx in true_ids:
         if tdx != unknown_id:
             y_true[tdx] = 1
 
-    all_scores.append(score_vec.copy())
+    all_scores.append(scores.copy())
     all_targets.append(y_true.copy())
 
     # GABA stabilization as in training phase
@@ -1312,29 +1310,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # reject rules
     if (mx < min_spikes_for_known_test) or (len(winners) == 0):
         winners = [unknown_id]
-
-    '''if mx < min_spikes_for_known_test:
-        winners = [unknown_id]
-    else:
-        # absolute gate for each class
-        base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
-        rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
-        rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel] if use_rel_gate_in_test else []
-        pos_expect = np.maximum(ema_pos_m1, eps_ema)
-        z = scores[:unknown_id] / pos_expect
-        z_max = float(np.max(z)) if z.size else 0.0
-
-        norm_winners = []
-        for i in range(num_tastes-1):
-            if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes):
-                # mini-soglia: almeno il 25% della soglia assoluta della classe
-                mini = 0.25 * thr_per_class[i]
-                if scores[i] >= mini:
-                    norm_winners.append(i)
-
-        winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
-        if not winners and mx >= min_spikes_for_known_test:
-            winners = [int(np.argmax(scores))]'''
 
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
@@ -1586,6 +1561,14 @@ if unknown_trials > 0:
     print(f"\nRejection accuracy (UNKNOWN on OOD/NULL): {unknown_ok}/{unknown_trials} = {unknown_ok/unknown_trials:.2%}")
 else:
     print("\n[WARN] No UNKNOWN/OOD trials were included in the test set.")
+
+# to monitor strict rejection
+unknown_strict_ok = sum(
+    1 for _, exp, pred, _ in results
+    if exp == ['UNKNOWN'] and pred == ['UNKNOWN']
+)
+if unknown_trials > 0:
+    print(f"Rejection accuracy (STRICT): {unknown_strict_ok}/{unknown_trials} = {unknown_strict_ok/unknown_trials:.2%}")
 
 # end test
 print("\nEnded TEST phase successfully!")
