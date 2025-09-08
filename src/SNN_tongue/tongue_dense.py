@@ -850,7 +850,6 @@ for input_rates, true_ids, label in training_stimuli:
     sorted_idx = np.argsort(scores)[::-1]
     top = scores[sorted_idx[0]]
     second = scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
-    margin_ok = (second <= 0) or (top / (second + 1e-9) >= top2_margin_ratio)
     winners = []
     if top >= min_spikes_for_known and second > 0 and (top / (second + 1e-9) >= top2_margin_ratio):
         winners = [int(sorted_idx[0])] # only one dominant taste -> single taste case
@@ -1253,7 +1252,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     if drv_now > thr_now:
         mod.HT[:] += 0.25
 
-    scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
+    #scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
     # z-score: z = scores / np.maximum(ema_pos_m1, 1e-9)
     y_true = np.zeros(unknown_id, dtype=int)
     for tdx in true_ids:
@@ -1579,7 +1578,7 @@ plt.figure(figsize=(10,4))
 plt.plot(spike_mon.t/b.ms, spike_mon.i, '.k')
 plt.xlabel("Time (ms)")
 plt.ylabel("Neuron index")
-plt.title("All spikes (input neurons silent, only taste_neurons)")
+plt.title("Taste neurons spikes")
 plt.show()
 
 # b) Weight trajectories for diagonal synapses (i→i)
