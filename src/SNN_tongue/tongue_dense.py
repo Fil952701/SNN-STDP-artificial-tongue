@@ -1587,11 +1587,10 @@ plt.show()
 plt.figure(figsize=(10,3))
 for k in ['DA','HT','NE','HI','ACH','GABA']:
     plt.plot(mod_mon.t/b.ms, getattr(mod_mon, k)[0], label=k)
-plt.legend(); 
-plt.title('Neuromodulators through the time');
+plt.title('Neuromodulators through the time')
 plt.legend(loc="upper right") 
-plt.xlabel('ms'); 
-plt.tight_layout(); 
+plt.xlabel('ms') 
+plt.tight_layout() 
 plt.show()
 
 # extimation of the average WTA movement
@@ -1608,7 +1607,7 @@ plt.plot(t, y_mean_over_syn, label='mean over synapses')
 plt.axhline(y_mean_over_syn.mean(), linestyle='--', linewidth=1,
             label=f'time mean={y_mean_over_syn.mean():.2f}')
 
-plt.title('WTA (inh\\_scale) nel tempo')
+plt.title('WTA (inh\\_scale) through the time')
 plt.xlabel('ms')
 plt.ylabel('inh\\_scale')
 plt.legend(loc='upper right')
@@ -1654,7 +1653,7 @@ plt.plot(spice_mon.t/b.ms, spice_mon.thr_spice[0],  label='thr')
 plt.plot(spice_mon.t/b.ms, spice_mon.a_spice[0],    label='aversion')
 plt.plot(spice_mon.t/b.ms, spice_mon.da_gate[0],    label='DA_gate')
 plt.legend(loc="upper right")
-plt.title('SPICY: drive vs thr (tolleranza)')
+plt.title('SPICY: drive vs thr (tolerence)')
 plt.xlabel('ms')
 plt.tight_layout()
 plt.show()
