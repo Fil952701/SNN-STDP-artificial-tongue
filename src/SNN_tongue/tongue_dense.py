@@ -1252,8 +1252,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     if drv_now > thr_now:
         mod.HT[:] += 0.25
 
-    #scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
-    # z-score: z = scores / np.maximum(ema_pos_m1, 1e-9)
     y_true = np.zeros(unknown_id, dtype=int)
     for tdx in true_ids:
         if tdx != unknown_id:
