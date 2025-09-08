@@ -13,6 +13,38 @@ import shutil
 # global base rate per every class -> not 500 in total to split among all the classes but 500 for everyone
 BASE_RATE_PER_CLASS = 500
 
+# Individual profiles (thresholds/rewards) -> every new trial => new different individual
+def sample_individual(seed=None):
+    rng = np.random.default_rng(seed)
+    # species baseline for each taste (SWEET,BITTER,SALTY,SOUR,UMAMI,FATTY,SPICY)
+    base_hi = np.array([0.45, 0.18, 0.35, 0.30, 0.50, 0.40, 0.40])
+    base_lo = np.array([0.10, 0.02, 0.05, 0.05, 0.10, 0.05, 0.05])
+    thr0_hi = np.clip(base_hi + rng.normal(0, 0.05, 7), 0.05, 0.95)
+    thr0_lo = np.clip(base_lo + rng.normal(0, 0.03, 7), 0.00, 0.70)
+    k_hab_hi  = rng.uniform(0.0015, 0.0035, 7)
+    k_sens_hi = rng.uniform(0.0005, 0.0015, 7)
+    k_hab_lo  = rng.uniform(0.0010, 0.0020, 7)
+    k_sens_lo = rng.uniform(0.0003, 0.0010, 7)
+    return dict(thr0_hi=thr0_hi, thr0_lo=thr0_lo,
+                k_hab_hi=k_hab_hi, k_sens_hi=k_sens_hi,
+                k_hab_lo=k_hab_lo, k_sens_lo=k_sens_lo)
+
+# state→bias mapping for every taste (coeff dimensionless)
+c_hun_hi = np.array([+0.06, 0.00, +0.01, 0.00, +0.03, +0.04, 0.00])
+c_hun_lo = np.array([-0.05, 0.00, 0.00, 0.00, -0.02, -0.03, 0.00])
+c_sat_hi = np.array([-0.07, 0.00, 0.00, 0.00, -0.03, -0.05, 0.00])
+c_sat_lo = np.array([+0.05, 0.00, 0.00, 0.00, +0.02, +0.03, 0.00])
+c_h2o_hi = np.array([0.00, 0.00, -0.08, 0.00, 0.00, 0.00, -0.02])
+c_h2o_lo = np.array([0.00, 0.00, +0.02, 0.00, 0.00, 0.00, 0.00])
+
+def apply_internal_state_bias(profile, mod, tn):
+    H = float(mod.HUN[0]); S = float(mod.SAT[0]); W = float(mod.H2O[0])
+    thr0_hi = np.clip(profile['thr0_hi'] + c_hun_hi*H + c_sat_hi*S + c_h2o_hi*W, 0.05, 0.95)
+    thr0_lo = np.clip(profile['thr0_lo'] + c_hun_lo*H + c_sat_lo*S + c_h2o_lo*W, 0.00, 0.70)
+    # all neurons except for UNKNOWN
+    tn.thr0_hi[:unknown_id] = thr0_hi
+    tn.thr0_lo[:unknown_id] = thr0_lo
+
 # time functions for timing training and test phase to calculate ETA
 def fmt_mmss(seconds: float) -> str:
     m, s = divmod(int(max(0.0, seconds) + 0.5), 60)
@@ -168,7 +200,7 @@ gaba_total_spikes    = 120              # if total spikes per trial overcome thi
 target_rate          = 50 * b.Hz        # reference firing per neuron (tu 40-80 Hz rule)
 tau_rate             = 200 * b.ms       # extimate window for rating -> spikes LPF
 tau_theta            = 1 * b.second     # threshold adaptive speed
-theta_init           = 0.0 *b.mV        # starting theta
+theta_init           = 0.0 *b.mV        # starting theta threshold for homeostasis
 rho_target = target_rate * tau_rate     # dimensionless (Hz*s)
 
 # Decoder threshold parameters
@@ -198,6 +230,26 @@ col_floor            = 0.0              # floor (0 or light epsilon) before norm
 col_allow_upscale    = True             # light up-scaling
 col_upscale_slack    = 0.90             # if L1 < 90% target → boost
 col_scale_max        = 1.2              # max factor per step
+
+# SPICY dynamic tolerance / aversion dynamics
+spicy_id             = 6                # spicy taste is the sixth one
+thr0_spice_var       = 0.40             # baseline aversive threshold -> driven unit
+tau_thr_spice        = 30 * b.second    # adapting threshold -> slow
+tau_sd_spice         = 50 * b.ms        # spicy intensity integration
+tau_a_spice          = 200 * b.ms       # dynamic aversion
+k_spike_spice        = 0.015            # spike contribution pre SPICY->drive
+k_a_spice            = 1.0              # aversion reward
+k_hab_spice          = 0.002            # upgrade threshold ↑ with adapting to aversion
+eta_da_spice         = 2.0              # multiplier DA for adapting
+k_sens_spice         = 0.001            # sensitization if above threshold but without reward -> just an adapting on the previous threshold: now higher
+reinforce_dur        = 150 * b.ms       # short window to push DA gate on SPICY
+
+# Hedonic window for all the tastes (SWEET, SOUR ecc...) -> one taste is rewarding ONLY if his spikes fire during this period
+tau_drive_win        = 50 * b.ms        # intensity/taste integration
+tau_av_win           = 200 * b.ms       # aversion/sub-threshold integration
+tau_thr_win          = 30 * b.second    # thresholds adapting
+eta_da_win           = 2.0              # rewarding on the habit of the Hedonic window
+k_spike_drive        = 0.015            # driving kick on each input spike
 
 # STDP and environment parameters
 tau                  = 30 * b.ms        # STDP time constant
@@ -258,7 +310,7 @@ def noisy_mix(ids, amp=250, mu=noise_mu, sigma=noise_sigma):
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
     return v, ids, f"TASTE: {label} (train)"
 
-# 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis
+# 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis and dynamic SPICY aversion
 taste_neurons = b.NeuronGroup(
     num_tastes,
     model='''
@@ -270,18 +322,72 @@ taste_neurons = b.NeuronGroup(
         dwfast/dt = -wfast/70/ms : volt
         theta_bias : volt
         homeo_on : 1
-    ''',
+
+        # ----- Hedonic window for every different taste -----
+        dtaste_drive/dt = -taste_drive/tau_drive_win : 1
+
+        # High threshold of the Hedonic window
+        dav_over/dt = (-av_over + 0.5*((taste_drive - thr_hi) + abs(taste_drive - thr_hi)))/tau_av_win : 1
+        # Low threshold of the Hedonic window
+        dav_under/dt = (-av_under + 0.5*((thr_lo - taste_drive) + abs(thr_lo - taste_drive)))/tau_av_win : 1
+
+        # Over time adapting HIGH
+        dthr_hi/dt = (-(thr_hi - thr0_hi)
+                      + k_hab_hi*av_over*(1 + eta_da_win*da_gate)
+                      - k_sens_hi*av_over*(1 - da_gate)) / tau_thr_win : 1
+        # Over time adapting LOW
+        dthr_lo/dt = (-(thr_lo - thr0_lo)
+                      + k_hab_lo*av_under
+                      - k_sens_lo*av_over) / tau_thr_win : 1
+        
+        # Stateless parameters for the Hedonic window
+        thr0_hi   : 1
+        thr0_lo   : 1
+        k_hab_hi  : 1
+        k_sens_hi : 1
+        k_hab_lo  : 1
+        k_sens_lo : 1
+        da_gate   : 1
+
+        # ----- SPICY aversion -----
+        dspice_drive/dt = is_spice * (-spice_drive / tau_sd_spice) : 1
+
+        da_spice/dt = is_spice * (
+            -a_spice / tau_a_spice
+            + (k_a_spice / tau_a_spice) * 0.5 * ((spice_drive - thr_spice) + abs(spice_drive - thr_spice))
+        ) : 1
+
+        dthr_spice/dt = is_spice * (
+            -(thr_spice - thr0_spice) / tau_thr_spice
+            + (k_hab_spice  / tau_thr_spice) * a_spice * (1 + eta_da_spice * da_gate)
+            - (k_sens_spice / tau_thr_spice) * a_spice * (1 - da_gate)
+        ) : 1
+
+        is_spice : 1
+        thr0_spice : 1
+
+    ''', 
     threshold='v > (Vth + theta + theta_bias + wfast)',
     reset='v = Vreset; s += 1; wfast += 0.3*mV',
     refractory=2*b.ms,
     method='euler',
     namespace={
+        # LIF neuron constants
         'C': C, 'gL': gL, 'EL': EL,
         'Ee': Ee, 'Ei': Ei,
         'taue': taue, 'taui': taui,
         'Vth': Vth, 'Vreset': Vreset,
         'tau_rate': tau_rate, 'tau_theta': tau_theta,
-        'rho_target': rho_target
+        'rho_target': rho_target,
+        # Hedonic window constants
+        'tau_drive_win': tau_drive_win,
+        'tau_av_win':    tau_av_win,
+        'tau_thr_win':   tau_thr_win,
+        'eta_da_win':    eta_da_win,
+        # Dynamic SPICY namespaces
+        'tau_sd_spice': tau_sd_spice, 'tau_a_spice': tau_a_spice, 'tau_thr_spice': tau_thr_spice,
+        'k_a_spice': k_a_spice, 'k_hab_spice': k_hab_spice, 'eta_da_spice': eta_da_spice,
+        'k_sens_spice': k_sens_spice
     }
 )
 # initializing theta bias because 5-HT is going to high the thresholds during aversive episode
@@ -330,7 +436,31 @@ S = b.Synapses(
 taste_neurons.v[:] = EL
 taste_neurons.s[:] = 0
 taste_neurons.theta[:] = theta_init
-taste_neurons.homeo_on = 1.0 # ON in training
+taste_neurons.homeo_on = 1.0 # ON during training
+taste_neurons.theta_bias[:] = 0 * b.mV
+
+# dynamic SPICY states initialization
+taste_neurons.is_spice[:]   = 0
+taste_neurons.is_spice[spicy_id] = 1
+taste_neurons.thr0_spice    = thr0_spice_var
+taste_neurons.thr_spice[:]  = 0.0
+taste_neurons.spice_drive[:] = 0.0
+taste_neurons.a_spice[:]     = 0.0
+taste_neurons.da_gate[:]     = 0.0
+
+# Hedonic window initialization
+taste_neurons.taste_drive[:] = 0.0
+taste_neurons.av_over[:]  = 0.0
+taste_neurons.av_under[:] = 0.0
+taste_neurons.thr_hi[:]   = 0.0
+taste_neurons.thr_lo[:]   = 0.0
+taste_neurons.thr0_hi[:]  = 0.0
+taste_neurons.thr0_lo[:]  = 0.0
+# rewards for each individual -> they will be overwrite with every new individual
+taste_neurons.k_hab_hi[:]  = 0.002
+taste_neurons.k_sens_hi[:] = 0.001
+taste_neurons.k_hab_lo[:]  = 0.0015
+taste_neurons.k_sens_lo[:] = 0.0005
 
 # Diagonal or dense connection mode except for UNKNOWN
 if connectivity_mode == "diagonal":
@@ -353,10 +483,10 @@ ij_to_si = {}
 Si = np.array(S.i[:], dtype=int)
 Sj = np.array(S.j[:], dtype=int)
 for k in range(len(Si)):
-    ij_to_si[(int(Si[k]), int(Sj[k]))] = int(k)
+    ij_to_si[(int(Si[k]), int(Sj[k]))] = int(k) # synapse index
 
 # Available diagonal index in 'diagonal' and 'dense'
-diag_idx = {k: ij_to_si[(k, k)] for k in range(num_tastes-1) if (k, k) in ij_to_si}
+diag_idx = {k: ij_to_si[(k, k)] for k in range(num_tastes-1) if (k, k) in ij_to_si} # dictionary to map the synapse couples i->j
 
 # Background synapses (ambient excitation)
 S_noise = b.Synapses(pg_noise, taste_neurons, on_pre='ge_post += g_step_bg',
@@ -373,8 +503,22 @@ inhibitory_S = b.Synapses(taste_neurons,
 inhibitory_S.connect('i != j')
 inhibitory_S.inh_scale = 0.9
 
+# every spike from SPICY gate increases SPICY neuron drive
+S_spice_sensor = b.Synapses(
+    pg, taste_neurons,
+    on_pre='spice_drive_post += k_spike_spice',
+    namespace={'k_spike_spice': k_spike_spice}
+)
+S_spice_sensor.connect('i == spicy_id and j == spicy_id')
+
 w_mon = b.StateMonitor(S, 'w', record=True)
 weight_monitors.append((w_mon, S))
+
+# Sensorial synapses for every taste neuron to module Hedonic window
+S_drive = b.Synapses(pg, taste_neurons,
+                     on_pre='taste_drive_post += k_spike_drive',
+                     namespace={'k_spike_drive': k_spike_drive})
+S_drive.connect('i == j and i != unknown_id')
 
 # DA, 5-HT, NE, HI, ACh, GABA neuromodulators that decay over time
 mod = b.NeuronGroup(
@@ -386,10 +530,17 @@ mod = b.NeuronGroup(
         dHI/dt = -HI/tau_HI : 1
         dACH/dt = -ACH/tau_ACH : 1
         dGABA/dt = -GABA/tau_GABA : 1
+        # hungry and need of that type of food
+        dHUN/dt  = -HUN/tau_HUN : 1
+        # too much of the same kind of food
+        dSAT/dt  = -SAT/tau_SAT : 1
+        # hydratation management to keep the level of the taste inside the Hedonic window
+        dH2O/dt  = -H2O/tau_H2O : 1
     ''',
     method='exact',
     namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE, 
-               'tau_HI' : tau_HI, 'tau_ACH' : tau_ACH, 'tau_GABA' : tau_GABA}
+               'tau_HI' : tau_HI, 'tau_ACH' : tau_ACH, 'tau_GABA' : tau_GABA,
+               'tau_HUN': 60*b.second, 'tau_SAT': 120*b.second, 'tau_H2O': 90*b.second}
 )
 mod.DA = 0.0
 mod.HT = 0.0
@@ -397,6 +548,9 @@ mod.NE = 0.0
 mod.HI = 0.0
 mod.ACH  = 0.0
 mod.GABA = 0.0
+mod.HUN = 0.2
+mod.SAT = 0.0
+mod.H2O = 0.2
 
 # 8. Building the SNN network and adding levels
 net = b.Network(
@@ -405,12 +559,14 @@ net = b.Network(
     pg_noise, # imput neurons noise introduced
     S,
     S_noise,
+    S_drive, # Hedonic window synapses
     inhibitory_S,
     spike_mon,
     state_mon,
-    mod # neuromodulator neurons installed into the net
+    mod, # neuromodulator neurons installed into the net
+    S_spice_sensor # to monitor dynamic SPICY
 )
-# monitoring all neuromodulators
+# monitoring all neuromodulators and aversion to SPICY
 net.add(w_mon)
 inh_mon = b.StateMonitor(inhibitory_S, 'inh_scale', record=True)
 net.add(inh_mon)
@@ -419,6 +575,13 @@ s_mon = b.StateMonitor(taste_neurons, 's', record=True)
 net.add(theta_mon, s_mon)
 mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE', 'HI', 'ACH', 'GABA'], record=True)
 net.add(mod_mon)
+# Hedonic window for SPICY nociceptive
+spice_mon = b.StateMonitor(taste_neurons, ['spice_drive','thr_spice','a_spice','da_gate'],
+                           record=[spicy_id])
+net.add(spice_mon)
+# Hedonic window monitor
+hed_mon = b.StateMonitor(taste_neurons, ['taste_drive','thr_hi','thr_lo','av_over','av_under','da_gate'], record=True)
+net.add(hed_mon)
 
 # 9. Prepare stimuli list
 # 9A: pure‐taste training
@@ -450,11 +613,11 @@ for _ in range(n_repeats):
 
 # 9C: test set -> couples and mixtures never seen during training
 test_stimuli = [
-    make_mix([0,4]),      # SWEET + UMAMI
-    make_mix([1,2]),      # BITTER + SALTY
-    make_mix([3,5]),      # SOUR + FATTY
-    make_mix([0,2,4,6]),  # 4-way
-    make_mix([2,6]),      # SALTY + SPICY
+    make_mix([0,4]),     # SWEET + UMAMI
+    make_mix([1,2]),     # BITTER + SALTY
+    make_mix([3,5]),     # SOUR + FATTY
+    make_mix([0,2,4,6]), # 4-way
+    make_mix([2,6]),     # SALTY + SPICY
 ]
 # total stimuli
 training_stimuli = pure_train + mixture_train
@@ -467,6 +630,30 @@ ema_neg_m1 = np.zeros(num_tastes-1)  # E[x] neg
 ema_neg_m2 = np.zeros(num_tastes-1)  # E[x^2] neg
 ema_pos_m1 = np.zeros(num_tastes-1)  # E[x] pos
 ema_pos_m2 = np.zeros(num_tastes-1)  # E[x^2] pos
+
+# SPICY initialization
+taste_neurons.is_spice[:] = 0
+taste_neurons.is_spice[spicy_id] = 1
+taste_neurons.thr0_spice = thr0_spice_var
+taste_neurons.thr_spice[:] = 0.0
+taste_neurons.spice_drive[:] = 0.0
+taste_neurons.a_spice[:] = 0.0
+taste_neurons.da_gate[:] = 0.0
+
+# Individual initialization before TRAINING loop
+INDIV_ID = 42  # seed for representing different people
+profile = sample_individual(seed=INDIV_ID)
+
+# profile set in the group
+taste_neurons.k_hab_hi[:unknown_id]  = profile['k_hab_hi']
+taste_neurons.k_sens_hi[:unknown_id] = profile['k_sens_hi']
+taste_neurons.k_hab_lo[:unknown_id]  = profile['k_hab_lo']
+taste_neurons.k_sens_lo[:unknown_id] = profile['k_sens_lo']
+
+apply_internal_state_bias(profile, mod, taste_neurons)
+# in the beginning thr = thr0
+taste_neurons.thr_hi[:unknown_id] = taste_neurons.thr0_hi[:unknown_id]
+taste_neurons.thr_lo[:unknown_id] = taste_neurons.thr0_lo[:unknown_id]
 
 # 10. Main "always-on" loop
 print("\nStarting TRAINING phase...")
@@ -512,11 +699,17 @@ for input_rates, true_ids, label in training_stimuli:
     # print the bar
     pbar_update(msg)
 
+    # Before the stimulus, update internal-state bias and reset the taste variables:
+    apply_internal_state_bias(profile, mod, taste_neurons)
+    taste_neurons.taste_drive[:] = 0.0
+    taste_neurons.av_over[:]  = 0.0
+    taste_neurons.av_under[:] = 0.0
+
     # 5-HT anticipatory serotonine -> aversive episode happened?
-    aversive_now = any((cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids)
+    '''aversive_now = any((cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids)
     # if there was a possible aversive episode
     if aversive_now:
-        mod.HT[:] += ht_pulse_aversion # increase caution before imminent training
+        mod.HT[:] += ht_pulse_aversion # increase caution before imminent training'''
 
     # ACh must to be high during in training for efficient plasticity
     mod.ACH[:] = ach_train_level
@@ -554,6 +747,19 @@ for input_rates, true_ids, label in training_stimuli:
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+
+    # fear/aversion only if the generic taste stimulous overcomes the threshold
+    drv = np.array(taste_neurons.taste_drive[:unknown_id])
+    thr = np.array(taste_neurons.thr_hi[:unknown_id])
+    if (drv > thr).any():
+       mod.HT[:] += 0.2
+
+    # fear/aversion only if the SPICY stimulous overcomes the threshold
+    drv_now = float(taste_neurons.spice_drive[spicy_id])
+    thr_now = float(taste_neurons.thr_spice[spicy_id])
+    if drv_now > thr_now:
+        mod.HT[:] += 0.3   # manage the aversion
+
     # to manage GABA during trial if there are too many spikes -> stabilizing the net
     total_spikes  = float(np.sum(diff_counts[:unknown_id]))
     active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
@@ -718,6 +924,22 @@ for input_rates, true_ids, label in training_stimuli:
     else:
         mod.HI[:] += hi_pulse_miss
 
+    # if the prevision is good => reward to every taste in the trial
+    if jacc >= 0.67:
+        for tid in true_ids:
+            if tid != unknown_id:
+                taste_neurons.da_gate[tid] = 1.0
+        net.run(reinforce_dur)
+        for tid in true_ids:
+            if tid != unknown_id:
+                taste_neurons.da_gate[tid] = 0.0
+    # clamp among thresholds for stability
+    eps_thr = 0.02
+    hi = np.array(taste_neurons.thr_hi[:]); lo = np.array(taste_neurons.thr_lo[:])
+    hi = np.maximum(hi, lo + eps_thr)
+    taste_neurons.thr_hi[:] = hi
+
+
     # with many strong FP, increase 5-HT -> future caution in the next trial
     has_strong_fp = any((i not in true_ids) and (float(diff_counts[i]) >= fp_gate[i])
                     for i in range(num_tastes-1))
@@ -867,6 +1089,12 @@ taste_neurons.theta_bias[:] = 0 * b.mV
 inhibitory_S.inh_scale = 1.0
 mod.DA[:] = 0.0
 mod.HT[:] = 0.0
+# to manage Hedonic window
+taste_neurons.taste_drive[:] = 0.0
+taste_neurons.av_over[:]  = 0.0
+taste_neurons.av_under[:] = 0.0
+apply_internal_state_bias(profile, mod, taste_neurons)
+
 
 # "emotive state" in test phase
 if test_emotion_mode == "off":
@@ -936,6 +1164,9 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     taste_neurons.ge[:] = 0 * b.nS
     taste_neurons.gi[:] = 0 * b.nS
     taste_neurons.wfast[:] = 0 * b.mV
+    # initializing SPICY during test
+    taste_neurons.spice_drive[spicy_id] = 0.0
+    taste_neurons.a_spice[spicy_id]     = 0.0
     # progress bar + chrono + ETA
     frac   = step / total_test
     filled = int(frac * progress_bar_len)
@@ -968,10 +1199,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
         ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
         pg_noise.rates = baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
-        if test_emotion_mode == "active": # aversive anticipation: if SPICY, increase 5-HT 
+        '''if test_emotion_mode == "active": # aversive anticipation: if SPICY, increase 5-HT 
             aversive_now = any( (cls in p_aversion) and (np.random.rand() < p_aversion[cls]) for cls in true_ids ) 
             if aversive_now: 
-                mod.HT[:] += ht_pulse_aversion
+                mod.HT[:] += ht_pulse_aversion'''
 
     # 0) inject UNKNOWN taste during test phase
     _rates_vec = add_unknown(_rates_vec, 20, 60)
@@ -982,6 +1213,18 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     prev_counts = spike_mon.count[:].copy()
     net.run(test_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+
+    # inject 5-HT for the generic TASTE aversion
+    drv = np.array(taste_neurons.taste_drive[:unknown_id])
+    thr = np.array(taste_neurons.thr_hi[:unknown_id])
+    if (drv > thr).any():
+        mod.HT[:] += 0.25
+
+    # inject 5-HT for the SPICY aversion
+    drv_now = float(taste_neurons.spice_drive[spicy_id])
+    thr_now = float(taste_neurons.thr_spice[spicy_id])
+    if drv_now > thr_now:
+        mod.HT[:] += 0.25
 
     scores = diff_counts.astype(float)[:unknown_id]  # except for UNKNOWN
     # z-score: z = scores / np.maximum(ema_pos_m1, 1e-9)
@@ -1351,21 +1594,17 @@ plt.xlabel('ms');
 plt.tight_layout(); 
 plt.show()
 
-#plt.figure(figsize=(6,3))
 # extimation of the average WTA movement
 # d2) WTA / inh_scale
 plt.figure(figsize=(8,3))
-
 t = inh_mon.t / b.ms
 # temporal average
-y0 = np.asarray(inh_mon.inh_scale)[0]  # sinapse 0
-
+y0 = np.asarray(inh_mon.inh_scale)[0]  # synapse 0
 y_mean_over_syn = np.mean(np.asarray(inh_mon.inh_scale), axis=0)
-
 plt.plot(t, y0, label='inh_scale: syn 0')
 plt.plot(t, y_mean_over_syn, label='mean over synapses')
 
-# linea orizzontale con la media temporale (indicatore sintetico)
+# synthetic indicator for the horizontal average
 plt.axhline(y_mean_over_syn.mean(), linestyle='--', linewidth=1,
             label=f'time mean={y_mean_over_syn.mean():.2f}')
 
@@ -1378,16 +1617,17 @@ plt.show()
 
 # e) pos/neg EMA plot
 for c in range(num_tastes-1):
-    pos = np.array(pos_counts[c]); neg = np.array(neg_counts[c])
+    pos = np.array(pos_counts[c])
+    neg = np.array(neg_counts[c])
     plt.figure(figsize=(5,3))
     plt.hist(neg, bins=20, alpha=0.6, label='neg')
     plt.hist(pos, bins=20, alpha=0.6, label='pos')
     plt.axvline(thr_per_class[c], ls='--')
     plt.title(f'{taste_map[c]}  | thr={int(thr_per_class[c])}')
-    plt.xlabel('#spike per trial'); 
-    plt.ylabel('freq'); 
-    plt.legend(loc="upper right"); 
-    plt.tight_layout(); 
+    plt.xlabel('#spike per trial')
+    plt.ylabel('freq')
+    plt.legend(loc="upper right")
+    plt.tight_layout()
     plt.show()
 
 # f) Cross-talk off-diagonal weights
@@ -1406,3 +1646,27 @@ plt.colorbar(label='w')
 plt.title('Weights matrix (note→note)')
 plt.tight_layout()
 plt.show()
+
+# g) Plot dynamic SPICY
+plt.figure(figsize=(10,4))
+plt.plot(spice_mon.t/b.ms, spice_mon.spice_drive[0], label='drive')
+plt.plot(spice_mon.t/b.ms, spice_mon.thr_spice[0],  label='thr')
+plt.plot(spice_mon.t/b.ms, spice_mon.a_spice[0],    label='aversion')
+plt.plot(spice_mon.t/b.ms, spice_mon.da_gate[0],    label='DA_gate')
+plt.legend(loc="upper right")
+plt.title('SPICY: drive vs thr (tolleranza)')
+plt.xlabel('ms')
+plt.tight_layout()
+plt.show()
+
+# h) Plot dynamic taste i = 0..unknown_id-1
+for idx in range(num_tastes-1):
+    plt.figure(figsize=(10,3))
+    plt.plot(hed_mon.t/b.ms, hed_mon.taste_drive[idx], label='drive')
+    plt.plot(hed_mon.t/b.ms, hed_mon.thr_hi[idx], label='thr_hi')
+    plt.plot(hed_mon.t/b.ms, hed_mon.thr_lo[idx], label='thr_lo')
+    plt.legend(loc='upper right')
+    plt.title(f'Hedonic window for {taste_map[idx]}')
+    plt.xlabel('ms')
+    plt.tight_layout()
+    plt.show()
