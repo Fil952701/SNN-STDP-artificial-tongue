@@ -84,9 +84,10 @@ def set_stimulus_vect_norm(rate_vec, total_rate=None, include_unknown=False):
     pg.rates = r * b.Hz
 
 # Rates vector helper without normalization
-def set_stimulus_vector(rate_vec):
+def set_stimulus_vector(rate_vec, include_unknown=False):
     r = np.asarray(rate_vec, dtype=float).copy()
-    r[unknown_id] = 0.0
+    if not include_unknown:
+        r[unknown_id] = 0.0
     pg.rates = r * b.Hz
 
 # EMA decoder helpers
@@ -261,7 +262,6 @@ A_minus              = -0.012           # dimensionless
 alpha                = 0.1              # learning rate for positive reward
 noise_mu             = 5                # noise mu constant
 noise_sigma          = 0.8              # noise sigma constant
-inhib_amp            = 0.1              # lateral inhibition constant
 training_duration    = 1000 * b.ms      # stimulus duration
 test_duration        = 500 * b.ms       # test verification duration
 pause_duration       = 100 * b.ms       # pause for eligibility decay
@@ -311,6 +311,25 @@ def noisy_mix(ids, amp=250, mu=noise_mu, sigma=noise_sigma):
         v[idx] = amp
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
     return v, ids, f"TASTE: {label} (train)"
+
+# --- test generators OOD/NULL (expected = UNKNOWN) ---
+def make_null(low=5, high=20):
+    v = np.random.randint(low, high+1, size=num_tastes).astype(float)
+    v[unknown_id] = 0.0
+    return v, [unknown_id], "NULL (only low background)"
+
+def make_ood_diffuse(low=20, high=80):
+    # no dominant class
+    v = np.random.uniform(low, high, size=num_tastes)
+    v[unknown_id] = 0.0
+    return v, [unknown_id], "OOD (diffuse low-mid rates)"
+
+def make_ood_many(low=60, high=130, k=5):
+    # many average-low canals
+    v = np.zeros(num_tastes)
+    picks = np.random.choice(np.arange(num_tastes-1), size=k, replace=False)
+    v[picks] = np.random.uniform(low, high, size=k)
+    return v, [unknown_id], f"OOD (many-{k} mid amps)"
 
 # 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis and dynamic SPICY aversion
 taste_neurons = b.NeuronGroup(
@@ -621,6 +640,11 @@ test_stimuli = [
     make_mix([0,2,4,6]), # 4-way
     make_mix([2,6]),     # SALTY + SPICY
 ]
+# OOD + NULL
+for _ in range(5):
+    test_stimuli.append(make_null())
+    test_stimuli.append(make_ood_diffuse())
+    test_stimuli.append(make_ood_many(k=np.random.randint(3,6)))
 # total stimuli
 training_stimuli = pure_train + mixture_train
 random.shuffle(training_stimuli) # continually randomize the stimuli without adapting patterns
@@ -743,7 +767,7 @@ for input_rates, true_ids, label in training_stimuli:
     # 1) training stimulus with masking on no-target neurons
     masked = np.zeros_like(input_rates)
     masked[true_ids] = input_rates[true_ids]
-    set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids))
+    set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
 
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
@@ -1062,6 +1086,7 @@ net.add(test_w_mon)
 
 # 11. Freezing STDP, homeostatis and input conductance
 print("Freezing STDP for TEST phase…")
+#baseline_hz = 0.0
 # Neuromodulator parameters in test
 k_inh_HI_test   = -0.08
 k_inh_HT_test = 0.4
@@ -1154,12 +1179,6 @@ recovery_between_trials = 100 * b.ms  # refractory recovery
 exact_hits = 0
 total_test = len(test_stimuli)
 
-# function to inject UNKNOWN inside test set and confuse the net
-def add_unknown(rate_vec, unk_min=20, unk_max=60):
-    v = rate_vec.copy()
-    v[unknown_id] = np.random.randint(unk_min, unk_max+1)
-    return v
-
 all_scores = []
 all_targets = []
 for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
@@ -1207,9 +1226,15 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 mod.HT[:] += ht_pulse_aversion'''
 
     # 0) inject UNKNOWN taste during test phase
-    _rates_vec = add_unknown(_rates_vec, 20, 60)
-    # 1) stimulus on target classes
-    set_stimulus_vect_norm(_rates_vec, total_rate=BASE_RATE_PER_CLASS * len(true_ids))
+    #_rates_vec = add_unknown(_rates_vec, 20, 60)
+    # 1) stimulus on target classes with UNKNOWN inputs
+    if len(true_ids) == 1 and true_ids[0] == unknown_id:
+        # OOD/NULL → no normalization
+        set_stimulus_vector(_rates_vec, include_unknown=False)
+    else:
+        set_stimulus_vect_norm(_rates_vec,
+                           total_rate=BASE_RATE_PER_CLASS * len(true_ids),
+                           include_unknown=False)
 
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
@@ -1268,7 +1293,27 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     top = scores[sorted_idx[0]]
     second = scores[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
 
-    if mx < min_spikes_for_known_test:
+    base_winners = [i for i in range(num_tastes-1) if scores[i] >= thr_per_class[i]]
+    rel = min(rel_gate_ratio_test * mx, rel_cap_abs)
+    rel_winners = [i for i in range(num_tastes-1) if scores[i] >= rel] if use_rel_gate_in_test else []
+
+    pos_expect = np.maximum(ema_pos_m1, eps_ema)
+    z = scores[:unknown_id] / pos_expect
+    z_max = float(np.max(z)) if z.size else 0.0
+    norm_winners = []
+    for i in range(num_tastes-1):
+        if (z[i] >= norm_rel_ratio_test * z_max) and (scores[i] >= min_norm_abs_spikes):
+            mini = 0.25 * thr_per_class[i]
+            if scores[i] >= mini:
+                norm_winners.append(i)
+
+    winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
+
+    # reject rules
+    if (mx < min_spikes_for_known_test) or (len(winners) == 0):
+        winners = [unknown_id]
+
+    '''if mx < min_spikes_for_known_test:
         winners = [unknown_id]
     else:
         # absolute gate for each class
@@ -1289,7 +1334,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
         winners = list(sorted(set(base_winners) | set(rel_winners) | set(norm_winners)))
         if not winners and mx >= min_spikes_for_known_test:
-            winners = [int(np.argmax(scores))]
+            winners = [int(np.argmax(scores))]'''
 
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
@@ -1533,6 +1578,14 @@ print("Per-class PR-AUC: ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in pr
 print("Per-class AP:     ", [f"{x:.3f}" if np.isfinite(x) else "—" for x in ap_per_class])
 print(f"Macro ROC-AUC={macro_roc_auc:.3f} | Macro PR-AUC={macro_pr_auc:.3f} | Macro mAP={macro_mAP:.3f}")
 print(f"Micro ROC-AUC={micro_roc_auc:.3f} | Micro PR-AUC={micro_pr_auc:.3f} | Micro mAP={micro_mAP:.3f}")
+
+# Rejection (UNKNOWN) metrics
+unknown_trials = sum(1 for _, exp, _, _ in results if exp == ['UNKNOWN'])
+unknown_ok = sum(1 for _, exp, pred, _ in results if exp == ['UNKNOWN'] and ('UNKNOWN' in pred))
+if unknown_trials > 0:
+    print(f"\nRejection accuracy (UNKNOWN on OOD/NULL): {unknown_ok}/{unknown_trials} = {unknown_ok/unknown_trials:.2%}")
+else:
+    print("\n[WARN] No UNKNOWN/OOD trials were included in the test set.")
 
 # end test
 print("\nEnded TEST phase successfully!")
