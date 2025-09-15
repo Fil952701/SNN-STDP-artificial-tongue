@@ -855,17 +855,17 @@ for input_rates, true_ids, label in training_stimuli:
         set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
 
     # GDI print debug
-    print("\nGDI init:", float(gdi_pool.x[0]), "| gamma_gdi:", f"{gamma_val:.3f}")
+    '''print("\nGDI init:", float(gdi_pool.x[0]), "| gamma_gdi:", f"{gamma_val:.3f}")
     eff = float(taste_neurons.gdi_eff[0])
     div_eff = 1.0 + gamma_val * eff
-    print(f"GDI eff-divisor≈{div_eff:.2f}  (gdi_eff={eff:.3f})")
+    print(f"GDI eff-divisor≈{div_eff:.2f}  (gdi_eff={eff:.3f})")'''
     
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
 
-    print(f"GDI end: x={float(gdi_pool.x[0]):.3f}, eff={float(taste_neurons.gdi_eff[0]):.3f}")
+    #print(f"GDI end: x={float(gdi_pool.x[0]):.3f}, eff={float(taste_neurons.gdi_eff[0]):.3f}")
 
     # fear/aversion only if the generic taste stimulous overcomes the threshold
     drv = np.array(taste_neurons.taste_drive[:unknown_id])
