@@ -10,6 +10,9 @@ import numpy as np
 import time
 import shutil
 
+# GDI toggle for activation/deactivation
+USE_GDI = True # True => use GDI; False => use rate normalization
+
 # global base rate per every class -> not 500 in total to split among all the classes but 500 for everyone
 BASE_RATE_PER_CLASS = 500
 
@@ -140,20 +143,27 @@ unknown_id = num_tastes-1
 
 # 3. Simulation global parameters
 # LIF (conductance-based) parameters:
-C                    = 200 * b.pF
-gL                   =  10 * b.nS
-EL                   = -70 * b.mV
-Vth                  = -52 * b.mV
-Vreset               = -60 * b.mV
+C                    = 200 * b.pF       # membrane potential
+gL                   =  10 * b.nS       # leak conductance
+EL                   = -70 * b.mV       # leak potential
+Vth                  = -52 * b.mV       # potential threshold
+Vreset               = -60 * b.mV       # potential reset
 # Synaptic reversal & time constants
-Ee                   = 0*b.mV
-Ei                   = -80*b.mV
-taue                 = 10*b.ms
-taui                 = 10*b.ms
+Ee                   = 0*b.mV           # excitement synapses potential
+Ei                   = -80*b.mV         # inhibition synapses potential
+taue                 = 10*b.ms          # time decay for excitement
+taui                 = 10*b.ms          # time decay for inhibition
 # Size of conductance kick per spike (scaling)
 g_step_exc           = 3.5 * b.nS       # excitation from inputs
 g_step_bg            = 0.3 * b.nS       # tiny background excitation noise
 g_step_inh_local     = 1.2 * b.nS       # lateral inhibition strength
+
+# Global Divisive Inhibition (GDI) parameters
+tau_gdi              = 40 * b.ms        # global pool temporal window
+k_e2g_ff             = 0.03             # feed-forward contribute (Poisson input spikes) -> GDI
+k_e2g_fb             = 0.012            # feedback contribute (output neuron spikes) -> GDI
+gamma_gdi_0          = 0.2              # scaled reward for (dimensionless)
+gdi_reset_each_trial = True             # managing carry-over thorugh trials
 
 # Neuromodulators (DA Dopamine: reward, 5-HT Serotonine: aversion/fear, NE Noradrenaline: arousal/attention)
 # Dopamine (DA) - reward gain
@@ -207,7 +217,7 @@ theta_init           = 0.0 *b.mV        # starting theta threshold for homeostas
 rho_target = target_rate * tau_rate     # dimensionless (Hz*s)
 
 # Decoder threshold parameters
-k_sigma              = 1.6              # ↑ if it is too weak
+k_sigma              = 1.3              # ↑ if it is too weak
 q_neg                = 0.99             # negative quantile
 
 # Multi-label RL + EMA decoder
@@ -216,11 +226,21 @@ tp_gate_ratio         = 0.30            # threshold to reward winner classes
 fp_gate_warmup_steps  = 50              # delay punitions to loser classes if EMA didn't stabilize them yet
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.5             # EMA factor to punish more easy samples
+use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
+rel_gate_ratio_test   = 0.50            # second > 50 % rel_gate
+mixture_thr_relax     = 0.35            # ≥ 35% of threshold per-class
+z_rel_min             = 0.20            # z margin threshold to let enter taste in relative gate  
+rel_cap_abs           = 10.0            # absolute value for spikes
+dyn_abs_min_frac      = 0.30            # helper for weak co-tastes -> it needs at least 30% of positive expected
+# boosting parameters to push more weak examples
+norm_rel_ratio_test   = 0.15            # winners with z_i >= 15% normalized top
+min_norm_abs_spikes   = 1               # at least one real spike
+eps_ema               = 1e-3            # epsilon for EMA decoder
 
 # Off-diag hyperparameters
 beta                 = 0.03             # learning rate for negative reward
 beta_offdiag         = 0.5 * beta       # off-diag parameter
-use_offdiag_dopamine = True             # quick toggle
+use_offdiag_dopamine = True             # quick toggle to activate/deactivate reward for off-diagonals
 
 # Normalization per-column (synaptic scaling in input)
 use_col_norm         = True             # on the normalization
@@ -344,6 +364,13 @@ taste_neurons = b.NeuronGroup(
         theta_bias : volt
         homeo_on : 1
 
+        # ---- GDI (pool linked + centering/saturation) ----
+        gdi : 1 (linked)                 # global pool value
+        gdi_center : 1                   # pool baseline
+        gdi_half   : 1                   # half-saturation
+        pos_gdi = 0.5*((gdi - gdi_center) + abs(gdi - gdi_center)) : 1
+        gdi_eff = pos_gdi / (1.0 + pos_gdi/gdi_half) : 1
+
         # ----- Hedonic window for every different taste -----
         dtaste_drive/dt = -taste_drive/tau_drive_win : 1
 
@@ -426,7 +453,28 @@ pg = b.PoissonGroup(num_tastes, rates=np.zeros(num_tastes)*b.Hz)
 baseline_hz = 0.5  # 0.5–1 Hz
 pg_noise = b.PoissonGroup(num_tastes, rates=baseline_hz*np.ones(num_tastes)*b.Hz)
 
-# STDP Synapses with eligibility trace, Noradrenaline NE, lateral inhibition WTA and EMA
+# Global Division Inhibition GDI neuron integrator => only one 
+gdi_pool = b.NeuronGroup(1, 'dx/dt = -x/tau_gdi : 1',
+                         method='euler',
+                         namespace={'tau_gdi': tau_gdi})
+gdi_pool.x = 0.0
+
+# linking GDI value to the output neurons
+taste_neurons.gdi = b.linked_var(gdi_pool, 'x')
+
+# GDI Synapses
+# Feedforward: input Poisson -> to GDI
+S_ff_gdi = b.Synapses(pg, gdi_pool, on_pre='x_post += k_e2g_ff', namespace={'k_e2g_ff': k_e2g_ff})
+S_ff_gdi.connect('i != unknown_id')
+
+# Feedback: output neurons -> to GDI
+S_fb_gdi = b.Synapses(taste_neurons, gdi_pool, on_pre='x_post += k_e2g_fb', namespace={'k_e2g_fb': k_e2g_fb})
+S_fb_gdi.connect('i != unknown_id')
+
+# Monitoring GDI
+gdi_mon = b.StateMonitor(gdi_pool, 'x', record=True)
+
+# STDP Synapses with eligibility trace, Noradrenaline NE, lateral inhibition WTA, Global Division Inhibition GDI and EMA
 S = b.Synapses(
     pg, taste_neurons,
     model='''
@@ -436,9 +484,10 @@ S = b.Synapses(
         delig/dt      = -elig/Te    : 1 (clock-driven)
         ex_scale      : 1
         stdp_on       : 1
+        gamma_gdi     : 1 (shared)      # global divisive rewarding
     ''',
     on_pre='''
-        ge_post += w * g_step_exc * ex_scale
+        ge_post += (w * g_step_exc * ex_scale) / (1.0 + gamma_gdi * gdi_eff_post)
         Apre    += stdp_on * A_plus
         elig    += stdp_on * Apost
     ''',
@@ -484,6 +533,10 @@ taste_neurons.k_sens_hi[:] = 0.001
 taste_neurons.k_hab_lo[:]  = 0.0015
 taste_neurons.k_sens_lo[:] = 0.0005
 
+# initializing GDI
+taste_neurons.gdi_center = 0.1
+taste_neurons.gdi_half   = 0.50 
+
 # Diagonal or dense connection mode except for UNKNOWN
 if connectivity_mode == "diagonal":
     S.connect('i == j and i != unknown_id') # diagonal-connected
@@ -510,20 +563,33 @@ for k in range(len(Si)):
 # Available diagonal index in 'diagonal' and 'dense'
 diag_idx = {k: ij_to_si[(k, k)] for k in range(num_tastes-1) if (k, k) in ij_to_si} # dictionary to map the synapse couples i->j
 
-# Background synapses (ambient excitation)
-S_noise = b.Synapses(pg_noise, taste_neurons, on_pre='ge_post += g_step_bg',
-                 namespace=dict(g_step_bg=g_step_bg))
+# Background synapses (ambient excitation) with GDI
+S_noise = b.Synapses(
+    pg_noise, taste_neurons,
+    model='gamma_gdi : 1 (shared)',
+    on_pre='ge_post += (g_step_bg) / (1.0 + gamma_gdi * gdi_eff_post)',
+    namespace=dict(g_step_bg=g_step_bg)
+)
 S_noise.connect('i == j and i != unknown_id')
+
+# GDI Synapses initialization
+S.gamma_gdi = gamma_gdi_0
+S_noise.gamma_gdi = gamma_gdi_0
 
 # Lateral inhibition for WTA (Winner-Take-All) with 5-HT modulation
 inhibitory_S = b.Synapses(taste_neurons,
                     taste_neurons,
-                    model='inh_scale : 1',
+                    model='''
+                        g_step_inh : siemens (shared)
+                        inh_scale : 1
+                    ''',
                     on_pre='gi_post += g_step_inh * inh_scale',
                     delay=0.2*b.ms,
-                    namespace=dict(g_step_inh=g_step_inh_local))
+                    #namespace=dict(g_step_inh=g_step_inh_local))
+                    )
 inhibitory_S.connect('i != j')
-inhibitory_S.inh_scale = 0.9
+inhibitory_S.inh_scale = 0.6 # with GDI installed less WTA inhibition
+inhibitory_S.g_step_inh = g_step_inh_local
 
 # every spike from SPICY gate increases SPICY neuron drive
 S_spice_sensor = b.Synapses(
@@ -552,10 +618,13 @@ mod = b.NeuronGroup(
         dHI/dt = -HI/tau_HI : 1
         dACH/dt = -ACH/tau_ACH : 1
         dGABA/dt = -GABA/tau_GABA : 1
+
         # hungry and need of that type of food
         dHUN/dt  = -HUN/tau_HUN : 1
+
         # too much of the same kind of food
         dSAT/dt  = -SAT/tau_SAT : 1
+
         # hydratation management to keep the level of the taste inside the Hedonic window
         dH2O/dt  = -H2O/tau_H2O : 1
     ''',
@@ -586,7 +655,10 @@ net = b.Network(
     spike_mon,
     state_mon,
     mod, # neuromodulator neurons installed into the net
-    S_spice_sensor # to monitor dynamic SPICY
+    S_spice_sensor, # to monitor dynamic SPICY
+    gdi_pool,    # GDI management
+    S_ff_gdi,
+    S_fb_gdi
 )
 # monitoring all neuromodulators and aversion to SPICY
 net.add(w_mon)
@@ -604,6 +676,10 @@ net.add(spice_mon)
 # Hedonic window monitor
 hed_mon = b.StateMonitor(taste_neurons, ['taste_drive','thr_hi','thr_lo','av_over','av_under','da_gate'], record=True)
 net.add(hed_mon)
+# Monitoring all the GDI states
+ge_mon = b.StateMonitor(taste_neurons, ['ge','gdi_eff'], record=[0])
+net.add(ge_mon)
+net.add(gdi_mon)
 
 # 9. Prepare stimuli list
 # 9A: pure‐taste training
@@ -688,6 +764,7 @@ S.stdp_on[:] = 1.0
 S.Apre[:]  = 0
 S.Apost[:] = 0
 S.elig[:]  = 0
+# reset GDI
 taste_neurons.v[:] = EL
 sim_t0 = time.perf_counter()
 step = 0
@@ -732,6 +809,9 @@ for input_rates, true_ids, label in training_stimuli:
     taste_neurons.taste_drive[:] = 0.0
     taste_neurons.av_over[:]  = 0.0
     taste_neurons.av_under[:] = 0.0
+    # GDI reset per-trial
+    if gdi_reset_each_trial:
+        gdi_pool.x[:] = 0.0
 
     # ACh must to be high during in training for efficient plasticity
     mod.ACH[:] = ach_train_level
@@ -746,6 +826,11 @@ for input_rates, true_ids, label in training_stimuli:
 
     # reward gain and WTA addicted to NE/HI/ACh
     S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI * HI_now) * (1.0 + k_ex_ACH * ACH_now)
+    # initializing the rewarding for GDI
+    gamma_val = gamma_gdi_0 * (1.0 + 0.5*NE_now) * (1.0 - 0.3*HI_now)
+    gamma_val = max(0.0, min(gamma_val, 0.5))  # clamp to max-limit gamma
+    S.gamma_gdi = gamma_val
+    S_noise.gamma_gdi = gamma_val
     # inhibition with 5-HT/GABA/HI -> whereas WTA more aggressive when 5-HT is higher, because aversion and fear must to influence the behiaviour during the train over and over
     _inh = (1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI * HI_now + k_inh_GABA * GABA_now)
     inhibitory_S.inh_scale = max(0.3, _inh) # clamp to avoid errors
@@ -763,12 +848,24 @@ for input_rates, true_ids, label in training_stimuli:
     # 1) training stimulus with masking on no-target neurons
     masked = np.zeros_like(input_rates)
     masked[true_ids] = input_rates[true_ids]
-    set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
+    if USE_GDI:
+        # no rates normalization with GDI
+        set_stimulus_vector(masked, include_unknown=False)
+    else:
+        set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
 
+    # GDI print debug
+    print("\nGDI init:", float(gdi_pool.x[0]), "| gamma_gdi:", f"{gamma_val:.3f}")
+    eff = float(taste_neurons.gdi_eff[0])
+    div_eff = 1.0 + gamma_val * eff
+    print(f"GDI eff-divisor≈{div_eff:.2f}  (gdi_eff={eff:.3f})")
+    
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+
+    print(f"GDI end: x={float(gdi_pool.x[0]):.3f}, eff={float(taste_neurons.gdi_eff[0]):.3f}")
 
     # fear/aversion only if the generic taste stimulous overcomes the threshold
     drv = np.array(taste_neurons.taste_drive[:unknown_id])
@@ -1069,7 +1166,7 @@ def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms):
     # at least -> 99.5° percentile
     for idx in range(num_tastes-1):
         if tmp[idx]:
-            thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.995)))
+            thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.990)))
 
     pg_noise.rates = saved_noise
     S.stdp_on[:] = saved_stdp
@@ -1120,7 +1217,7 @@ theta_min, theta_max = -10*b.mV, 10*b.mV
 taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
 # deactivate state effect for DA and 5-HT for clean test phase
 taste_neurons.theta_bias[:] = 0 * b.mV
-inhibitory_S.inh_scale = 1.0
+inhibitory_S.inh_scale = 0.8
 mod.DA[:] = 0.0
 mod.HT[:] = 0.0
 # to manage Hedonic window
@@ -1150,6 +1247,10 @@ else:
     taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI_test * HI_now) * b.mV
     # synaptic gain
     S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
+    # initializing the rewarding for GDI
+    gamma_val = 0.1
+    S.gamma_gdi = gamma_val
+    S_noise.gamma_gdi = gamma_val
     # WTA (HI push the model to explore better ⇒ decrease WTA a bit)
     _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now
     inhibitory_S.inh_scale = max(0.3, _inh)
@@ -1158,22 +1259,14 @@ else:
     pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
 
 # to compute more mixtures
-inhibitory_S.namespace['g_step_inh'] = 0.5 * g_step_inh_local
+inhibitory_S.g_step_inh = 0.5 * g_step_inh_local
 inhibitory_S.delay = 0.5*b.ms
-use_rel_gate_in_test = False # in multi-label is better to deactivate
-rel_gate_ratio_test  = 0.10
-rel_cap_abs = 10.0 # absolute value for spikes
-# boosting parameters to push more weak examples
-norm_rel_ratio_test = 0.15 # winners with z_i >= 15% normalized top
-min_norm_abs_spikes = 1 # at least one real spike
-eps_ema = 1e-3 
 
 # 12. TEST PHASE
 print("\nStarting TEST phase...")
 S.stdp_on[:] = 0.0
 results = []
 # low ACh in test phase
-#ach_test_level = 0.0
 mod.ACH[:] = ach_test_level
 pg_noise.rates = 0 * b.Hz
 test_t0 = time.perf_counter()  # start stopwatch TEST
@@ -1192,6 +1285,9 @@ total_test = len(test_stimuli)
 all_scores = []
 all_targets = []
 for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
+    # reset GDI
+    if gdi_reset_each_trial:
+        gdi_pool.x[:] = 0.0
     taste_neurons.ge[:] = 0 * b.nS
     taste_neurons.gi[:] = 0 * b.nS
     taste_neurons.wfast[:] = 0 * b.mV
@@ -1236,9 +1332,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # OOD/NULL → no normalization
         set_stimulus_vector(_rates_vec, include_unknown=False)
     else:
-        set_stimulus_vect_norm(_rates_vec,
-                           total_rate=BASE_RATE_PER_CLASS * len(true_ids),
-                           include_unknown=False)
+        if USE_GDI:
+            set_stimulus_vector(_rates_vec, include_unknown=False)
+        else:
+            set_stimulus_vect_norm(_rates_vec, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
 
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
@@ -1281,24 +1378,44 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     z = scores[:unknown_id] / pos_expect_test
 
     # hyperparameters
-    z_min = 0.50                        
-    sep_min = 0.25 # just during the fallback
-    abs_margin_test = max(2.0, 5.0 * float(test_duration / training_duration))
+    z_min = 0.25                        
+    sep_min = 0.15 # just during the fallback
+    abs_margin_test = 0.0 # to avoid margin during test
+    #abs_margin_test = max(2.0, 5.0 * float(test_duration / training_duration))  # testing
 
     # multi-label candidates: threshold per-class + z-score
     strict_winners = [
-        i for i in range(num_tastes-1)
-        if (scores[i] >= (thr_per_class[i] + abs_margin_test)) and (z[i] >= z_min)
+        idx for idx in range(num_tastes-1)
+        if (scores[idx] >= (thr_per_class[idx] + abs_margin_test)) and (z[idx] >= z_min)
     ]
 
-    winners = strict_winners
+    winners = list(strict_winners)
 
-    # fallback: if nobody pass, we only take the winner if is really winner
+    # 2) relative add-on always available if there is a known top
+    top_known = (scores[top_idx] >= (thr_per_class[top_idx] - 1)) or (z[top_idx] >= z_min)
+    if use_rel_gate_in_test and top_known:
+        rel_thr = rel_gate_ratio_test * top
+
+        # absolute dynamic minimum per-class: half of positive expected (never < 1 spike)
+        dyn_abs_min_i = np.maximum(min_norm_abs_spikes, dyn_abs_min_frac * pos_expect_test)
+
+        add = [idx for idx in range(num_tastes-1)
+            if (idx not in winners)
+                and (scores[idx] >= rel_thr)
+                and (z[idx] >= z_rel_min)
+                and (scores[idx] >= mixture_thr_relax * thr_per_class[idx])
+                and (scores[idx] >= dyn_abs_min_i[idx])]
+
+        if add:
+            add.sort(key=lambda idx: scores[idx], reverse=True)
+            winners.extend(add)   # adding class to the final winner list
+
+    # 3) fallback if there aren't winners
     if not winners:
         if (scores[top_idx] >= thr_per_class[top_idx] + abs_margin_test) and (z[top_idx] >= z_min) and (sep >= sep_min):
             winners = [top_idx]
 
-    # avoiding if it is so weak
+    # 4) UNKNOWN labeling classification if there's no enough energy
     if (top < min_spikes_for_known_test) or (len(winners) == 0):
         winners = [unknown_id]
 
@@ -1646,7 +1763,7 @@ plt.tight_layout()
 plt.show()
 
 # e) pos/neg EMA plot
-for c in range(num_tastes-1):
+'''for c in range(num_tastes-1):
     pos = np.array(pos_counts[c])
     neg = np.array(neg_counts[c])
     plt.figure(figsize=(5,3))
@@ -1658,7 +1775,7 @@ for c in range(num_tastes-1):
     plt.ylabel('freq')
     plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
 
 # f) Cross-talk off-diagonal weights
 W = np.zeros((num_tastes, num_tastes))
@@ -1690,7 +1807,7 @@ plt.tight_layout()
 plt.show()
 
 # h) Plot dynamic taste i = 0..unknown_id-1
-for idx in range(num_tastes-1):
+'''for idx in range(num_tastes-1):
     plt.figure(figsize=(10,3))
     plt.plot(hed_mon.t/b.ms, hed_mon.taste_drive[idx], label='drive')
     plt.plot(hed_mon.t/b.ms, hed_mon.thr_hi[idx], label='thr_hi')
@@ -1699,4 +1816,4 @@ for idx in range(num_tastes-1):
     plt.title(f'Hedonic window for {taste_map[idx]}')
     plt.xlabel('ms')
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
