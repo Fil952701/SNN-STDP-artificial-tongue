@@ -128,7 +128,6 @@ conda activate artificial-tongue-snn
 
 ## 📜 License
 
-This project is released under the **MIT License**.  
-Feel free to use, modify, and build upon this work with proper attribution.  
+All rights reserved
 
 ---
