@@ -227,15 +227,16 @@ fp_gate_warmup_steps  = 50              # delay punitions to loser classes if EM
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.5             # EMA factor to punish more easy samples
 use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
-rel_gate_ratio_test   = 0.45            # second > 45 % rel_gate
-mixture_thr_relax     = 0.50            # ≥ 50% of threshold per-class
-z_rel_min             = 0.30            # z margin threshold to let enter taste in relative gate  
+rel_gate_ratio_test   = 0.40            # second > 45 % rel_gate
+mixture_thr_relax     = 0.40            # ≥ 50% of threshold per-class
+z_rel_min             = 0.25            # z margin threshold to let enter taste in relative gate  
 rel_cap_abs           = 10.0            # absolute value for spikes
-dyn_abs_min_frac      = 0.30            # helper for weak co-tastes -> it needs at least 30% of positive expected
+dyn_abs_min_frac      = 0.25            # helper for weak co-tastes -> it needs at least 30% of positive expected
 # boosting parameters to push more weak examples
 norm_rel_ratio_test   = 0.15            # winners with z_i >= 15% normalized top
 min_norm_abs_spikes   = 1               # at least one real spike
 eps_ema               = 1e-3            # epsilon for EMA decoder
+mix_abs_pos_frac      = 0.30            # positive expected fraction
 
 # Off-diag hyperparameters
 beta                 = 0.03             # learning rate for negative reward
@@ -1064,7 +1065,9 @@ for input_rates, true_ids, label in training_stimuli:
             for q in range(num_tastes-1):
                 if q == p:
                    continue
-                # punish only if: hot EMA and q break the big FP threshold -> big FP case
+                # punish only if: hot EMA and q break the big FP threshold -> big FP case. Also, if q is true in this trial, NOT punish p→q
+                if q in true_ids:
+                    continue
                 if step > fp_gate_warmup_steps and float(diff_counts[q]) >= fp_gate[q]:
                    si = ij_to_si.get((p, q), None)
                    if si is None:
@@ -1329,7 +1332,7 @@ else:
     # synaptic gain
     S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
     # initializing the rewarding for GDI
-    gamma_val = 0.1
+    gamma_val = 0.12
     S.gamma_gdi = gamma_val
     S_noise.gamma_gdi = gamma_val
     # WTA (HI push the model to explore better ⇒ decrease WTA a bit)
@@ -1482,10 +1485,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
         add = [idx for idx in range(num_tastes-1)
             if (idx not in winners)
-                and (scores[idx] >= rel_thr)
-                and (z[idx] >= z_rel_min)
-                and (scores[idx] >= mixture_thr_relax * thr_per_class[idx])
-                and (scores[idx] >= dyn_abs_min_i[idx])]
+            and (z[idx] >= z_rel_min)
+            and (scores[idx] >= max(rel_thr, dyn_abs_min_i[idx]))]
 
         if add:
             add.sort(key=lambda idx: scores[idx], reverse=True)
