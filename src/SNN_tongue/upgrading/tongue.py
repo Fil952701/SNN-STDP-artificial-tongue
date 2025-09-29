@@ -237,9 +237,9 @@ fp_gate_warmup_steps  = 50              # delay punitions to loser classes if EM
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.5             # EMA factor to punish more easy samples
 use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
-rel_gate_ratio_test   = 0.35            # second > 45 % rel_gate
+rel_gate_ratio_test   = 0.40            # second > 45 % rel_gate
 mixture_thr_relax     = 0.40            # ≥ 50% of threshold per-class
-z_rel_min             = 0.20            # z margin threshold to let enter taste in relative gate  
+z_rel_min             = 0.25            # z margin threshold to let enter taste in relative gate  
 rel_cap_abs           = 10.0            # absolute value for spikes
 dyn_abs_min_frac      = 0.25            # helper for weak co-tastes -> it needs at least 30% of positive expected
 # boosting parameters to push more weak examples
@@ -321,6 +321,7 @@ weight_monitors      = []               # list for weights to monitor
 threshold_ratio      = 0.5              # threshold for winner spiking neurons
 min_spikes_for_known = 10               # minimum number of spikes for neuron, otherwise UNKNOWN
 top2_margin_ratio    = 1.4              # top/second >= 1.4 -> safe
+weight_decay         = 1e-4             # weight decay for trial
 verbose_rewards      = False            # dopamine reward logs
 test_emotion_mode    = "active"         # to test with active neuromodulators
 
@@ -385,7 +386,7 @@ def noisy_mix(ids, amp=250, mu=noise_mu, sigma=noise_sigma):
     label = " + ".join([f"'{taste_map[idx]}'" for idx in ids])
     return vix, ids, f"TASTE: {label} (train)"
 
-# test generators OOD/NULL (expected = UNKNOWN)
+# --- test generators OOD/NULL (expected = UNKNOWN) ---
 def make_null(low=5, high=20):
     vix = np.random.randint(low, high+1, size=num_tastes).astype(float)
     vix[unknown_id] = 0.0
@@ -405,150 +406,54 @@ def make_ood_many(low=60, high=130, k=5):
     return vix, [unknown_id], f"OOD (many-{k} mid amps)"
 
 # OOD/NULL calibration: increase threshold on OOD queues
-reject_stats = {
-    'ood': {'z_top': [], 'rel_top': [], 'margin': [], 'H': [], 'gdi_eff': [], 'top': []},
-    'id1': {'z_top': [], 'rel_top': [], 'margin': [], 'H': [], 'gdi_eff': [], 'top': []},  # single
-    'idM': {'z_top': [], 'rel_top': [], 'margin': [], 'H': [], 'gdi_eff': [], 'top': []},  # mixtures
-}
-
-reject_thr = {}
-
-def _trial_metrics_from_scores(scores, pos_expect_test, gdi_eff_val):
-    s = np.asarray(scores[:unknown_id], float)
-    top_idx = int(np.argmax(s))
-    s_sum = float(np.sum(s)) + 1e-9
-    top = float(s[top_idx])
-    # positive expected z-score
-    z_top = top / max(1e-6, pos_expect_test[top_idx])
-    # top and margin frac
-    rel_top = top / s_sum
-    s_sorted = np.sort(s)[::-1]
-    second = float(s_sorted[1]) if s_sorted.size > 1 else 0.0
-    margin = (top - second) / max(1.0, top)
-    # normalized entropy (0..1)
-    p = s / s_sum
-    H = 0.0
-    if (p > 0).any():
-        H = -np.sum(p[p>0] * np.log(p[p>0] + 1e-12))
-        H = H / np.log(len(p))  # normalization [0,1]
-    return dict(z_top=z_top, rel_top=rel_top, margin=margin, H=H, gdi_eff=float(gdi_eff_val), top=top)
-
-# mini-calibration on clean stimuli without plasticity
-def _calib_probe_id(dur=200*b.ms, reps=2):
-    saved_stdp = float(S.stdp_on[0]); S.stdp_on[:] = 0.0
-    saved_noise = pg_noise.rates;     pg_noise.rates = 0 * b.Hz
-
-    # expected scaled positive for the test
-    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
-
-    def _probe_once(vix, bucket):
-        set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = spike_mon.count[:] - prev
-        m = _trial_metrics_from_scores(diff, pos_expect_test, taste_neurons.gdi_eff[0])
-        for k, vox in m.items():
-            reject_stats[bucket][k].append(float(vox))
-        return diff
-
-    # single-class probe → bucket 'id1'
-    for c in range(num_tastes-1):
-        for _ in range(reps):
-            vix = np.zeros(num_tastes); vix[c] = 250.0
-            _probe_once(vix, 'id1')
-
-    # mix probe (2,3,4 classi) → bucket 'idM'
-    mix_bank = [
-        [0,2], [0,4], [2,4], [1,6], [3,5],
-        [0,2,4], [1,4,6], [3,5,6],
-        [0,2,4,6]
-    ]
-    for _ in range(reps):
-        for mix in mix_bank:
-            vix = np.zeros(num_tastes)
-            vix[mix] = 250.0
-            _probe_once(vix, 'idM')
-
-    # final restore
-    pg_noise.rates = saved_noise
-    S.stdp_on[:] = saved_stdp
-
 def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms):
-    saved_stdp = float(S.stdp_on[0]); S.stdp_on[:] = 0.0
-    saved_noise = pg_noise.rates;     pg_noise.rates = 0 * b.Hz
+    saved_stdp = float(S.stdp_on[0])
+    S.stdp_on[:] = 0.0
+    saved_noise = pg_noise.rates
+    pg_noise.rates = 0 * b.Hz
     tmp = [[] for _ in range(num_tastes-1)]
-    # expected scaled positive test examples
-    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
-
-    def run_and_collect(vix):
-        set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = spike_mon.count[:] - prev
-        # saving spikes per class threshold
-        for idx in range(num_tastes-1):
-            tmp[idx].append(int(diff[idx]))
-        # metrics per rejector
-        m = _trial_metrics_from_scores(diff, pos_expect_test, taste_neurons.gdi_eff[0])
-        for k, vox in m.items(): reject_stats['ood'][k].append(float(vox))
 
     # NULL
     for _ in range(n_null):
         vix, _, _ = make_null()
-        run_and_collect(vix)
-        if gap > 0* b.ms: net.run(gap)
-    # OOD diffuse
-    for _ in range(n_ood//2):
-        vix, _, _ = make_ood_diffuse()
-        run_and_collect(vix)
-        if gap > 0* b.ms: net.run(gap)
-    # OOD many-k
-    for _ in range(n_ood//2):
-        vix, _, _ = make_ood_many(k=np.random.randint(4,6))
-        run_and_collect(vix)
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
         if gap > 0* b.ms: net.run(gap)
 
-    # updating threshold with conservative quantile
+    # OOD
+    # ood_diffuse
+    for _ in range(n_ood//2):
+        vix, _, _ = make_ood_diffuse()
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
+        if gap > 0* b.ms: net.run(gap)
+    
+    # ood_many
+    for _ in range(n_ood//2):
+        vix, _, _ = make_ood_many(k=np.random.randint(4,6))
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
+        if gap > 0* b.ms: net.run(gap)
+
+    # at least -> 99.5° percentile
     for idx in range(num_tastes-1):
         if tmp[idx]:
             thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.995)))
 
-    pg_noise.rates = saved_noise; S.stdp_on[:] = saved_stdp
-
-    # mini-calibration for balanced thresholds
-    _calib_probe_id(dur=200*b.ms, reps=2)
-
-    # data-driven thresholds construction
-    # high-quantile OOD + low-quantile ID to maximize margin
-    def q(a, qv):
-        a = np.asarray(a, float)
-        return float(np.quantile(a, qv)) if a.size else np.nan
-
-    # helper per combinare single/mix: per rel_top e margin prendi quantili più "permissivi" su idM
-    def q_id_low(k, q1=0.05, qM=0.20):
-        return np.nanmin([q(reject_stats['id1'][k], q1), q(reject_stats['idM'][k], qM)])
-
-    def q_id_high(k, q1=0.95, qM=0.80):
-        return np.nanmax([q(reject_stats['id1'][k], q1), q(reject_stats['idM'][k], qM)])
-
-    # thresholds manual construction
-    tau = {}
-    # z_top: resta prudente (singoli vanno bene come riferimento)
-    tau['z_top']  = np.clip(0.5*(q(reject_stats['ood']['z_top'], 0.99) + q(reject_stats['id1']['z_top'], 0.05)), 0.0, 1.5)
-
-    # rel_top e margin: usa il min tra low-quantile single e low-quantile mix (più basso = più permissivo per mix)
-    tau['rel_top'] = np.clip(0.5*(q(reject_stats['ood']['rel_top'], 0.99) + q_id_low('rel_top', 0.05, 0.20)), 0.0, 1.0)
-    tau['margin']  = np.clip(0.5*(q(reject_stats['ood']['margin'],  0.99) + q_id_low('margin',  0.05, 0.20)), 0.0, 1.0)
-
-    # entropia: per ammettere miscele alza la soglia usando l'high-quantile delle mix
-    tau['H']       = np.clip(0.5*(q(reject_stats['ood']['H'], 0.85) + q_id_high('H', 0.95, 0.80)), 0.0, 1.0)
-
-    # gdi/abs_top: invariati
-    tau['gdi_eff'] = np.clip(0.5*(q(reject_stats['ood']['gdi_eff'], 0.90) + q_id_high('gdi_eff', 0.99, 0.99)), 0.0, 5.0)
-    tau['abs_top'] = max(1.0, 0.5*(q(reject_stats['ood']['top'], 0.999) + q_id_low('top', 0.01, 0.01)))
-
-    global reject_thr
-    reject_thr = tau
+    pg_noise.rates = saved_noise
+    S.stdp_on[:] = saved_stdp
 
 # more often a class is inside hedonic window (high gwin_ema) -> less push (conservative)
 def meta_scale(idx):
@@ -1376,8 +1281,8 @@ for input_rates, true_ids, label in training_stimuli:
 
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
-    has_strong_fp = any((idx not in true_ids) and (float(diff_counts[idx]) >= fp_gate[idx])
-                    for idx in range(num_tastes-1))
+    has_strong_fp = any((i not in true_ids) and (float(diff_counts[i]) >= fp_gate[i])
+                    for i in range(num_tastes-1))
     if has_strong_fp:
         mod.HT[:] += ht_pulse_fp
         mod.NE[:] += 0.5 * ne_pulse_amb # arousal on strong FP
@@ -1468,8 +1373,8 @@ for idx in range(num_tastes-1):
 print("Per-class thresholds (hybrid μ+kσ, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class[idx]) for idx in range(num_tastes-1)})
 
-# OOD/NULL calibration before TEST
-ood_calibration(n_null=8, n_ood=16, dur=200*b.ms, gap=0*b.ms)
+# call that function
+ood_calibration(n_null=8, n_ood=16, dur=test_duration, gap=0*b.ms)
 
 # printing scaled weights after training
 print(f"Target weights after training:")
@@ -1547,7 +1452,7 @@ else:
     # synaptic gain
     S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
     # initializing the rewarding for GDI
-    gamma_val = 0.12
+    gamma_val = 0.18
     S.gamma_gdi = gamma_val
     S_noise.gamma_gdi = gamma_val
     # WTA (HI push the model to explore better ⇒ decrease WTA a bit)
@@ -1675,51 +1580,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # scaled z-score during test
     pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
     z = scores[:unknown_id] / pos_expect_test
-    met = _trial_metrics_from_scores(scores, pos_expect_test, taste_neurons.gdi_eff[0])
-
-    # rejector OOD/NULL
-    dyn_abs_min_i = np.maximum(min_norm_abs_spikes, dyn_abs_min_frac * pos_expect_test)
-    mix_like = int(np.sum((z[:unknown_id] >= z_rel_min) & (scores[:unknown_id] >= dyn_abs_min_i))) >= 2
-
-    reject_now = False
-
-    # 1) energetic barrier
-    if float(scores.max()) < max(min_spikes_for_known_test, reject_thr.get('abs_top', 0.0)):
-        reject_now = True
-
-    # 2) GDI "iper/ipo" only if top is low
-    if (met['gdi_eff'] > reject_thr['gdi_eff']) and (met['top'] < reject_thr['abs_top']):
-        reject_now = True
-
-    # 3) if not mix-like, then using shape signals (rel_top/margin/H/z_top) with score "2-on-4"
-    if not mix_like:
-        fails = 0
-        fails += int(met['z_top']   < reject_thr['z_top'])
-        fails += int(met['rel_top'] < reject_thr['rel_top'])
-        fails += int(met['margin']  < reject_thr['margin'])
-        fails += int(met['H']       > reject_thr['H'])
-        if fails >= 2:
-            reject_now = True
-
-        if reject_now:
-            winners = [unknown_id]
-            # debug log:
-            print(f"[REJECT] z_top={met['z_top']:.2f} rel_top={met['rel_top']:.2f} margin={met['margin']:.2f} H={met['H']:.2f} gdi={met['gdi_eff']:.2f} top={met['top']:.1f}")
-            # valutation + recovery + next trial
-            expected  = [taste_map[idxs] for idxs in true_ids]
-            predicted = [taste_map[w] for w in winners]
-            hit = set(winners) == set(true_ids)
-            print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
-            results.append((label, expected, predicted, hit))
-            if set(winners) == set(true_ids):
-                exact_hits += 1
-            net.run(recovery_between_trials)
-            continue
 
     # hyperparameters
     z_min = 0.25                        
     sep_min = 0.15 # just during the fallback
     abs_margin_test = 0.0 # to avoid margin during test
+    #abs_margin_test = max(2.0, 5.0 * float(test_duration / training_duration))  # testing
 
     # multi-label candidates: threshold per-class + z-score
     strict_winners = [
@@ -1729,27 +1595,49 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     winners = list(strict_winners)
 
-    # 2) relative add-on always available if there is a known top
-    top_known = (scores[top_idx] >= (thr_per_class[top_idx] - 1)) or (z[top_idx] >= z_min)
+    # one taste is top only if it exceeds the threshold correctly and it has a good separation between other tastes
+    top_known = (scores[top_idx] >= thr_per_class[top_idx]) and (sep >= 0.20)
+
+    # strict_winners
+    winners = list(strict_winners)
+
     if use_rel_gate_in_test and top_known:
+        # relative threshold against top
         rel_thr = rel_gate_ratio_test * top
 
-        # absolute dynamic minimum per-class: half of positive expected (never < 1 spike)
-        dyn_abs_min_i = np.maximum(min_norm_abs_spikes, dyn_abs_min_frac * pos_expect_test)
+        # dynamic absolute minimum per-class (at least 1 real spike)
+        dyn_abs_min_i = np.maximum(min_norm_abs_spikes,
+                               dyn_abs_min_frac * pos_expect_test)
+
+        # normalized set (little booster for weak co-activations)
+        norm = scores[:unknown_id] / (top + 1e-9)
 
         add = [idx for idx in range(num_tastes-1)
-            if (idx not in winners)
-            and (z[idx] >= z_rel_min)
-            and (scores[idx] >= max(rel_thr, dyn_abs_min_i[idx]))]
+           if (idx not in winners)
+           and (z[idx] >= z_rel_min)
+           and (
+                # normalized relative booster
+                (scores[idx] >= max(rel_thr, dyn_abs_min_i[idx])) or
+                (norm[idx] >= norm_rel_ratio_test and scores[idx] >= dyn_abs_min_i[idx])
+           )]
 
         if add:
             add.sort(key=lambda idx: scores[idx], reverse=True)
-            winners.extend(add)   # adding class to the final winner list
+            winners.extend(add)
+    else:
+        # no relative -> less FP during OOD/NULL gating
+        pass
 
-    # 3) fallback if there aren't winners
+    # fallback/guard OOD
+    # if there aren't any winners, try with lower top and relative gate
     if not winners:
+        sep_min = 0.15
         if (scores[top_idx] >= thr_per_class[top_idx] + abs_margin_test) and (z[top_idx] >= z_min) and (sep >= sep_min):
             winners = [top_idx]
+
+    # UNKNOWN if energy too low or no winner
+    if (top < min_spikes_for_known_test) or (len(winners) == 0):
+        winners = [unknown_id]
 
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
@@ -1768,8 +1656,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             mod.DA_f[:] += da_pulse_reward    # phasic burst
             mod.DA_t[:] += da_tonic_tail      # tonic tail
         has_strong_fp = any(
-            (idx not in true_ids) and (float(diff_counts[idx]) >= thr_per_class[idx])
-            for idx in range(num_tastes-1)
+            (i not in true_ids) and (float(diff_counts[i]) >= thr_per_class[i])
+            for i in range(num_tastes-1)
         )
         if has_strong_fp:
             mod.HT[:] += ht_pulse_fp # prudence or fear increased
@@ -1882,7 +1770,7 @@ print(f"Mean IoU (per-class): {fmt_pct(mean_iou)}")
 # Jaccard per test-case (expected vs predicted)
 if jaccard_per_case:
     mean_jaccard_cases = float(np.mean(jaccard_per_case))
-    print("\nJaccard per test-case:", [f"{jx:.2f}" for jx in jaccard_per_case])
+    print("\nJaccard per test-case:", [f"{j:.2f}" for j in jaccard_per_case])
     print(f"Average Jaccard (set vs set): {mean_jaccard_cases:.2f}")
 
 # PR-/ROC-AUC management
