@@ -209,6 +209,16 @@ gaba_pulse_stabilize = 0.8              # burst when activity is too much
 gaba_active_neurons  = 4                # if > k neurons are activated in the same time → stability
 gaba_total_spikes    = 120              # if total spikes per trial overcome this threshold → stability
 
+# Dopamine delay dynamics + tonic tail (phasic vs tonic)
+tau_DA_phasic        = 300 * b.ms
+tau_DA_tonic         = 2 * b.second
+dopamine_latency     = 150 * b.ms       # little delay before weight update -> more biologically plausible
+k_tonic_DA           = 0.35             # how much the tonic tail contributes during plasticity
+da_tonic_tail        = 0.25             # when the reward is gained => how big is the tonic tail quote
+# state -> tonic bias (hungry/thirsty increase DA_tonic baseline)
+k_hun_tonic          = 0.20
+k_h2o_tonic          = 0.20
+
 # Intrinsic homeostasis adapative threshold parameters
 target_rate          = 50 * b.Hz        # reference firing per neuron (tu 40-80 Hz rule)
 tau_rate             = 200 * b.ms       # extimate window for rating -> spikes LPF
@@ -237,6 +247,11 @@ norm_rel_ratio_test   = 0.15            # winners with z_i >= 15% normalized top
 min_norm_abs_spikes   = 1               # at least one real spike
 eps_ema               = 1e-3            # epsilon for EMA decoder
 mix_abs_pos_frac      = 0.30            # positive expected fraction
+# metaplasticity -> STDP reward adapted to the historical of how often the reward is inside the hedonic window
+meta_min              = 0.3             # lower range STDP scaling
+meta_max              = 1.5             # higher range STDP scaling
+meta_lambda           = 0.05            # EMA velocity
+gwin_ema        = np.zeros(unknown_id)  # historical for every class
 
 # Off-diag hyperparameters
 beta                 = 0.03             # learning rate for negative reward
@@ -275,10 +290,19 @@ tau_thr_win          = 30 * b.second    # thresholds adapting
 eta_da_win           = 2.0              # rewarding on the habit of the Hedonic window
 k_spike_drive        = 0.015            # driving kick on each input spike
 
-# Hedonic gating for DA (fallback included) -> if a taste is recognized inside the hedonic window => full DA, otherwise if it is ricognized but it's not in the window => less DA
+# Hedonic gating for DA state-dependente (fallback included) -> if a taste is recognized inside the hedonic window => full DA, otherwise if it is ricognized but it's not in the window => less DA
 use_hedonic_da       = True
 hed_fallback         = 0.40             # minimum reinforcement if prediction is not inside the hedonic window
 hed_gate_k           = 2.0              # gating convergence: ↑k = more aggressive
+hed_min              = 0.10             # lower fallback clamp
+hed_max              = 0.95             # higher fallback clamp
+k_hun_fb             = 0.35             # hungry -> ↑ fallback for SWEET/UMAMI/FATTY
+k_sat_fb             = 0.25             # satiety -> ↓ fallback for SWEET/UMAMI/FATTY
+k_h2o_fb             = 0.25             # thirsty -> ↑ fallback for SALTY/SPICY
+k_bitter_sat         = 0.10             # bitter -> ↓ light fallback with satiety
+# energy needs requirements mapping
+hunger_idxs          = [0, 4, 5]        # SWEET, UMAMI, FATTY
+water_idxs           = [2, 6]           # SALTY, SPICY
 
 # Spike-Timing Dependent Plasticity STDP and environment parameters
 tau                  = 30 * b.ms        # STDP time constant
@@ -297,7 +321,6 @@ weight_monitors      = []               # list for weights to monitor
 threshold_ratio      = 0.5              # threshold for winner spiking neurons
 min_spikes_for_known = 10               # minimum number of spikes for neuron, otherwise UNKNOWN
 top2_margin_ratio    = 1.4              # top/second >= 1.4 -> safe
-weight_decay         = 1e-4             # weight decay for trial
 verbose_rewards      = False            # dopamine reward logs
 test_emotion_mode    = "active"         # to test with active neuromodulators
 
@@ -313,6 +336,20 @@ stp_warmup_trials    = 30               # important initial warmup to avoid DA s
 
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode    = "dense"          # "dense" -> fully-connected | "diagonal" -> one to one
+
+# helper to define states fallback for hedonic window during DA reinforcement
+def state_hed_fallback_vec(mod, base=hed_fallback):
+    H = float(mod.HUN[0]); S = float(mod.SAT[0]); W = float(mod.H2O[0])
+    fb = np.full(unknown_id, base, dtype=float)
+
+    # hungry/satiety
+    fb[hunger_idxs] += k_hun_fb*H - k_sat_fb*S
+    # thirsty
+    fb[water_idxs]  += k_h2o_fb*W
+    # bitter: less hungry/satiety
+    fb[1] -= k_bitter_sat * S
+
+    return np.clip(fb, hed_min, hed_max)
 
 # helpers to define toggles per ablation
 def set_ach(on=True):
@@ -366,6 +403,125 @@ def make_ood_many(low=60, high=130, k=5):
     picks = np.random.choice(np.arange(num_tastes-1), size=k, replace=False)
     vix[picks] = np.random.uniform(low, high, size=k)
     return vix, [unknown_id], f"OOD (many-{k} mid amps)"
+
+# OOD/NULL calibration: increase threshold on OOD queues
+reject_stats = {
+    'ood': {'z_top': [], 'rel_top': [], 'margin': [], 'H': [], 'gdi_eff': [], 'top': []},
+    'id':  {'z_top': [], 'rel_top': [], 'margin': [], 'H': [], 'gdi_eff': [], 'top': []},
+}
+reject_thr = {}
+
+def _trial_metrics_from_scores(scores, pos_expect_test, gdi_eff_val):
+    s = np.asarray(scores[:unknown_id], float)
+    top_idx = int(np.argmax(s))
+    s_sum = float(np.sum(s)) + 1e-9
+    top = float(s[top_idx])
+    # positive expected z-score
+    z_top = top / max(1e-6, pos_expect_test[top_idx])
+    # top and margin frac
+    rel_top = top / s_sum
+    s_sorted = np.sort(s)[::-1]
+    second = float(s_sorted[1]) if s_sorted.size > 1 else 0.0
+    margin = (top - second) / max(1.0, top)
+    # normalized entropy (0..1)
+    p = s / s_sum
+    H = 0.0
+    if (p > 0).any():
+        H = -np.sum(p[p>0] * np.log(p[p>0] + 1e-12))
+        H = H / np.log(len(p))  # normalization [0,1]
+    return dict(z_top=z_top, rel_top=rel_top, margin=margin, H=H, gdi_eff=float(gdi_eff_val), top=top)
+
+ # mini-calibration on clean stimuli without plasticity
+def _calib_probe_id(dur=200*b.ms, reps=2):
+    saved_stdp = float(S.stdp_on[0]); S.stdp_on[:] = 0.0
+    saved_noise = pg_noise.rates;     pg_noise.rates = 0 * b.Hz
+    # pos_expect_test: expected TP scaled during test phase
+    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+    for c in range(num_tastes-1):
+        # 2–3 probe per class related to test
+        for _ in range(reps):
+            vix = np.zeros(num_tastes); vix[c] = 250.0
+            set_stimulus_vector(vix, include_unknown=False)
+            prev = spike_mon.count[:].copy()
+            net.run(dur)
+            diff = spike_mon.count[:] - prev
+            # metrics + gdi_eff
+            m = _trial_metrics_from_scores(diff, pos_expect_test, taste_neurons.gdi_eff[0])
+            for k, v in m.items(): reject_stats['id'][k].append(float(v))
+    pg_noise.rates = saved_noise; S.stdp_on[:] = saved_stdp
+
+def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms):
+    saved_stdp = float(S.stdp_on[0]); S.stdp_on[:] = 0.0
+    saved_noise = pg_noise.rates;     pg_noise.rates = 0 * b.Hz
+    tmp = [[] for _ in range(num_tastes-1)]
+    # expected scaled positive test examples
+    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+
+    def run_and_collect(vix):
+        set_stimulus_vector(vix, include_unknown=False)
+        prev = spike_mon.count[:].copy()
+        net.run(dur)
+        diff = spike_mon.count[:] - prev
+        # saving spikes per class threshold
+        for idx in range(num_tastes-1):
+            tmp[idx].append(int(diff[idx]))
+        # metrics per rejector
+        m = _trial_metrics_from_scores(diff, pos_expect_test, taste_neurons.gdi_eff[0])
+        for k, v in m.items(): reject_stats['ood'][k].append(float(v))
+
+    # NULL
+    for _ in range(n_null):
+        vix, _, _ = make_null()
+        run_and_collect(vix)
+        if gap > 0* b.ms: net.run(gap)
+    # OOD diffuse
+    for _ in range(n_ood//2):
+        vix, _, _ = make_ood_diffuse()
+        run_and_collect(vix)
+        if gap > 0* b.ms: net.run(gap)
+    # OOD many-k
+    for _ in range(n_ood//2):
+        vix, _, _ = make_ood_many(k=np.random.randint(4,6))
+        run_and_collect(vix)
+        if gap > 0* b.ms: net.run(gap)
+
+    # updating threshold with conservative quantile
+    for idx in range(num_tastes-1):
+        if tmp[idx]:
+            thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.995)))
+
+    pg_noise.rates = saved_noise; S.stdp_on[:] = saved_stdp
+
+    # mini-calibration for balanced thresholds
+    _calib_probe_id(dur=200*b.ms, reps=2)
+
+    # data-driven thresholds construction
+    # high-quantile OOD + low-quantile ID to maximize margin
+    def q(a, qv): 
+        a = np.asarray(a, float); 
+        return float(np.quantile(a, qv)) if a.size else (np.nan)
+
+    # thresholds manual construction
+    tau = {}
+    # z_top: OOD low → threshold = average between (OOD q0.99) and (ID q0.05), clamp in [0,1.5]
+    tau['z_top']  = np.clip(0.5*(q(reject_stats['ood']['z_top'], 0.99) + q(reject_stats['id']['z_top'], 0.05)), 0.0, 1.5)
+    # rel_top: OOD low → threshold = average between (OOD q0.99) and (ID q0.05)
+    tau['rel_top'] = np.clip(0.5*(q(reject_stats['ood']['rel_top'], 0.99) + q(reject_stats['id']['rel_top'], 0.05)), 0.0, 1.0)
+    # margin: OOD low → same logic
+    tau['margin']  = np.clip(0.5*(q(reject_stats['ood']['margin'], 0.99) + q(reject_stats['id']['margin'], 0.05)), 0.0, 1.0)
+    # entropy: OOD is high → threshold = average between (OOD q0.80) and (ID q0.95) to avoid over-reject
+    tau['H']       = np.clip(0.5*(q(reject_stats['ood']['H'], 0.80) + q(reject_stats['id']['H'], 0.95)), 0.0, 1.0)
+    # gdi_eff: OOD high → threshold = OOD q0.90 and ID q0.99
+    tau['gdi_eff'] = np.clip(0.5*(q(reject_stats['ood']['gdi_eff'], 0.90) + q(reject_stats['id']['gdi_eff'], 0.99)), 0.0, 5.0)
+    # absolute barrier per spikes: top very low on OOD
+    tau['abs_top'] = max(1.0, 0.5*(q(reject_stats['ood']['top'], 0.999) + q(reject_stats['id']['top'], 0.01)))
+
+    global reject_thr
+    reject_thr = tau
+
+# more often a class is inside hedonic window (high gwin_ema) -> less push (conservative)
+def meta_scale(idx):
+    return np.clip(meta_min + (meta_max - meta_min) * (1.0 - float(gwin_ema[idx])), meta_min, meta_max)
 
 # 4. LIF conductance-based OUTPUT taste neurons with intrinsic homeostatis and dynamic SPICY aversion
 taste_neurons = b.NeuronGroup(
@@ -662,7 +818,8 @@ S_drive.connect('i == j and i != unknown_id')
 mod = b.NeuronGroup(
     1,
     model='''
-        dDA/dt = -DA/tau_DA : 1
+        dDA_f/dt = -DA_f/tau_DA_phasic : 1   # phasic
+        dDA_t/dt = -DA_t/tau_DA_tonic  : 1   # tonic
         dHT/dt = -HT/tau_HT : 1
         dNE/dt = -NE/tau_NE : 1
         dHI/dt = -HI/tau_HI : 1
@@ -679,11 +836,13 @@ mod = b.NeuronGroup(
         dH2O/dt  = -H2O/tau_H2O : 1
     ''',
     method='exact',
-    namespace={'tau_DA': tau_DA, 'tau_HT': tau_HT, 'tau_NE': tau_NE, 
+    namespace={'tau_DA_phasic': tau_DA_phasic, 'tau_DA_tonic': tau_DA_tonic, 
+               'tau_HT': tau_HT, 'tau_NE': tau_NE, 
                'tau_HI' : tau_HI, 'tau_ACH' : tau_ACH, 'tau_GABA' : tau_GABA,
                'tau_HUN': 60*b.second, 'tau_SAT': 120*b.second, 'tau_H2O': 90*b.second}
 )
-mod.DA = 0.0
+mod.DA_f = 0.0
+mod.DA_t = 0.0
 mod.HT = 0.0
 mod.NE = 0.0
 mod.HI = 0.0
@@ -717,7 +876,7 @@ net.add(inh_mon)
 theta_mon = b.StateMonitor(taste_neurons, 'theta', record=True)
 s_mon = b.StateMonitor(taste_neurons, 's', record=True)
 net.add(theta_mon, s_mon)
-mod_mon = b.StateMonitor(mod, ['DA', 'HT', 'NE', 'HI', 'ACH', 'GABA'], record=True)
+mod_mon = b.StateMonitor(mod, ['DA_f','DA_t','HT','NE','HI','ACH','GABA'], record=True)
 net.add(mod_mon)
 # Hedonic window for SPICY nociceptive
 spice_mon = b.StateMonitor(taste_neurons, ['spice_drive','thr_spice','a_spice','da_gate'],
@@ -867,7 +1026,8 @@ for input_rates, true_ids, label in training_stimuli:
     mod.ACH[:] = ach_train_level
 
     # after the increasing, neuromodulators must decay
-    DA_now = float(mod.DA[0])
+    #DA_now = float(mod.DA[0])
+    DA_now = float(mod.DA_f[0] + k_tonic_DA * mod.DA_t[0])  # DA with tonic tail included
     HT_now = float(mod.HT[0])
     NE_now = float(mod.NE[0])
     HI_now = float(mod.HI[0])
@@ -1016,12 +1176,18 @@ for input_rates, true_ids, label in training_stimuli:
     order = np.argsort(scores)
     dbg = [(taste_map[idx], int(scores[idx])) for idx in order[::-1]]
 
-    # if there is hedonic window dopaminergic reinforcement => DA is modulated by the hedonic window itself
+    # if there is hedonic window dopaminergic reinforcement => DA is modulated by the hedonic window itself keeping states in mind
     if use_hedonic_da:
         av_out = np.array(taste_neurons.av_over[:unknown_id]) + np.array(taste_neurons.av_under[:unknown_id])
         g_win = 1.0 / (1.0 + hed_gate_k * np.maximum(av_out, 0.0))  # 0..1
+        hed_fb_vec = state_hed_fallback_vec(mod, base=hed_fallback) # fallback for every different state
     else:
         g_win = np.ones(unknown_id)
+        hed_fb_vec = np.full(unknown_id, hed_fallback)
+
+    # biologically plausible dopaminergic latency simulation -> part of eligibility decay
+    gwin_ema = (1.0 - meta_lambda) * gwin_ema + meta_lambda * np.asarray(g_win[:unknown_id])
+    net.run(dopamine_latency)
 
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
@@ -1043,8 +1209,10 @@ for input_rates, true_ids, label in training_stimuli:
             r *= 0.5 + 0.5 * conf   # 0.5–1.0
             # hedonic fallback => if a taste is recognized but is not inside the hedonic window => minor DA reinforcement
             if use_hedonic_da:
-                hed_mult = hed_fallback + (1.0 - hed_fallback) * float(g_win[idx])
+                hed_mult = hed_fb_vec[idx] + (1.0 - hed_fb_vec[idx]) * float(g_win[idx])
                 r *= hed_mult
+            # metaplasticity: reinforcement scaling for TP
+            r *= meta_scale(idx)
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -1071,29 +1239,93 @@ for input_rates, true_ids, label in training_stimuli:
                 if step > fp_gate_warmup_steps and float(diff_counts[q]) >= fp_gate[q]:
                    si = ij_to_si.get((p, q), None)
                    if si is None:
-                      continue  # if that synapse doesn't exist
-                   old_w = float(S.w[si])
-                   delta = - beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now) * float(S.elig[si])
+                       continue  # if that synapse doesn't exist
+                   
+                   # OFF-diagonal FP severity on q (how much the threshold is exceeded)
+                   severity_q = float(diff_counts[q]) / float(fp_gate[q] + 1e-9)
+                   severity_q = float(np.clip(severity_q, 1.0, 2.0))  # 1x..2x
+                   
+                   # trial confidence
+                   conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
+
+                   # true class 'p' hedonic scaling
+                   if use_hedonic_da:
+                       hed_mult_p = float(hed_fb_vec[p] + (1.0 - hed_fb_vec[p]) * float(g_win[p]))
+                   else:
+                       hed_mult_p = 1.0
+
+                   # negative off-diagonal reward related to the p class and q severity
+                   r_off = - beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now)
+                   r_off *= severity_q * (0.5 + 0.5 * conf) * hed_mult_p
+                   r_off *= meta_scale(p)
+
+                   delta = r_off * float(S.elig[si])
                    if delta != 0.0:
-                      S.w[si] = float(np.clip(S.w[si] + delta, 0, 1))
-                      if verbose_rewards and step % 10 == 0:
-                          print(f"  offdiag - {taste_map[p]}→{taste_map[q]} | "
-                              f"spk_q={float(diff_counts[q]):.1f} fp_q={fp_gate[q]:.1f} "
-                              f"Δw={delta:+.4f}  w:{old_w:.3f}→{float(S.w[si]):.3f}")
+                       old_w = float(S.w[si])
+                       S.w[si] = float(np.clip(S.w[si] + delta, 0, 1))
+                       if verbose_rewards and step % 10 == 0:
+                           print(f"  offdiag[cls] - {taste_map[p]}→{taste_map[q]} | "
+                                 f"spk_q={float(diff_counts[q]):.1f} fp_q={fp_gate[q]:.1f} sev={severity_q:.2f} hed={hed_mult_p:.2f} "
+                                 f"Δw={delta:+.4f}  w:{old_w:.3f}→{float(S.w[si]):.3f}")
                    S.elig[si] = 0.0
-    
+
+                   # light simmetrical pattern q→p
+                   sj_sym = ij_to_si.get((q, p), None)
+                   if sj_sym is not None:
+                        delta_sym = 0.5 * r_off * float(S.elig[sj_sym])
+                        if delta_sym != 0.0:
+                            S.w[sj_sym] = float(np.clip(S.w[sj_sym] + delta_sym, 0, 1))
+                        S.elig[sj_sym] = 0.0
+
+                   # safety fallback -> if FP is very strong, normalization on 'q' column again
+                   if severity_q > 1.5 and use_col_norm and connectivity_mode == "dense":
+                        w_all = np.asarray(S.w[:], dtype=float)
+                        i_all = np.asarray(S.i[:], dtype=int)
+                        j_all = np.asarray(S.j[:], dtype=int)
+
+                        idx_col = np.where(j_all == q)[0]
+                        if idx_col.size:
+                            col = w_all[idx_col].copy()
+
+                            if col_floor > 0.0:
+                                col = np.maximum(col, col_floor)
+
+                        # diagonal bias for normalization
+                        if diag_bias_gamma != 1.0:
+                            dloc = np.where(i_all[idx_col] == q)[0]
+                            if dloc.size:
+                                col[dloc[0]] *= float(diag_bias_gamma)
+
+                        L1 = float(np.sum(col))
+                        target = col_norm_target if col_norm_target is not None else L1
+                        if L1 > 1e-12:
+                            if L1 > target:
+                                scale = target / L1
+                                col = np.clip(col * scale, 0.0, 1.0)
+                            elif col_allow_upscale and (L1 < col_upscale_slack * target):
+                                scale = min(col_scale_max, (target / L1))
+                                col = np.clip(col * scale, 0.0, 1.0)
+
+                        w_all[idx_col] = col
+                        S.w[:] = w_all
+
     # burst neuromodulators DA and 5-HT for the next trial as in a human-inspired biology brain
     # quality = Jaccard(T, P)
     T = set(true_ids); P = set(winners)
     jacc = len(T & P) / len(T | P) if (T | P) else 1.0
 
     if jacc >= 0.67:
-        mod.DA[:] += da_pulse_reward * jacc # scaled reward
+        # scaled reward
+        mod.DA_f[:] += da_pulse_reward * jacc
+        mod.DA_t[:] += da_tonic_tail * jacc
     elif jacc > 0.0:
-        mod.DA[:] += 0.4 * da_pulse_reward * jacc # partial reward
+        mod.DA_f[:] += 0.4 * da_pulse_reward * jacc # partial reward
         mod.HI[:] += 0.5 * hi_pulse_miss
     else:
         mod.HI[:] += hi_pulse_miss
+
+    # tonic bias internal state (HUN/H2O)
+    mod.DA_t[:] += k_hun_tonic * float(mod.HUN[0]) + k_h2o_tonic * float(mod.H2O[0])
 
     # if the prevision is good => reward to every taste in the trial
     if jacc >= 0.67:
@@ -1113,8 +1345,8 @@ for input_rates, true_ids, label in training_stimuli:
 
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
-    has_strong_fp = any((i not in true_ids) and (float(diff_counts[i]) >= fp_gate[i])
-                    for i in range(num_tastes-1))
+    has_strong_fp = any((idx not in true_ids) and (float(diff_counts[idx]) >= fp_gate[idx])
+                    for idx in range(num_tastes-1))
     if has_strong_fp:
         mod.HT[:] += ht_pulse_fp
         mod.NE[:] += 0.5 * ne_pulse_amb # arousal on strong FP
@@ -1205,57 +1437,7 @@ for idx in range(num_tastes-1):
 print("Per-class thresholds (hybrid μ+kσ, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class[idx]) for idx in range(num_tastes-1)})
 
-# OOD/NULL calibration: increase threshold on OOD queues
-def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms):
-    saved_stdp = float(S.stdp_on[0])
-    S.stdp_on[:] = 0.0
-    saved_noise = pg_noise.rates
-    pg_noise.rates = 0 * b.Hz
-    tmp = [[] for _ in range(num_tastes-1)]
-
-    # NULL
-    for _ in range(n_null):
-        vix, _, _ = make_null()
-        set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = spike_mon.count[:] - prev
-        for idx in range(num_tastes-1):
-            tmp[idx].append(int(diff[idx]))
-        if gap > 0* b.ms: net.run(gap)
-
-    # OOD
-    # ood_diffuse
-    for _ in range(n_ood//2):
-        vix, _, _ = make_ood_diffuse()
-        set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = spike_mon.count[:] - prev
-        for idx in range(num_tastes-1):
-            tmp[idx].append(int(diff[idx]))
-        if gap > 0* b.ms: net.run(gap)
-    
-    # ood_many
-    for _ in range(n_ood//2):
-        vix, _, _ = make_ood_many(k=np.random.randint(4,6))
-        set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = spike_mon.count[:] - prev
-        for idx in range(num_tastes-1):
-            tmp[idx].append(int(diff[idx]))
-        if gap > 0* b.ms: net.run(gap)
-
-    # at least -> 99.5° percentile
-    for idx in range(num_tastes-1):
-        if tmp[idx]:
-            thr_per_class[idx] = max(thr_per_class[idx], float(np.quantile(tmp[idx], 0.995)))
-
-    pg_noise.rates = saved_noise
-    S.stdp_on[:] = saved_stdp
-
-# call that function
+# OOD/NULL calibration before TEST
 ood_calibration(n_null=8, n_ood=16, dur=200*b.ms, gap=0*b.ms)
 
 # printing scaled weights after training
@@ -1302,7 +1484,8 @@ taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_m
 # deactivate state effect for DA and 5-HT for clean test phase
 taste_neurons.theta_bias[:] = 0 * b.mV
 inhibitory_S.inh_scale = 0.8
-mod.DA[:] = 0.0
+mod.DA_f[:] = 0.0
+mod.DA_t[:] = 0.0
 mod.HT[:] = 0.0
 # to manage Hedonic window
 taste_neurons.taste_drive[:] = 0.0
@@ -1314,7 +1497,8 @@ apply_internal_state_bias(profile, mod, taste_neurons)
 # "emotive state" in test phase
 if test_emotion_mode == "off":
     # neutral test
-    mod.DA[:] = 0.0
+    mod.DA_f[:] = 0.0
+    mod.DA_t[:] = 0.0
     mod.HT[:] = 0.0
     mod.NE[:] = 0.0
     mod.HI[:] = 0.0
@@ -1394,7 +1578,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # deciding with "active" or "off" if there's need to applicate emotion test or not
     if test_emotion_mode != "off":
-        DA_now = float(mod.DA[0])
+        DA_now = float(mod.DA_f[0] + k_tonic_DA * mod.DA_t[0])
         HT_now = float(mod.HT[0])
         NE_now = float(mod.NE[0])
         HI_now = float(mod.HI[0])
@@ -1461,6 +1645,38 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
     z = scores[:unknown_id] / pos_expect_test
 
+    # rejector OOD/NULL
+    if reject_thr:
+        met = _trial_metrics_from_scores(scores, pos_expect_test, taste_neurons.gdi_eff[0])
+
+        reject_now = False
+        # OR criteria: if at least one push on OOD/NULL
+        if met['z_top']   < reject_thr['z_top']:    reject_now = True
+        if met['rel_top'] < reject_thr['rel_top']:  reject_now = True
+        if met['margin']  < reject_thr['margin']:   reject_now = True
+        if met['H']       > reject_thr['H']:        reject_now = True
+        if (met['gdi_eff'] > reject_thr['gdi_eff']) and (met['top'] < reject_thr['abs_top']):
+            reject_now = True
+
+        # minimum energetic barrier: strong against fast NULL
+        if float(scores.max()) < max(min_spikes_for_known_test, reject_thr.get('abs_top', 0.0)):
+            reject_now = True
+
+        if reject_now:
+            winners = [unknown_id]
+            # debug log:
+            print(f"[REJECT] z_top={met['z_top']:.2f} rel_top={met['rel_top']:.2f} margin={met['margin']:.2f} H={met['H']:.2f} gdi={met['gdi_eff']:.2f} top={met['top']:.1f}")
+            # valutation + recovery + next trial
+            expected  = [taste_map[idxs] for idxs in true_ids]
+            predicted = [taste_map[w] for w in winners]
+            hit = set(winners) == set(true_ids)
+            print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
+            results.append((label, expected, predicted, hit))
+            if set(winners) == set(true_ids):
+                exact_hits += 1
+            net.run(recovery_between_trials)
+            continue
+
     # hyperparameters
     z_min = 0.25                        
     sep_min = 0.15 # just during the fallback
@@ -1497,10 +1713,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         if (scores[top_idx] >= thr_per_class[top_idx] + abs_margin_test) and (z[top_idx] >= z_min) and (sep >= sep_min):
             winners = [top_idx]
 
-    # 4) UNKNOWN labeling classification if there's no enough energy
-    if (top < min_spikes_for_known_test) or (len(winners) == 0):
-        winners = [unknown_id]
-
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
     print("\nTest scores:", dbg)
@@ -1515,10 +1727,11 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # Emotional burst in test phase
     if test_emotion_mode == "active":
         if set(winners) == set(true_ids):
-            mod.DA[:] += da_pulse_reward  # gratification
+            mod.DA_f[:] += da_pulse_reward    # phasic burst
+            mod.DA_t[:] += da_tonic_tail      # tonic tail
         has_strong_fp = any(
-            (i not in true_ids) and (float(diff_counts[i]) >= thr_per_class[i])
-            for i in range(num_tastes-1)
+            (idx not in true_ids) and (float(diff_counts[idx]) >= thr_per_class[idx])
+            for idx in range(num_tastes-1)
         )
         if has_strong_fp:
             mod.HT[:] += ht_pulse_fp # prudence or fear increased
@@ -1527,8 +1740,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             mod.HI[:] += 0.5 * hi_pulse_miss
     
     if test_emotion_mode != "off":
-        msg += f" | DA={float(mod.DA[0]):.2f} HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f} HI={float(mod.HI[0]):.2f} ACH={float(mod.ACH[0]):.2f} GABA={float(mod.GABA[0]):.2f}"
-    # showing the log bar    
+        DA_disp = float(mod.DA_f[0] + k_tonic_DA * mod.DA_t[0])
+        msg += (f" | DA={DA_disp:.2f} (f={float(mod.DA_f[0]):.2f},t={float(mod.DA_t[0]):.2f})"
+            f" HT={float(mod.HT[0]):.2f} NE={float(mod.NE[0]):.2f} HI={float(mod.HI[0]):.2f}"
+            f" ACH={float(mod.ACH[0]):.2f} GABA={float(mod.GABA[0]):.2f}")
     pbar_update(msg)
 
     # to make a confrontation: expected vs predicted values
@@ -1629,7 +1844,7 @@ print(f"Mean IoU (per-class): {fmt_pct(mean_iou)}")
 # Jaccard per test-case (expected vs predicted)
 if jaccard_per_case:
     mean_jaccard_cases = float(np.mean(jaccard_per_case))
-    print("\nJaccard per test-case:", [f"{j:.2f}" for j in jaccard_per_case])
+    print("\nJaccard per test-case:", [f"{jx:.2f}" for jx in jaccard_per_case])
     print(f"Average Jaccard (set vs set): {mean_jaccard_cases:.2f}")
 
 # PR-/ROC-AUC management
@@ -1815,7 +2030,7 @@ plt.show()
 # d) Neuromodulators/WTA plot
 # d1) Neuromodulators
 plt.figure(figsize=(10,3))
-for k in ['DA','HT','NE','HI','ACH','GABA']:
+for k in ['DA_f','DA_t','HT','NE','HI','ACH','GABA']:
     plt.plot(mod_mon.t/b.ms, getattr(mod_mon, k)[0], label=k)
 plt.title('Neuromodulators through the time')
 plt.legend(loc="upper right") 
@@ -1872,7 +2087,7 @@ plt.imshow(W[:unknown_id, :unknown_id], aspect='equal')
 plt.xticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)], rotation=45)
 plt.yticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)])
 plt.colorbar(label='w')
-plt.title('Weights matrix (note→note)')
+plt.title('Weights matrix (taste→taste)')
 plt.tight_layout()
 plt.show()
 
