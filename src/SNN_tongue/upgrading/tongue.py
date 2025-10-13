@@ -8,6 +8,7 @@ import sys
 import random
 import numpy as np
 import time
+import math
 import shutil
 
 # GDI toggle for activation/deactivation
@@ -104,6 +105,91 @@ def ema_sd(m1, m2):
     var = max(1e-9, m2 - m1*m1)
     return np.sqrt(var)
 
+# UNSUPERVISED LEARNING helpers => NNLS lightweight solver
+#    A: (C, K) prototipi, tipicamente K=C se usi una colonna per classe
+#    b: (C,) vettore score osservato
+#    Ritorna alpha (K,), alpha>=0, sum(alpha)<=l1_cap
+# 1.
+def nnls_projected_grad(A, b, iters=200, lr=0.05, l1_cap=1.0):
+    A = np.asarray(A, float); b = np.asarray(b, float)
+    K = A.shape[1]
+    alpha = np.zeros(K, dtype=float)
+    At = A.T
+    for _ in range(iters):
+        grad = At @ (A @ alpha - b)
+        alpha -= lr * grad
+        alpha = np.clip(alpha, 0.0, None)
+        s = alpha.sum()
+        if s > l1_cap:
+            alpha *= (l1_cap / (s + 1e-9))
+    return alpha
+# 2.
+def recon_error(A, b, alpha):
+    r = b - A @ alpha
+    return float(np.linalg.norm(r, 2))  # L2
+# 3. UNSUP: conf score and micro-probe for logging and verification of unsupervised learning success
+def clamp01(x): 
+    return float(np.clip(x, 0.0, 1.0)) # clipping
+# 4. confidence probability => higher means good confidence: correct unsupervised learning, smaller means bad confidence
+def conf_unsup_score(err, top_alpha, good_coverage):
+    # conf_unsup = (1 - err) * top_alpha * good_coverage
+    return clamp01((1.0 - float(err)) * float(top_alpha) * (1.0 if good_coverage else 0.0))
+# 5.
+def probe_boost_candidates(cands, base_rates, K=3, dur_ms=120, boost_frac=0.12):
+    """
+    Micro-trial: re-inietta lo stimolo K volte aumentando i canali candidati di +10–15%.
+    Ritorna (ok, pmr_series, gap_series, z_series_dict)
+    - ok=True se PMR/gap e z dei candidati crescono "abbastanza" in maniera consistente.
+    Nota: non tocca STDP (è già frozen nel TEST).
+    """
+    dur = dur_ms * b.ms
+    pmr_list, gap_list = [], []
+    z_series = {c: [] for c in cands}
+
+    for _ in range(K):
+        boosted = np.array(base_rates, dtype=float)
+        for c in cands:
+            boosted[c] *= (1.0 + boost_frac)
+
+        # run micro-trial: conteggio differenziale
+        prev = spike_mon.count[:].copy()
+        if USE_GDI:
+            set_stimulus_vector(boosted, include_unknown=False)
+        else:
+            set_stimulus_vect_norm(boosted, total_rate=None, include_unknown=False)
+        net.run(dur)
+        diff = (spike_mon.count[:] - prev).astype(float)
+
+        # metriche
+        s = diff.copy(); s[unknown_id] = -1e9
+        top = float(s.max()); order = np.argsort(s)[::-1]
+        second = float(s[order[1]]) if len(order) > 1 else 0.0
+        E = float(np.sum(s[:unknown_id])) if np.isfinite(s[:unknown_id]).any() else 0.0
+        pmr = (top / (E + 1e-9)) if E > 0 else 0.0
+        gap = (top - second) / (top + 1e-9) if top > 0 else 0.0
+        pmr_list.append(pmr); gap_list.append(gap)
+
+        # z-score relativo alle aspettative positive (scala test)
+        pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1.0)
+        z = s[:unknown_id] / np.maximum(pos_expect_test, 1.0)
+        for c in cands:
+            z_series[c].append(float(z[c]))
+
+    # criterio “crescita sistematica” (largo ma utile):
+    # - PMR e gap non devono peggiorare in media
+    # - per ogni candidato almeno 2/3 degli step mostrano crescita z rispetto al primo
+    pmr_ok = (np.mean(np.diff(pmr_list)) >= -0.01)      # non decresce
+    gap_ok = (np.mean(np.diff(gap_list)) >= -0.01)
+    z_ok_all = True
+    for c in cands:
+        base = z_series[c][0]
+        ups = sum(1 for zc in z_series[c][1:] if zc >= base + 1e-3)
+        need = max(1, math.ceil((K-1)*2/3))
+        z_ok_all = z_ok_all and (ups >= need) # at least 2 on 3
+
+    return (pmr_ok and gap_ok and z_ok_all), pmr_list, gap_list, z_series
+
+
 # 1. Initialize the simulation
 b.start_scope()
 b.defaultclock.dt = 0.1 * b.ms  # high temporal precision
@@ -198,7 +284,7 @@ hi_pulse_miss        = 1.0              # burst on error
 # Acetylcholine (ACh) — contextual plasticity / different attention on train and test
 tau_ACH              = 700 * b.ms       # decay for ACh
 ach_train_level      = 0.8              # high ACh during training
-ach_test_level       = 0.10             # low ACh during test
+ach_test_level       = 0.15             # low ACh during test
 k_ex_ACH             = 0.25             # exictement gain with ACh
 ach_plasticity_gain  = 0.40             # ACh ↑ reward effect on Δw
 k_noise_ACH          = 0.25             # ACh noise environment reduction
@@ -227,26 +313,28 @@ theta_init           = 0.0 *b.mV        # starting theta threshold for homeostas
 rho_target = target_rate * tau_rate     # dimensionless (Hz*s)
 
 # Decoder threshold parameters
-k_sigma              = 1.3              # ↑ if it is too weak
+k_sigma              = 1.2              # ↑ if it is too weak
 q_neg                = 0.99             # negative quantile
 
 # Multi-label RL + EMA decoder
-ema_lambda            = 0.05            # 0 < λ ≤ 1
-tp_gate_ratio         = 0.30            # threshold to reward winner classes
-fp_gate_warmup_steps  = 50              # delay punitions to loser classes if EMA didn't stabilize them yet
+ema_lambda            = 0.10            # 0 < λ ≤ 1
+tp_gate_ratio         = 0.34            # threshold to reward winner classes
+fp_gate_warmup_steps  = 80              # delay punitions to loser classes if EMA didn't stabilize them yet
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
-ema_factor            = 0.5             # EMA factor to punish more easy samples
+ema_factor            = 0.50            # EMA factor to punish more easy samples
 use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
-rel_gate_ratio_test   = 0.22            # second > 45 % rel_gate
+rel_gate_ratio_test   = 0.14            # second > 45 % rel_gate
 mixture_thr_relax     = 0.40            # ≥ 50% of threshold per-class
-z_rel_min             = 0.10            # z margin threshold to let enter taste in relative gate  
+z_rel_min             = 0.03            # z margin threshold to let enter taste in relative gate
+z_min_base            = 0.14            # prima 0.20
+z_min_mix             = 0.08  
 rel_cap_abs           = 10.0            # absolute value for spikes
-dyn_abs_min_frac      = 0.25            # helper for weak co-tastes -> it needs at least 30% of positive expected
+dyn_abs_min_frac      = 0.22            # helper for weak co-tastes -> it needs at least 30% of positive expected
 # boosting parameters to push more weak examples
-norm_rel_ratio_test   = 0.15            # winners with z_i >= 15% normalized top
+norm_rel_ratio_test   = 0.04            # winners with z_i >= 15% normalized top
 min_norm_abs_spikes   = 1               # at least one real spike
 eps_ema               = 1e-3            # epsilon for EMA decoder
-mix_abs_pos_frac      = 0.15            # positive expected fraction
+mix_abs_pos_frac      = 0.12            # positive expected fraction
 # metaplasticity -> STDP reward adapted to the historical of how often the reward is inside the hedonic window
 meta_min              = 0.3             # lower range STDP scaling
 meta_max              = 1.5             # higher range STDP scaling
@@ -261,13 +349,13 @@ use_offdiag_dopamine = True             # quick toggle to activate/deactivate re
 # Normalization per-column (synaptic scaling in input)
 use_col_norm         = True             # on the normalization
 col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax" -> synaptic scaling that mantains input scale per post neuron to avoid unfair competition
-col_norm_every       = 3                # execute norm every N trial
+col_norm_every       = 2                # execute norm every N trial
 col_norm_temp        = 1.0              # temperature softmax (if mode="softmax")
 col_norm_target      = None             # if None, calculating the target at the beginning of the trial
-diag_bias_gamma      = 1.30             # >1.0 = light bias to the diagonal weight before normalization
+diag_bias_gamma      = 1.20             # >1.0 = light bias to the diagonal weight before normalization
 col_floor            = 0.0              # floor (0 or light epsilon) before norm
 col_allow_upscale    = True             # light up-scaling
-col_upscale_slack    = 0.90             # if L1 < 90% target → boost
+col_upscale_slack    = 0.80             # if L1 < 90% target → boost
 col_scale_max        = 1.2              # max factor per step
 
 # SPICY dynamic tolerance / aversion dynamics
@@ -313,7 +401,7 @@ alpha                = 0.1              # learning rate for positive reward
 noise_mu             = 5                # noise mu constant
 noise_sigma          = 0.8              # noise sigma constant
 training_duration    = 1000 * b.ms      # stimulus duration
-test_duration        = 500 * b.ms       # test verification duration
+test_duration        = 800 * b.ms       # test verification duration
 pause_duration       = 100 * b.ms       # pause for eligibility decay
 n_repeats            = 10               # repetitions per taste
 progress_bar_len     = 30               # characters
@@ -333,7 +421,7 @@ stp_uinc             = 0.05             # increasing per-spike (facilitation)
 stp_tau_rec          = 150 * b.ms       # recovery (STD)
 stp_tau_facil        = 800 * b.ms       # facilitation decay (STF)
 stp_r_ref            = 120.0            # reference Hz to calibrate gain for STP
-stp_warmup_trials    = 30               # important initial warmup to avoid DA suppression in the beginning
+stp_warmup_trials    = 90               # important initial warmup to avoid DA suppression in the beginning
 
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode    = "dense"          # "dense" -> fully-connected | "diagonal" -> one to one
@@ -406,35 +494,41 @@ def make_ood_many(low=60, high=130, k=5):
     return vix, [unknown_id], f"OOD (many-{k} mid amps)"
 
 # OOD/NULL calibration: increase threshold on OOD queues
-def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms, thr_vec=None):
-    saved_stdp = float(S.stdp_on[0]); S.stdp_on[:] = 0.0
-    saved_noise = pg_noise.rates; pg_noise.rates = 0 * b.Hz
+def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None):
+    saved_stdp = float(S.stdp_on[0]) # saved current plasticity state
+    S.stdp_on[:] = 0.0
+    saved_noise = pg_noise.rates # the same with noise
+    pg_noise.rates = 0 * b.Hz
 
-    tmp_spikes = [[] for _ in range(num_tastes-1)]
+    # list of lists to collect all negative spikes for each class
+    tmp_spikes = [[] for _ in range(num_tastes-1)] 
     pmr_list, h_list, gap_list = [], [], []
 
     def _one_trial(vix):
-        # niente UNKNOWN
+        # no UNKNOWN
         set_stimulus_vector(vix, include_unknown=False)
-        prev = spike_mon.count[:].copy()
-        net.run(dur)
-        diff = (spike_mon.count[:] - prev).astype(float)
-        # accumula per-class
+        prev = spike_mon.count[:].copy() # saving previous trial spikes
+        net.run(dur) # starting simulation
+        diff = (spike_mon.count[:] - prev).astype(float) # misuring current spikes with substract previous to current ones
+        # storing per-class
         for idx in range(num_tastes-1):
-            tmp_spikes[idx].append(int(diff[idx]))
+            tmp_spikes[idx].append(int(diff[idx])) # collect every negative spike per class
 
-        # feature open-set
+        # feature open-set calculation
         s = diff.copy()
         s[unknown_id] = -1e9
-        order = np.argsort(s)[::-1]
+        order = np.argsort(s)[::-1] # desc sorting (last spike for first)
         top, second = float(s[order[0]]), float(s[order[1]]) if len(order) > 1 else 0.0
         E = float(np.sum(s[:unknown_id]))
         pmr = top / (E + 1e-9)
-        gap_rel = (top - second) / (top + 1e-9)
-        p = s[:unknown_id] / (E + 1e-9)
-        p = np.clip(p, 1e-12, 1.0); p = p / p.sum()
-        h = float(-(p*np.log(p)).sum())
-        pmr_list.append(pmr); h_list.append(h); gap_list.append(gap_rel)
+        gap_rel = (top - second) / (top + 1e-9) # numerical epsilon needs to be installed to avoid division per 0
+        p = s[:unknown_id] / (E + 1e-9) # p is the spikes / their energy
+        p = np.clip(p, 1e-12, 1.0)
+        p = p / p.sum() # normalized distribution
+        h = float(-(p*np.log(p)).sum()) # entropy
+        pmr_list.append(pmr)
+        h_list.append(h)
+        gap_list.append(gap_rel)
 
     # NULL
     for _ in range(n_null):
@@ -454,7 +548,7 @@ def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
         _one_trial(vix)
         if gap > 0*b.ms: net.run(gap)
 
-    # aggiorna soglie per-class contro FP (come prima, ma 0.999 di default)
+    # updating per-class thresholds against FP increasing negative quantile
     if thr_vec is not None:
         for idx in range(num_tastes-1):
             if tmp_spikes[idx]:
@@ -463,20 +557,21 @@ def ood_calibration(n_null=10, n_ood=20, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
                     float(np.quantile(tmp_spikes[idx], 0.995))
                 )
 
-    # soglie open-set data-driven: scegli valori alti sui *negativi*
-    # (=> se al test PMR/H/gap ricadono nella parte "tipica dei negativi", rifiutiamo)
-    PMR_thr_auto = float(np.quantile(pmr_list, 0.98)) if pmr_list else 0.6
-    H_thr_auto   = float(np.quantile(h_list,  0.60)) if h_list  else np.log(unknown_id)*0.65
-    gap_thr_auto = float(np.quantile(gap_list,0.40)) if gap_list else 0.20
+    # open-set data-driven thresholds
+    # (=> if during the test PMR/H/gap are inside the "negative typical part", refusing)
+    PMR_thr_auto = float(np.quantile(pmr_list, 0.990))  # 0.995 → 0.990
+    H_thr_auto   = float(np.quantile(h_list,  0.45))    # 0.35 → 0.45 (meno severo)
+    gap_thr_auto = float(np.quantile(gap_list,0.55))    # 0.60 → 0.55
 
     pg_noise.rates = saved_noise
     S.stdp_on[:] = saved_stdp
 
-    # quantile 0.999 per classe sui negativi OOD/NULL
+    # 0.995 per-class quantile on negatives OOD/NULL
     ood_q = np.array([
-        (np.quantile(tmp_spikes[idx], 0.999) if len(tmp_spikes[idx]) else 0.0)
+        (np.quantile(tmp_spikes[idx], 0.995) if len(tmp_spikes[idx]) else 0.0)
         for idx in range(num_tastes-1)
     ], dtype=float)
+
     return PMR_thr_auto, H_thr_auto, gap_thr_auto, ood_q
 
 # more often a class is inside hedonic window (high gwin_ema) -> less push (conservative)
@@ -606,50 +701,78 @@ S_fb_gdi.connect('i != unknown_id')
 # Monitoring GDI
 gdi_mon = b.StateMonitor(gdi_pool, 'x', record=True)
 
-# STDP / STP (STF+STD) Synapses with eligibility trace ET, lateral inhibition WTA, Global Division Inhibition GDI and EMA
+# --- Triplet STDP (Pfister & Gerstner 2006) + eligibility trace decay + STP (STF/STD) Tsodyks-Markram---
+# Tracce:
+#   x, xbar  -> pre (tau_x_minus, tau_xbar_minus)
+#   y, ybar  -> post (tau_y_plus,  tau_ybar_plus)
+# Contributi a elig:
+#   on_pre  : A2p * y_post      + A3p * y_post * ybar_post
+#   on_post : A2m * x_pre       + A3m * x_pre  * xbar_pre
+#
+# NB: accumuliamo in 'elig' (che poi decresce con Te). Il segno finale lo dà il rinforzo r
+#     (positivo -> LTP; negativo -> LTD) come già fai nel tuo codice.
 S = b.Synapses(
     pg, taste_neurons,
     model='''
-        w             : 1
-        x             : 1               # available resource (0...1)
-        u             : 1               # current usage (0...1)
-        u0            : 1               # u set-point
-        uinc          : 1               # spike increase
-        tau_rec       : second          # recovery time for resources (STD)
-        tau_facil     : second          # decay time for facilitation (STF)
-        ex_scale_stp  : 1               # STP gain
+        w            : 1
+        x_stp        : 1                 # risorsa disponibile (0..1)
+        u            : 1                 # utilizzo corrente (0..1)
+        u0           : 1                 # set-point di u
+        uinc         : 1                 # incremento per spike
+        tau_rec      : second            # STD recovery
+        tau_facil    : second            # STF decay
+        ex_scale_stp : 1                 # gain STP
 
-        dApre/dt      = -Apre/tau   : 1 (event-driven)
-        dApost/dt     = -Apost/tau  : 1 (event-driven)
-        delig/dt      = -elig/Te    : 1 (clock-driven)
-        ex_scale      : 1
-        stdp_on       : 1
-        gamma_gdi     : 1 (shared)      # global divisive rewarding
+        dx/dt     = -x/tau_x_minus        : 1 (event-driven)   # pre  (veloce, LTD)
+        dxbar/dt  = -xbar/tau_xbar_minus  : 1 (event-driven)   # Triplet pre  (lenta)
+        dy/dt     = -y/tau_y_plus         : 1 (event-driven)   # post (veloce, LTP)
+        dybar/dt  = -ybar/tau_ybar_plus   : 1 (event-driven)   # Triplet post (lenta)
+
+        delig/dt  = -elig/Te              : 1 (clock-driven)
+
+        stdp_on    : 1
+        ex_scale   : 1
+
+        gamma_gdi  : 1 (shared)
     ''',
     on_pre='''
-        u = u + uinc * (1 - u)          # STF: facilitation => u grow up to 1 for every spike
-        ge_post += (w * u * x * g_step_exc * ex_scale * ex_scale_stp) / (1.0 + gamma_gdi * gdi_eff_post)    # EPSC with STP: weight * u * x  (not with GDI)
-        x = x * (1 - u)                 # STD: depression => resource recovery
+        u     = u + uinc * (1 - u)
+        ge_post += (w * u * x_stp * g_step_exc * ex_scale * ex_scale_stp) / (1.0 + gamma_gdi * gdi_eff_post)
+        x_stp = x_stp * (1 - u)
 
-        Apre    += stdp_on * A_plus
-        elig    += stdp_on * Apost
+        x    += 1.0
+        xbar += 1.0
+
+        elig += stdp_on * ( (A2p * y + A3p * y * ybar) * (1 - w) )
     ''',
     on_post='''
-        Apost   += stdp_on * A_minus
-        elig    += stdp_on * Apre
+        y    += 1.0
+        ybar += 1.0
+
+        elig += stdp_on * ( (A2m * x + A3m * x * xbar) * w )
     ''',
     method='exact',
     namespace={
-        'tau': tau, 'Te': Te,
-        'A_plus': A_plus, 'A_minus': A_minus,
-        'g_step_exc': g_step_exc
+        'g_step_exc': g_step_exc, 'Te': Te,
+
+        # time constants per le tracce (ms -> second via unità Brian2)
+        'tau_y_plus':     33*b.ms,
+        'tau_ybar_plus': 200*b.ms,
+        'tau_x_minus':    16*b.ms,
+        'tau_xbar_minus': 66*b.ms,
+
+        # guadagni pair/triplet
+        'A2p':  0.0065,   # pair LTP
+        'A3p':  0.0070,   # triplet LTP
+        'A2m': -0.0070,   # pair LTD
+        'A3m': -0.0023,   # triplet LTD
     }
 )
 
 # Continual recovery between spikes: x grow up, u go back to U0
 S.run_regularly('''
-    x += (1 - x) * (dt / tau_rec)
-    u += (u0 - u) * (dt / tau_facil)
+    x_stp += (1 - x_stp) * (dt / tau_rec)
+    u     += (u0 - u)    * (dt / tau_facil)
 ''')
 
 # states initialization
@@ -702,7 +825,7 @@ else:
 
 # if STP is ON => initialize it
 if use_stp:
-    S.x[:]         = 1.0
+    S.x_stp[:]     = 1.0
     S.u[:]         = stp_u0
     S.u0[:]        = stp_u0
     S.uinc[:]      = stp_uinc
@@ -736,6 +859,10 @@ S_noise = b.Synapses(
     namespace=dict(g_step_bg=g_step_bg)
 )
 S_noise.connect('i == j and i != unknown_id')
+
+# Weak non-plastic uniform drive -> UNKNOWN (rifiuto guidato dall'energia diffusa)
+S_unk = b.Synapses(pg, taste_neurons, on_pre='ge_post += 0.15*nS')  # piccolo
+S_unk.connect('j == unknown_id and i != unknown_id')
 
 # GDI Synapses initialization
 S.gamma_gdi = gamma_gdi_0
@@ -848,6 +975,8 @@ net.add(hed_mon)
 ge_mon = b.StateMonitor(taste_neurons, ['ge','gdi_eff'], record=[0])
 net.add(ge_mon)
 net.add(gdi_mon)
+# unknown gate without learning it
+net.add(S_unk)
 
 # 9. Prepare stimuli list
 # 9A: pure‐taste training
@@ -880,13 +1009,7 @@ for idx in range(unknown_id):
 rng.shuffle(triples)
 for (idx,jdx,k) in triples[:K_triples*len(triples)//len(triples)]:
     mixture_train.append(noisy_mix([idx,jdx,k], amp=rng.integers(180,321)))
-'''mixture_train = []
-for _ in range(n_repeats): # N repeats for every training taste 
-    mixture_train.append(noisy_mix([0, 3]))    # SWEET + SOUR
-    mixture_train.append(noisy_mix([0, 2]))    # SWEET + SALTY
-    mixture_train.append(noisy_mix([2, 4]))    # SALTY + UMAMI
-    mixture_train.append(noisy_mix([0, 6]))    # SWEET + SPICY
-    mixture_train.append(noisy_mix([1, 4, 6])) # BITTER + UMAMI + SPICY'''
+
 
 # new random couples of tastes and mixtures to stress more the net
 extra_mixes = [
@@ -896,6 +1019,19 @@ extra_mixes = [
 for _ in range(n_repeats):
     for mix in extra_mixes:
         mixture_train.append(noisy_mix(mix, amp=np.random.randint(180, 321)))
+
+# Curriculum di training per mix “asimmetrici”
+for _ in range(n_repeats):
+    # co-gusto debole vicino alla soglia positiva media prevista
+    for isr in range(unknown_id):
+        js = np.random.randint(0, unknown_id)
+        if js == isr: js = (js+1) % unknown_id
+        amp_main = np.random.randint(220, 321)
+        amp_co   = np.random.randint(120, 181)   # debole
+        mixture_train.append(noisy_mix([isr, js], amp=amp_main))            
+        # in ~30% dei casi inverti le ampiezze per simmetria
+        if np.random.rand() < 0.3:
+            mixture_train.append(noisy_mix([js, isr], amp=amp_main))
 
 # 9C: test set -> couples and mixtures never seen during training
 test_stimuli = [
@@ -949,9 +1085,11 @@ taste_neurons.thr_lo[:unknown_id] = taste_neurons.thr0_lo[:unknown_id]
 # 10. Main "always-on" loop
 print("\nStarting TRAINING phase...")
 S.stdp_on[:] = 1.0
-S.Apre[:]  = 0
-S.Apost[:] = 0
+S.x[:] = 0; S.xbar[:] = 0
+S.y[:] = 0; S.ybar[:] = 0
 S.elig[:]  = 0
+ema_cop_m1 = np.zeros(num_tastes-1)  # E[x] quando la classe è presente in mix (co-presenza)
+ema_cop_m2 = np.zeros(num_tastes-1)  # E[x^2]
 n_noti = unknown_id   # max available tastes
 # reset GDI
 taste_neurons.v[:] = EL
@@ -1014,14 +1152,23 @@ for input_rates, true_ids, label in training_stimuli:
     ACH_now = float(mod.ACH[0])
     GABA_now = float(mod.GABA[0])
 
+    # just the effectives
+    masked = np.zeros_like(input_rates)
+    masked[true_ids] = input_rates[true_ids]
+
     # reward gain and WTA addicted to NE/HI/ACh
     S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI * HI_now) * (1.0 + k_ex_ACH * ACH_now)
     # s.ex_scale with STP and warmup
     if use_stp and (step <= stp_warmup_trials):
-        S.ex_scale *= 1.25
+        S.ex_scale *= 1.30
     # initializing the rewarding for GDI
     gamma_val = gamma_gdi_0 * (1.0 + 0.5*NE_now) * (1.0 - 0.3*HI_now)
     gamma_val = max(0.0, min(gamma_val, 0.5))  # clamp to max-limit gamma
+    # cap adattivo in base a "diffusione" dell'input
+    inp_energy = float(np.sum(masked[:unknown_id]))
+    pmr_in = (float(np.max(masked[:unknown_id])) / (inp_energy + 1e-9)) if inp_energy > 0 else 0.0
+    cap_boost  = float(np.interp(pmr_in, [0.25, 0.45], [0.95, 0.60]))
+    gamma_val = min(gamma_val, cap_boost)
     # STP warmup trials to avoid collapsing on a few spikes
     if use_stp and (step <= stp_warmup_trials):
         gamma_val = min(gamma_val, 0.08) # softer GDI to avoid initial collapse
@@ -1044,24 +1191,52 @@ for input_rates, true_ids, label in training_stimuli:
     taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI * HI_now) * b.mV
 
     # 1) training stimulus with masking on no-target neurons
-    masked = np.zeros_like(input_rates)
-    masked[true_ids] = input_rates[true_ids]
     if USE_GDI:
         # no rates normalization with GDI
         set_stimulus_vector(masked, include_unknown=False)
     else:
         set_stimulus_vect_norm(masked, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
-
-    # GDI print debug
-    '''print("\nGDI init:", float(gdi_pool.x[0]), "| gamma_gdi:", f"{gamma_val:.3f}")
-    eff = float(taste_neurons.gdi_eff[0])
-    div_eff = 1.0 + gamma_val * eff
-    print(f"GDI eff-divisor≈{div_eff:.2f}  (gdi_eff={eff:.3f})")'''
     
     # 2) spikes counting during trial
     prev_counts = spike_mon.count[:].copy()
     net.run(training_duration)
     diff_counts = spike_mon.count[:] - prev_counts
+
+    # --- OOD/NULL hard-negative mining on-the-fly (generic, no hard-coding) ---
+    E = float(np.sum(diff_counts[:unknown_id]))
+    pmr = (float(diff_counts[:unknown_id].max()) / (E + 1e-9)) if E>0 else 0.0
+
+    # trial diffuso/ambiguo => usa gate negativo più severo
+    is_diffuse_train = (pmr < 0.45)
+    if is_diffuse_train:
+        for q in range(unknown_id):
+            # "FP gate" sul training window (EMA-neg già disponibile)
+            neg_mu  = float(ema_neg_m1[q])
+            neg_sd  = float(ema_sd(ema_neg_m1[q], ema_neg_m2[q]))
+            fp_gate_train = max(min_spikes_for_known, neg_mu + 1.8*neg_sd)  # leggermente più severo del test
+
+            if float(diff_counts[q]) >= fp_gate_train:
+                # punizione proporzionale all’eccesso + cautela (5-HT)
+                severity = float(diff_counts[q]) / (fp_gate_train + 1e-9)
+                # boost leggero se è SPICY (perché tende a vincere nei diffusi)
+                #spice_boost = 1.20 if q == spicy_id else 1.0
+                #r_off = - spice_boost * beta_offdiag * (1.0 + ht_gain * float(mod.HT[0])) * min(2.0, severity)
+                r_off = - 1.15 * beta_offdiag * (1.0 + ht_gain * float(mod.HT[0])) * min(2.0, severity)
+                # penalizza TUTTE le sinapsi *→ q* (riduce l’attrattore spuriamente “caldo”)
+                idx = np.where(np.asarray(S.j[:], int) == q)[0]
+                if idx.size:
+                    S.w[idx] = np.clip(S.w[idx] + r_off * S.elig[idx], 0.0, 1.0)
+                    S.elig[idx] = 0.0
+        # piccolo boost GABA per stabilità
+        mod.GABA[:] += 0.3 * gaba_pulse_stabilize
+
+    # EMA vectors for decoder
+    is_mix_trial = (len(true_ids) >= 2)
+    for idx in range(num_tastes-1):
+        if idx in true_ids and is_mix_trial:
+            ema_cop_m1[idx], ema_cop_m2[idx] = ema_update(
+                ema_cop_m1[idx], ema_cop_m2[idx], float(diff_counts[idx]), ema_lambda
+            )
 
     #print(f"GDI end: x={float(gdi_pool.x[0]):.3f}, eff={float(taste_neurons.gdi_eff[0]):.3f}")
 
@@ -1098,10 +1273,19 @@ for input_rates, true_ids, label in training_stimuli:
             ema_neg_m1[idx], ema_neg_m2[idx] = ema_update(ema_neg_m1[idx], ema_neg_m2[idx],
                                                       float(diff_counts[idx]), ema_lambda)
 
+    # soft-pruning off-diagonali con bassa utilità (ogni 10 step)
+    if step % 10 == 0 and connectivity_mode == "dense":
+        w_all = np.asarray(S.w[:], float)
+        i_all = np.asarray(S.i[:], int)
+        j_all = np.asarray(S.j[:], int)
+        mask_off = (i_all != j_all) & (j_all != unknown_id) & (i_all != unknown_id)
+        w_all[mask_off] *= 0.992  # decadimento lieve e continuo
+        S.w[:] = np.clip(w_all, 0.0, 1.0)
+
     if diff_counts.max() <= 0:
         print("\nThere's no computed spike, skipping rewarding phase...")
-        S.elig[:] = 0
         net.run(pause_duration)
+        S.elig[:] = 0
         continue
 
     # A3: TP/FP threshold for each class
@@ -1150,7 +1334,29 @@ for input_rates, true_ids, label in training_stimuli:
     if ambiguous:
         mod.NE[:] += ne_pulse_amb
         mod.HI[:] += hi_pulse_nov
-        inhibitory_S.inh_scale[:] = np.maximum(0.3, inhibitory_S.inh_scale[:] * 0.85)
+        inhibitory_S.inh_scale[:] = np.maximum(0.8, inhibitory_S.inh_scale[:] * 0.85)
+        thr_rel = 0.18 * top
+        for jas in range(unknown_id):
+           if jas != sorted_idx[0]:
+                if float(scores[jas]) >= max(thr_rel, 0.4 * tp_gate[jas]):
+                    if jas not in winners:
+                        winners.append(jas)
+    
+    # stai per decidere i winner e dare rinforzi. Allentare WTA/GDI prima del rinforzo permette a più classi vere di sparare insieme nei mix (e poi ricevere reward).
+    E = float(np.sum(scores[:unknown_id]))
+    top = float(np.max(scores[:unknown_id])) if E > 0 else 0.0
+    PMR = top / (E + 1e-9) if E > 0 else 0.0
+    p = scores[:unknown_id] / (E + 1e-9) if E > 0 else np.zeros(unknown_id)
+    p = np.clip(p, 1e-12, 1.0); p /= p.sum()
+    H = float(-(p*np.log(p)).sum())
+
+    is_mix_like = (0.35 <= PMR <= 0.60) and (0.8 <= H <= 1.4)
+    if is_mix_like:
+        # meno WTA e meno squeeze GDI per far coesistere più gusti
+        inhibitory_S.inh_scale[:] = np.maximum(0.5, float(inhibitory_S.inh_scale[0]) * 0.80)
+        gamma_val = min(gamma_val, 0.18)
+        S.gamma_gdi = gamma_val
+        S_noise.gamma_gdi = gamma_val
 
     # total scores printing
     order = np.argsort(scores)
@@ -1193,6 +1399,18 @@ for input_rates, true_ids, label in training_stimuli:
                 r *= hed_mult
             # metaplasticity: reinforcement scaling for TP
             r *= meta_scale(idx)
+          # micro-reward per co-taste vero ma sotto soglia
+          elif idx in true_ids:
+            pos_mu_i = float(ema_pos_m1[idx])
+            pos_mu_t = max(1.0, pos_mu_i)
+            z_i = spikes_i / pos_mu_t
+            if z_i >= 0.40:  # presente ma debole
+                r = 0.25 * alpha * (1.0 + da_gain * DA_now) / (1.0 + ht_gain * HT_now)
+                r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
+                if use_hedonic_da:
+                    hed_mult = hed_fb_vec[idx] + (1.0 - hed_fb_vec[idx]) * float(g_win[idx])
+                    r *= hed_mult
+                r *= meta_scale(idx)
        else:
          # big FP (after warm-up EMA)
           if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -1225,10 +1443,15 @@ for input_rates, true_ids, label in training_stimuli:
                     spikes_q = float(diff_counts[q])
                     # usa la soglia positiva online
                     weak_q = (spikes_q < 0.5 * max(min_spikes_for_known, tp_gate[q]))
+                    # quando una classe vera è debole, è il momento giusto per sgonfiare le connessioni parassite p→q che la disturbano.
                     if weak_q:
+                        undershoot = max(0.0, 0.5*max(min_spikes_for_known, tp_gate[q]) - spikes_q)
+                        scale = 1.0 + 0.5 * (undershoot / (0.5*max(1.0, tp_gate[q])))
                         # penalità morbida (>> più piccola della FP severa)
-                        r_off_soft = - 0.25 * beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now)
-                        # metaplasticità legata alla classe p (quella che stiamo rinforzando)
+                        r_off_soft = (- 0.25 * beta_offdiag
+                            * (1.0 + ht_gain * HT_now)
+                            * (1.0 + ne_gain_r * NE_now))
+                        r_off_soft *= scale
                         r_off_soft *= meta_scale(p)
 
                         delta_soft = r_off_soft * float(S.elig[si])
@@ -1317,10 +1540,12 @@ for input_rates, true_ids, label in training_stimuli:
 
                                 # anti-crosstalk: lieve leak sugli off-diagonali (corretto: usa idx_col)
                                 pre_idx = i_all[idx_col]
+                                #hot = np.array([1,0,0,0,1,0,1], dtype=float)  # SWEET, UMAMI, SPICY
+                                leak_hot = 0.96
                                 post = q
                                 for k_local, pre in enumerate(pre_idx):
                                     if pre != post:
-                                        col[k_local] *= 0.98  # 2% controlled leak
+                                        col[k_local] *= leak_hot  # 2% controlled leak
 
                             w_all[idx_col] = col
                             S.w[:] = w_all
@@ -1449,19 +1674,46 @@ dur_scale = float(test_duration / training_duration)
 thr_per_class_test = thr_per_class_train.copy()
 thr_per_class_test[:unknown_id] *= dur_scale
 
+# UNSUPERVISED LEARNING without knowing the label "a priori"
+# Prototipo "forte" = aspettativa positiva media (scalata al test window)
+proto_pos = np.maximum(ema_pos_m1 * dur_scale, 1.0)
+
+# Prototipo "co-presenza" (più indulgente per i mix)
+proto_cop = np.maximum(ema_cop_m1 * dur_scale, 1.0)
+
+# Matrice dei prototipi: scegliamo un blend conservativo
+#   - se il trial sarà "mix-like" useremo di più proto_cop,
+#   - altrimenti proto_pos. Il blend preciso lo faremo nel punto di decisione.
+P_pos = np.diag(proto_pos[:unknown_id])  # shape (C,C)
+P_cop = np.diag(proto_cop[:unknown_id])
+
 # 4) OOD/NULL calibration sul test window
-PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=8, n_ood=16, dur=test_duration, gap=0*b.ms, thr_vec=thr_per_class_test)
+PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=16, n_ood=32, dur=test_duration, gap=0*b.ms, thr_vec=thr_per_class_test)
+# Overshoot OOD rispetto alla soglia corrente del TEST window
+gap_thr = max(gap_thr, 0.18)
+overshoot = np.maximum(0.0, ood_q - thr_per_class_test[:unknown_id])
+# smorza overshoot con radice e riduci i gain
+overshoot = np.sqrt(overshoot)
+heat_gain = np.array([0.16, 0.10, 0.10, 0.10, 0.16, 0.18, 0.18])  # ↑ FATTY da 0.12→0.18
+margin = heat_gain * overshoot
+
+thr_per_class_test[:unknown_id] += margin
+# debug stamp
+print("[DBG] OOD quantiles per-class:", {taste_map[isa]: float(ood_q[isa]) for isa in range(unknown_id)})
+print("[DBG] Final test thresholds per-class:", {taste_map[isa]: float(thr_per_class_test[isa]) for isa in range(unknown_id)})
+
+min_floor_test = max(6, int(min_spikes_for_known * dur_scale))
+for idx in range(num_tastes-1):
+    pos_mu_t = float(ema_pos_m1[idx]) * dur_scale
+    pos_sd_t = float(ema_sd(ema_pos_m1[idx], ema_pos_m2[idx])) * dur_scale
+    cap_soft = max(float(min_floor_test), 0.80 * max(1.0, pos_mu_t))  # 0.85 -> 0.80
+    cap_soft += 0.30 * pos_sd_t                                      # 0.35 -> 0.30
+    thr_per_class_test[idx] = min(float(thr_per_class_test[idx]), cap_soft)
+
 print(f"[Open-Set] PMR_thr={PMR_thr:.3f}  H_thr={H_thr:.3f}  gap_thr={gap_thr:.3f}")
 print("Per-class thresholds (final, after OOD calib):",
       {taste_map[idx]: int(thr_per_class_test[idx]) for idx in range(num_tastes-1)})
-# Overshoot OOD rispetto alla soglia corrente del TEST window
-overshoot = np.maximum(0.0, ood_q - thr_per_class_test[:unknown_id])
 
-# Margine dolce = 10% dell'extra (puoi portarlo a 0.2–0.35 se vuoi più/meno conservativo)
-margin = 0.10 * overshoot
-
-# Applica solo alle classi coinvolte (tipicamente SPICY), senza toccare UNKNOWN
-thr_per_class_test[:unknown_id] += margin
 
 # printing scaled weights after training
 print(f"Target weights after training:")
@@ -1480,6 +1732,7 @@ net.add(test_w_mon)
 
 # 11. Freezing STDP, homeostatis and input conductance
 print("Freezing STDP for TEST phase…")
+USE_GDI = True # Toggle between True or False during test phase to control GDI behaviour
 # to manage baseline_hz noise during test phase
 use_test_noise = False
 test_baseline_hz = baseline_hz if use_test_noise else 0.0
@@ -1495,8 +1748,8 @@ taste_neurons.ge[:] = 0 * b.nS
 taste_neurons.gi[:] = 0 * b.nS
 taste_neurons.s[:]  = 0
 taste_neurons.wfast[:] = 0 * b.mV
-S.Apre[:] = 0
-S.Apost[:] = 0
+S.x[:] = 0; S.xbar[:] = 0
+S.y[:] = 0; S.ybar[:] = 0
 S.elig[:] = 0
 # Intrinsic homeostasis frozen
 taste_neurons.homeo_on = 0.0
@@ -1526,9 +1779,9 @@ if test_emotion_mode == "off":
     mod.HI[:] = 0.0
     #mod.ACH[:] = ach_test_level
     taste_neurons.theta_bias[:] = 0 * b.mV
-    inhibitory_S.inh_scale = 1.0
+    inhibitory_S.inh_scale = 0.9
     #S.ex_scale = (1.0 + k_ex_ACH * float(mod.ACH[0]))
-    S.ex_scale = 1.0  # gain reset
+    S.ex_scale = 1.05  # gain reset
     pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
 else:
     # test with neuromodulators
@@ -1592,8 +1845,7 @@ H_unif = np.log(n_known) # uniform entropy
 all_scores = []
 all_targets = []
 # hyperparameters
-z_min   = max(0.20, 0.80 / np.sqrt(n_known))                      
-sep_min = max(0.12, 0.25 / np.sqrt(n_known)) # just during the fallback
+sep_min    = max(0.12, 0.25 / np.sqrt(n_noti))
 abs_margin_test = 0.0 # to avoid margin during test
 for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # reset GDI
@@ -1605,6 +1857,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # initializing SPICY during test
     taste_neurons.spice_drive[spicy_id] = 0.0
     taste_neurons.a_spice[spicy_id]     = 0.0
+    did_unsup_relabel = False
+    unsup_log = None
     # progress bar + chrono + ETA
     frac   = step / total_test
     filled = int(frac * progress_bar_len)
@@ -1656,15 +1910,15 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     inp = np.asarray(_rates_vec[:unknown_id], dtype=float)
     pmr_in = (inp.max() / (inp.sum() + 1e-9)) if inp.sum() > 0 else 0.0
 
-    cap_base   = 0.60
+    cap_base   = 0.55
     cap_boost  = float(np.interp(pmr_in, [0.25, 0.45], [0.95, 0.60]))     # più diffuso ⇒ più cap
     cap_energy = float(np.interp(_input_energy / (ref_rate + 1e-9), [0.5, 2.0], [cap_base, 0.90]))
     cap        = min(cap_boost, cap_energy)
 
-    gamma_val  = float(np.clip(gamma_gdi_0, 0.20, cap))
+    gamma_val  = float(np.clip(gamma_gdi_0, 0.10, cap))
     S.gamma_gdi = gamma_val
     S_noise.gamma_gdi = gamma_val
-    # 2) spikes counting during trial
+    # 2) spikes counting during trials
     prev_counts = spike_mon.count[:].copy()
     net.run(test_duration)
     diff_counts = spike_mon.count[:] - prev_counts
@@ -1701,7 +1955,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     sep = (top - second) / (top + 1e-9)  # relative separation
 
     # scaled z-score during test
-    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+    pos_expect_test = np.maximum(0.90 * ema_pos_m1 * float(test_duration / training_duration), 1.0)
+    #pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
     z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
 
     E = float(np.sum(scores[:unknown_id]))
@@ -1715,16 +1970,53 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     k_est  = int(np.clip(round(1.0 / HHI), 1, n_noti))
     
     # intervalli stretti mantengono l'open-set. Sono centrati sui dati attuali
-    mix_pmr_lo, mix_pmr_hi = 0.35, 0.60
-    mix_H_lo,   mix_H_hi   = 0.8,  1.3
+    mix_pmr_lo, mix_pmr_hi = 0.28, 0.68     # era 0.35–0.60
+    mix_H_lo,   mix_H_hi   = 0.55, 1.65     # era 0.8–1.3
     is_mixture_like = (PMR >= mix_pmr_lo and PMR <= mix_pmr_hi) and (H >= mix_H_lo and H <= mix_H_hi)
     #is_mixture_like = (PMR >= 0.32 and PMR <= 0.66) and (H >= 0.9 and H <= 1.5)
     k_active = int(np.sum(scores[:unknown_id] >= min_spikes_for_known_test))
-    is_mixture_like = is_mixture_like and (1 < k_active <= 3)
+    if k_active >= 4:
+        inhibitory_S.inh_scale[:] = np.minimum(1.35, float(inhibitory_S.inh_scale[0]) * 1.10)
+    is_mixture_like = (k_active >= 2) and (mix_pmr_lo <= PMR <= mix_pmr_hi) and (mix_H_lo <= H <= mix_H_hi)
+    n_strong = np.sum(scores[:unknown_id] >= min_spikes_for_known_test)
+    is_mixture_like = is_mixture_like and (n_strong >= 2)
 
-    if is_mixture_like and not is_diffuse:
-        inhibitory_S.inh_scale[:] = np.maximum(0.6, float(inhibitory_S.inh_scale[0]) * 0.90)
-        gamma_val = min(gamma_val, 0.22)  # solo per mix "puliti"
+    # regola di rifiuto open-set (usa soglie sopra)
+    is_diffuse = (PMR < PMR_thr) or (H > H_thr) or (gap < gap_thr)
+    # mixture_shortcut — solo se mix-like e NON diffuso -
+    mixture_shortcut = []
+    if is_mixture_like and (not is_diffuse):
+        # soglia assoluta morbida proporzionale all'atteso positivo
+        soft_abs = np.maximum(mix_abs_pos_frac * np.maximum(pos_expect_test, 1.0),
+                          float(min_spikes_for_known_test))
+        # guardia relativa al top per evitare code spurie
+        rel_guard = norm_rel_ratio_test * top
+        for idx in range(unknown_id):
+            if (scores[idx] >= max(soft_abs[idx], rel_guard)) and (z[idx] >= max(0.18, z_rel_min)):
+                mixture_shortcut.append(idx)
+    z_min = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20
+    if (k_active >= 3) and (PMR < max(0.70, 1.05*PMR_thr)):
+        is_diffuse = True
+
+    # veto rapido su molti attivi diffusi
+    too_many_active_diffuse = (k_active >= 5) and ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr))
+    if too_many_active_diffuse:
+        winners = [unknown_id]
+        # stampa/log come ora...
+        # passa direttamente alla chiusura del trial:
+        expected  = [taste_map[idxs] for idxs in true_ids]
+        predicted = [taste_map[w] for w in winners]
+        hit = set(winners) == set(true_ids)
+        print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
+        results.append((label, expected, predicted, hit, ""))
+        net.run(recovery_between_trials)
+        continue
+
+    if is_mixture_like and (not is_diffuse):
+        inhibitory_S.inh_scale[:] = np.maximum(0.40, float(inhibitory_S.inh_scale[0]) * 0.70)  # 0.42/0.75 → 0.40/0.70
+        gamma_val = min(gamma_val, 0.030)  # 0.035 → 0.030
+        S.gamma_gdi = gamma_val
+        S_noise.gamma_gdi = gamma_val
 
     # “pulizia” del trial: blending factor 0..1 (0 = tutto su EMA+, 1 = tutto su soglia dura)
     # aumentiamo il blending (=> soglia più dura) se il trial è più ambiguo/diffuso
@@ -1732,34 +2024,51 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     clean_gap = np.clip((gap - gap_thr) / max(1e-9, 0.50 - gap_thr), 0.0, 1.0)  # separazione relativa
     clean = 0.5*clean_pmr + 0.5*clean_gap
 
+    # blending: più peso al co-positive se siamo in un mix pulito
+    # clean ∈ [0,1] (già calcolato): più è alto, più il trial è "pulito"
+    cop_expect_test = np.maximum(ema_cop_m1 * float(test_duration / training_duration), 1.0)
+    mix_blend = np.interp(clean, [0.0, 1.0], [0.55, 0.95])  # 0.90 → 0.95
+    frac_pos  = float(np.interp(clean, [0.0, 1.0], [0.75, 0.30]))  # 0.34 → 0.30
+    pos_exp_blend = (1.0 - mix_blend) * pos_expect_test + mix_blend * cop_expect_test
+
     # quanta frazione dell'aspettativa positiva usiamo come soglia "morbida"
     # - se clean≈1 (trial pulito) ⇒ frazione bassa (~0.60) -> più facile accettare noti
     # - se clean≈0 (trial ambiguo) ⇒ frazione alta (~0.90) -> più vicina alla soglia dura
-    frac_pos = float(np.interp(clean, [0.0, 1.0], [0.90, 0.60]))
-    if is_mixture_like: # if there are real mixes
-        frac_pos = max(0.50, frac_pos - 0.05)
+    mix_min_abs = (
+        max(4, int(0.6*min_spikes_for_known_test))
+        if is_mixture_like and (not is_diffuse) else
+        min_spikes_for_known_test
+    )    
+    if is_mixture_like:
+        frac_pos = max(0.42, frac_pos - 0.04)  # leggermente più tenera sui mix
+        # più tenera su coppie/terzine
+        if k_active in (2,3):
+            frac_pos = max(0.38, frac_pos - 0.03)  # prima -0.02
 
-    # regola di rifiuto open-set (usa soglie sopra)
-    is_diffuse = (PMR < PMR_thr) or (H > H_thr) or (gap < gap_thr)
-
+    if not is_diffuse:
+        thr_eff = np.minimum(thr_per_class_test[:unknown_id], frac_pos * pos_exp_blend)
+        thr_eff = np.maximum(thr_eff,
+                         np.maximum(float(mix_min_abs),
+                                    dyn_abs_min_frac * np.maximum(pos_expect_test, 1.0)))
+    else:
+        thr_eff = np.maximum(thr_per_class_test[:unknown_id], float(mix_min_abs))
+    
     # data-driven thresholds
     top_pass_strict = (
-        (scores[top_idx] >= thr_per_class_test[top_idx]) and
+        (scores[top_idx] >= 0.95 * thr_per_class_test[top_idx]) and   # prima 1.00x
         (z[top_idx] >= z_min) and
-        (gap >= gap_thr)
+        (gap >= 0.95 * gap_thr)                                       # prima 1.00x
     )
-
-    # NO light threshold
-    use_soft = not is_diffuse
-    if use_soft:
-        frac_pos = float(np.interp(clean, [0.0, 1.0], [0.90, 0.60]))
-        if is_mixture_like:
-            frac_pos = max(0.55, frac_pos - 0.05)
-        thr_eff = np.minimum(thr_per_class_test[:unknown_id], frac_pos * pos_expect_test)
-    else:
-        thr_eff = thr_per_class_test[:unknown_id].copy()
-
-    thr_eff = np.maximum(thr_eff, float(min_spikes_for_known_test))
+    # penalità anti-iper-reattività per classi "calde" su OOD/NULL
+    # usa overshoot e varianza negativa come proxy (già calcolati nella calibrazione)
+    neg_sd = np.array([ema_sd(ema_neg_m1[isd], ema_neg_m2[isd]) for isd in range(unknown_id)])
+    heat = np.clip((overshoot / (neg_sd + 1e-6)), 0.0, 4.0)  # grande se la classe eccede spesso sugli OOD
+    # clean ∈ [0,1] come già calcolato
+    k_cap_base = int(np.clip(k_est, 2, n_noti))
+    bonus = 0 if k_active < 2 else (2 if clean >= 0.70 else (1 if clean >= 0.60 else 0))
+    k_cap = min(k_cap_base + bonus, k_active, 8)  # 7 → 8 per lasciare spazio
+    if is_diffuse:
+        thr_eff[:unknown_id] *= (1.0 + 0.45 * heat)  # 0.35 → 0.45
 
     if is_diffuse and not top_pass_strict:
         winners = [unknown_id]
@@ -1773,43 +2082,165 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
         # 3) co-vincitori SOLO se il top è davvero "known" e NON diffuso
         top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
+        if top_known and (not is_diffuse) and mixture_shortcut:
+            add = [c for c in mixture_shortcut if c != top_idx and c not in winners]
+            if add:  # <— NEW: safe guard
+                add.sort(key=lambda i: scores[i], reverse=True)
+                add = add[:max(0, k_cap-1)]  # k_cap già calcolato sopra
+                if scores[add].sum() >= 0.20 * E:  # somma solo se add non è vuota
+                    winners.extend(add)
         if use_rel_gate_in_test and top_known and (not is_diffuse):
-            # soglia relativa al top (più permissiva) + assoluta morbida
-            rel_thr = rel_gate_ratio_test * top  # con 0.28 * top
-            # soglia assoluta per co-taste: blend di thr_eff e atteso positivo
-            co_abs = np.maximum(
-                0.45 * thr_eff,   # 60% della soglia effettiva (era relax*thr_eff)
-                mix_abs_pos_frac * pos_expect_test
-            )
-            # soglia minima per evitare falsi-allarmi di puro rumore
-            co_abs_cap = 1.10 * rel_thr
-            co_abs = np.minimum(co_abs, co_abs_cap)
+            rel_thr = rel_gate_ratio_test * top  # soglia relativa al top
+            # soglia assoluta "soft" per co-taste (blend già calcolato in thr_eff)
+            co_abs_soft = np.maximum(0.30 * thr_eff, 0.30 * cop_expect_test)  # 0.32→0.30
 
-            # candidati ordinati per punteggio, escluso il top
-            cand = [
-                idx for idx in range(unknown_id)
-                if (idx != top_idx)
-                and (z[idx] >= z_rel_min)
-                and (scores[idx] >= max(rel_thr, co_abs[idx]))
-            ]
+            co_abs_cap = 1.05 * rel_thr               # cap per evitare sforamenti strani
+            co_abs = np.minimum(co_abs_soft, co_abs_cap)
+
+            # === NEW: binario normalizzato-al-top ===
+            E_abs = E  # somma spikes note
+            co_abs_energy_min = np.clip(0.05*E_abs, 2.0, 10.0)
+            n = scores[:unknown_id] / (top + 1e-9)    # quota rispetto al top
+            # candidatura: abbastanza vicini al top OPPURE sopra l'assoluto “soft”
+            cand = [idx for idx in range(unknown_id)
+                    if (idx != top_idx) and (z[idx] >= z_rel_min) and
+                    ((n[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
+                    (scores[idx] >= max(rel_thr, co_abs[idx])) ) and
+                    (scores[idx] >= co_abs_energy_min)]
+            
             cand.sort(key=lambda idx: scores[idx], reverse=True)
 
-            # limite massimo coerente con la "larghezza" del mix
-            k_cap = int(np.clip(k_est, 2, n_noti))
-            add_max = max(0, k_cap - 1)              # -1 perché il top è già nei winners
-            add = cand[:min(add_max, len(cand))]     # non superare i candidati validi
-
-            if add:
+            add_max = max(0, k_cap - 1)             # -1 perché il top è già dentro
+            add = cand[:min(add_max, len(cand))]
+            if add and scores[add].sum() >= 0.22 * E:
                 winners.extend(add)
+
+            # Weak co-taste rescue (solo se NON diffuso e top è forte)
+            if (not is_diffuse) and top_pass_strict:
+                rescue = []
+                abs_co_min = 0.40 * min_spikes_for_known_test      # co-gusto davvero debole ma reale
+                rel_min    = 0.08                                  # quota minima vs top
+                z_min_resc = 0.26                                  # z minimo del co-gusto
+
+                for idx in range(unknown_id):
+                    if idx == top_idx or (idx in winners):
+                        continue
+                    if (z[idx] >= z_min_resc and
+                        scores[idx] >= abs_co_min and
+                        (scores[idx] / (top + 1e-9) >= rel_min)):
+                        rescue.append(idx)
+
+                # tieni al massimo 1 co-gusto extra, e solo se contribuisce davvero
+                rescue.sort(key=lambda js: scores[js], reverse=True)
+                if rescue:
+                    js = rescue[0]
+                    # guardrail energetico: non attivare co-accettazioni spurie
+                    if scores[js] >= max(0.18 * E, 2.0):
+                        winners.append(js)
+            
+            # Top-only fallback severo in scene borderline
+            if (k_active >= 3) and (clean < 0.35):
+                winners = [top_idx] if top_pass_strict else [unknown_id]  # 0.35→0.40
+            
+            # NEW: cap finale sul numero totale di vincitori (mantieni il top)
+            if len(winners) > k_cap:
+                # ordina per score decrescente e preserva il top
+                rest = [isa for isa in winners if isa != top_idx]
+                rest.sort(key=lambda isa: scores[isa], reverse=True)
+                winners = [top_idx] + rest[:max(0, k_cap-1)]
 
         # 4) fallback “top-only” se ancora vuoto
         if not winners:
-            if top_known and (z[top_idx] >= z_min):
+            if (not is_diffuse) and top_pass_strict and (z[top_idx] >= z_min):
+                winners = [top_idx]
+
+        # TENTATIVO DI LABEL DISCOVERY NON SUPERVISIONATO
+        did_unsup_relabel = False
+        unsup_labels = []
+        unsup_log = None
+
+        if winners == [unknown_id] and (not is_diffuse):
+            # Scegli i prototipi: se mix-like usa più "cop", altrimenti "pos"
+            mix_like = is_mixture_like  # già calcolato da te
+            blend = 0.7 if mix_like else 0.3
+            P = (1.0 - blend) * P_pos + blend * P_cop  # shape (C,C)
+
+            b_vec = scores[:unknown_id].astype(float)
+
+            # Normalizza leggermente per robustezza (facoltativo)
+            b_sum = float(b_vec.sum())
+            if b_sum > 0:
+                b_n = b_vec / b_sum
+                P_n = P / np.maximum(P.sum(axis=0, keepdims=True), 1e-9)  # colonne a somma ≈1
+            else:
+                b_n = b_vec.copy()
+                P_n = P.copy()
+
+            alpha_w = nnls_projected_grad(P_n, b_n, iters=250, lr=0.08, l1_cap=1.0)
+            err  = recon_error(P_n, b_n, alpha_w)
+
+            # Soglie conservative
+            # - errore di ricostruzione deve essere basso
+            # - pochi coefficienti davvero sopra 0
+            # - energia coperta ≥ una certa frazione
+            cover = float((P_n @ alpha_w).sum())
+            k_active_alpha = int(np.sum(alpha_w >= 0.12))
+            top_idx_alpha = int(np.argmax(alpha_w))
+            top_alpha = float(alpha_w[top_idx_alpha])
+
+            good_recon   = (err <= 0.38)             # più piccolo = meglio
+            good_coverage= (cover >= 0.65)           # quanta energia spiegata
+            sparse_enough= (k_active_alpha in (1,2,3))  # singolo gusto o mix “corto”
+            top_conf     = (top_alpha >= 0.32)       # top coefficiente sufficientemente alto
+
+            if good_recon and good_coverage and sparse_enough and top_conf:
+                # Proponi le etichette corrispondenti ai coeff > soglia
+                cand = np.where(alpha_w >= 0.22)[0].tolist()
+                # Tieni al massimo 4
+                #cand = cand[:4]
+                if len(cand) >= 1:
+                    conf_unsup = conf_unsup_score(err, top_alpha, good_coverage)
+                    conf_ok = (conf_unsup >= 0.60)
+                    probe_ok, pmr_s, gap_s, z_s = probe_boost_candidates(
+                        cands=cand,
+                        base_rates=_rates_vec[:unknown_id],  # lo stimolo corrente senza UNKNOWN
+                        K=3, dur_ms=100, boost_frac=0.10
+                    )
+
+                    # Soglia prudente + probe passata
+                    if conf_ok and probe_ok:
+                        unsup_labels = cand
+                        did_unsup_relabel = True
+                        lab_txt = "+".join([taste_map[c] for c in cand])
+                        unsup_log = f"UNSUPERVISED:{lab_txt} (conf={conf_unsup:.2f}; err={err:.2f}; cover={cover:.2f}; probe_ok={probe_ok})"
+                        # stampa immediata su terminale
+                        print("[INFO]", unsup_log)
+
+        # Se abbiamo una proposta sensata, usa quelle etichette invece di UNKNOWN
+        if did_unsup_relabel:
+            winners = unsup_labels
+            if unsup_log is not None:
+                print(f"[DECISION] accepted pseudo-labels → {unsup_log}")
+        
+        # # Rescue solo se NON diffuso: accetta il top se è quasi sopra soglia e con z decente
+        if winners == [unknown_id] and (not is_diffuse):
+            if (scores[top_idx] >= 0.80*thr_eff[top_idx]) and (z[top_idx] >= 0.45):  # 0.85 / 0.50 → 0.80 / 0.45
                 winners = [top_idx]
 
         # 5) ultima guardia energetica
         if (scores[top_idx] < min_spikes_for_known_test) or (len(winners) == 0):
             winners = [unknown_id]
+        
+        # debug prints
+        print(f"[DBG] decision: PMR={PMR:.3f} H={H:.3f} gap={gap:.3f} top={taste_map[top_idx]} "
+            f"score_top={scores[top_idx]:.1f} thr_eff_top={thr_eff[top_idx]:.1f} z_top={z[top_idx]:.2f}")
+        print(f"[DBG] thr_eff[:]= {[round(float(x),1) for x in thr_eff]}")
+        print(f"[DBG] z[:]= {[round(float(x),2) for x in z]}")
+        print(f"[DBG] is_diffuse={is_diffuse} is_mixture_like={is_mixture_like} k_active={k_active} k_cap={k_cap}")
+        if winners == [unknown_id]:
+            print(f"[REJECT] PMR={PMR:.3f}<{PMR_thr:.3f}? {PMR<PMR_thr} | H={H:.3f}>{H_thr:.3f}? {H>H_thr} "
+            f"| gap={gap:.3f}<{gap_thr:.3f}? {gap<gap_thr} | top={taste_map[top_idx]} "
+            f"score_top={scores[top_idx]:.1f} thr_eff_top={thr_eff[top_idx]:.1f} z_top={z[top_idx]:.2f}")
 
     order = np.argsort(scores)
     dbg = [(taste_map[idxs], int(scores[idxs])) for idxs in order[::-1]]
@@ -1817,10 +2248,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # burst NE on ambiguities
     ambiguous = (second > 0 and top / (second + 1e-9) < 1.3) or (len(winners) > 2)
-    if test_emotion_mode == "active" and ambiguous:
+    if test_emotion_mode == "active" and (ambiguous or is_diffuse):
         mod.NE[:] += ne_pulse_amb
         mod.HI[:] += 0.5 * hi_pulse_nov
-        inhibitory_S.inh_scale[:] = np.maximum(0.3, inhibitory_S.inh_scale[:] * 0.85) # if a class is weak, is not going to be suppressed in general cases except for ambiguous cases
+        inhibitory_S.inh_scale[:] = np.maximum(0.8, inhibitory_S.inh_scale[:] * 1.05) # if a class is weak, is not going to be suppressed in general cases except for ambiguous cases
 
     # Emotional burst in test phase
     if test_emotion_mode == "active":
@@ -1851,7 +2282,9 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # output visualization
     print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
-    results.append((label, expected, predicted, hit))
+    #results.append((label, expected, predicted, hit))
+    note = unsup_log if (did_unsup_relabel and unsup_log is not None) else ""
+    results.append((label, expected, predicted, hit, note))
     # 4) final valutation
     if set(winners) == set(true_ids):
         exact_hits += 1
@@ -1861,6 +2294,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 # unfreezing intrinsic homeostasis
 taste_neurons.homeo_on = 1.0
 
+# ending test debug
+hot_fp = {taste_map[isa]: int(sum((lab.startswith("OOD") or lab.startswith("NULL")) and (taste_map[isa] in pred)
+        for lab,_,pred,_,_ in results))
+        for isa in range(unknown_id)}
+print("[DBG] FP su OOD/NULL per classe:", hot_fp)
+
 # clean the bar
 pbar_done()
 print(f"\nTEST phase done (elapsed: {fmt_mmss(time.perf_counter()-test_t0)})")
@@ -1868,9 +2307,15 @@ print(f"\nTEST phase done (elapsed: {fmt_mmss(time.perf_counter()-test_t0)})")
 # Metrics classification report with Jaccard class and confusion matrix
 # a. Test accuracy
 ok = 0
-for label, exp, pred, hit in results:
+for row in results:
+    if len(row) == 5:
+        label, exp, pred, hit, note = row
+    else:
+        label, exp, pred, hit = row
+        note = ""
     status = "OK" if hit else "MISS"
-    print(f"{label:26s} | expected={exp} | predicted={pred} | {status}")
+    suffix = f" | {note}" if note else ""
+    print(f"{label:26s} | expected={exp} | predicted={pred} | {status}{suffix}")
     ok += int(hit)
 print(f"\nTest accuracy (exact-set match): {ok}/{len(results)} = {ok/len(results):.2%}")
 
@@ -1880,7 +2325,9 @@ classes = [idx for idx in range(num_tastes) if idx != unknown_id]
 # Class counters
 stats = {idx: {'tp': 0, 'fp': 0, 'fn': 0} for idx in classes}
 jaccard_per_case = []
-for _, exp_labels, pred_labels, _ in results:
+for row in results:
+    exp_labels = row[1]
+    pred_labels = row[2]
     T = {label_to_id[lbl] for lbl in exp_labels if label_to_id[lbl] != unknown_id}
     P = {label_to_id[lbl] for lbl in pred_labels if label_to_id[lbl] != unknown_id}
     # expected vs predicted
@@ -2053,18 +2500,14 @@ else:
     print("\n[INFO] Skipping AUC metrics: no stored per-trial score arrays.")
 
 # Rejection UNKNOWN metrics
-unknown_trials = sum(1 for _, exp, _, _ in results if exp == ['UNKNOWN'])
-unknown_ok = sum(1 for _, exp, pred, _ in results if exp == ['UNKNOWN'] and ('UNKNOWN' in pred))
+unknown_trials = sum(1 for row in results if row[1] == ['UNKNOWN'])
+unknown_ok      = sum(1 for row in results if row[1] == ['UNKNOWN'] and ('UNKNOWN' in row[2]))
+unknown_strict_ok = sum(1 for row in results if row[1] == ['UNKNOWN'] and row[2] == ['UNKNOWN'])
 if unknown_trials > 0:
     print(f"\nRejection accuracy (UNKNOWN on OOD/NULL): {unknown_ok}/{unknown_trials} = {unknown_ok/unknown_trials:.2%}")
 else:
     print("\n[WARN] No UNKNOWN/OOD trials were included in the test set.")
 
-# to monitor strict rejection
-unknown_strict_ok = sum(
-    1 for _, exp, pred, _ in results
-    if exp == ['UNKNOWN'] and pred == ['UNKNOWN']
-)
 if unknown_trials > 0:
     print(f"Rejection accuracy (STRICT): {unknown_strict_ok}/{unknown_trials} = {unknown_strict_ok/unknown_trials:.2%}")
 
