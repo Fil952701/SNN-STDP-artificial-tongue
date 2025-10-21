@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import sys
 import random
 import numpy as np
+from collections import Counter
+from numpy import trapezoid
 import time
 import math
 import shutil
@@ -380,7 +382,7 @@ q_neg                = 0.99             # negative quantile
 # Multi-label RL + EMA decoder
 ema_lambda            = 0.10            # 0 < � d 1
 tp_gate_ratio         = 0.34            # threshold to reward winner classes
-fp_gate_warmup_steps  = 80              # delay punitions to loser classes if EMA didn't stabilize them yet
+fp_gate_warmup_steps  = 120              # delay punitions to loser classes if EMA didn't stabilize them yet
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.40            # EMA factor to punish more easy samples
 use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
@@ -1396,13 +1398,14 @@ for _ in range(4*n_repeats):
     mixture_train.append(augment_mix([0,3], amp=250, rng=rng))  # SWEET+SOUR
     mixture_train.append(augment_mix([3,4], amp=240, rng=rng))  # SOUR+UMAMI
 
-# Data augmentation for hard negatives NEAR-OOD per il TRAIN ---
-'''near_ood_train = []
-N_NEAR = 240  # 200–300 consigliati
-for _ in range(N_NEAR):
-    vix, ids, lab = make_near_ood(lo=10, hi=40, bump=rng.integers(20, 31))
-    # ids = [unknown_id], label = "NEAR-OOD (weak bumps)"
-    near_ood_train.append((vix, ids, lab + " (train-hardneg)"))'''
+# Coppie asimmetriche che includano sempre 2 e/o 3
+hard_pairs = [(2,3), (2,6), (3,5), (0,3), (2,4)]
+for _ in range(n_repeats):
+    for ia, ja in hard_pairs:
+        va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(260, 321), rng=rng)
+        va = jitter_active(va, frac=0.15, rng=rng)
+        va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
+        mixture_train.append((va, ids, lab + " (train)"))
 
 #print(mixture_train[0])
 
@@ -1544,7 +1547,8 @@ for input_rates, true_ids, label in training_stimuli:
     # this is important especially if the initial weights are high
     # after 300 trials the GDI is free to grow up as needed
     if step <= 300:
-        S.gamma_gdi = min(S.gamma_gdi, 0.10)
+        if float(S.gamma_gdi[0]) > 0.10:
+            S.gamma_gdi = 0.10
         S_noise.gamma_gdi = S.gamma_gdi
     
     # progress bar + chrono + ETA
@@ -1741,6 +1745,11 @@ for input_rates, true_ids, label in training_stimuli:
     tp_gate = np.zeros(num_tastes-1, dtype=float)
     fp_gate = np.zeros(num_tastes-1, dtype=float)
 
+    # Dopo aver calcolato tp_gate/fp_gate
+    is_mix_like = (0.35 <= PMR <= 0.60) and (0.8 <= H <= 1.4)
+    if is_mix_like:
+        tp_gate = np.maximum(min_spikes_for_known * 0.6, tp_gate * mixture_thr_relax)  # mixture_thr_relax 0.55 già nel codice
+
     for idx in range(num_tastes-1):
        # negative floor -> FP conservative threshold for EMA
        neg_mu_i = float(ema_neg_m1[idx])
@@ -1753,6 +1762,9 @@ for input_rates, true_ids, label in training_stimuli:
                 ema_pos_m1[idx] - ema_factor * pos_sd_i)
        fp_gate_i = max(thr_ema_i, rel)
 
+       # to avoid FP on these two
+       if idx in (0,1):  # SWEET=0, BITTER=1
+            fp_gate[idx] *= 1.08  # +8% solo su queste due
        # safety clamp for infinite values
        if not np.isfinite(tp_gate_i): tp_gate_i = 0.0
        if not np.isfinite(fp_gate_i): fp_gate_i = 0.0
@@ -1823,8 +1835,8 @@ for input_rates, true_ids, label in training_stimuli:
     is_mix_like = (0.35 <= PMR <= 0.60) and (0.8 <= H <= 1.4)
     if is_mix_like:
         # meno WTA e meno squeeze GDI per far coesistere più gusti
-        inhibitory_S.inh_scale[:] = np.maximum(0.5, float(inhibitory_S.inh_scale[0]) * 0.80)
-        gamma_val = min(gamma_val, 0.10)
+        inhibitory_S.inh_scale[:] = np.maximum(0.5, float(inhibitory_S.inh_scale[0]) * 0.78)
+        gamma_val = min(gamma_val, 0.08)
         S.gamma_gdi = gamma_val
         S_noise.gamma_gdi = gamma_val
 
@@ -2160,9 +2172,9 @@ P_cop = np.diag(proto_cop[:unknown_id])
 # 4) OOD/NULL calibration sul test window
 PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=96, n_ood=192, dur=test_duration, gap=0*b.ms, thr_vec=thr_per_class_test)
 # clamp minimo delle soglie OOD
-PMR_thr = max(PMR_thr, 0.20)
-H_thr = max(H_thr, 0.95)
-gap_thr = max(gap_thr, 0.22)
+PMR_thr = max(PMR_thr, 0.25)   # prima 0.20
+H_thr   = max(H_thr,   1.05)   # prima 0.95
+gap_thr = max(gap_thr, 0.26)   # prima 0.22
 # Overshoot OOD rispetto alla soglia corrente del TEST window
 overshoot = np.maximum(0.0, ood_q - thr_per_class_test[:unknown_id])
 # smorza overshoot con radice e riduci i gain
@@ -2174,8 +2186,8 @@ pos_cap = 0.85 * np.maximum(ema_pos_m1 * dur_scale, 1.0)
 thr_per_class_test[:unknown_id] = np.minimum(thr_per_class_test[:unknown_id], pos_cap)
 #thr_per_class_test[:unknown_id] += margin # add some heat only where needed
 # extra margin to SALTY/SOUR because they are more "leaky"
-thr_per_class_test[2] += 2.0  # SALTY
-thr_per_class_test[3] += 2.0  # SOUR
+thr_per_class_test[2] = max(1.0, thr_per_class_test[2] - 1.5)  # SALTY
+thr_per_class_test[3] = max(1.0, thr_per_class_test[3] - 1.0)  # SOUR
 # debug stamp
 print("[DBG] OOD quantiles per-class:", {taste_map[isa]: float(ood_q[isa]) for isa in range(unknown_id)})
 print("[DBG] Final test thresholds per-class:", {taste_map[isa]: float(thr_per_class_test[isa]) for isa in range(unknown_id)})
@@ -2477,6 +2489,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     H = float(-(p * np.log(p)).sum())              # entropia (nats)
     HHI = float((p**2).sum())
     k_est  = int(np.clip(round(1.0 / HHI), 1, n_noti))
+    # blend dinamico (0=solo P_pos, 1=solo P_cop)
+    # più "mix-like" (PMR medio e H alto) ⇒ più peso a P_cop
+    lam_blend = float(np.clip(np.interp(PMR, [0.30, 0.55], [0.0, 1.0]) * np.interp(H, [0.7, 1.5], [0.0, 1.0]), 0.0, 1.0))
+    P_blend = (1.0 - lam_blend) * P_pos + lam_blend * P_cop
     
     # intervalli stretti mantengono l'open-set. Sono centrati sui dati attuali
     mix_pmr_lo, mix_pmr_hi = 0.26, 0.72
@@ -2633,6 +2649,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 add = add[:max(0, k_cap-1)]  # k_cap già calcolato sopra
                 if scores[add].sum() >= 0.20 * E:  # somma solo se add non � vuota
                     winners.extend(add)
+        
+        # Negative rel gate
         if use_rel_gate_in_test and top_known and (not is_diffuse):
             rel_thr = rel_gate_ratio_test * top  # soglia relativa al top
             # soglia assoluta "soft" per co-taste (blend già calcolato in thr_eff)
@@ -2641,7 +2659,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             co_abs_cap = 1.05 * rel_thr               # cap per evitare sforamenti strani
             co_abs = np.minimum(co_abs_soft, co_abs_cap)
 
-            # === NEW: binario normalizzato-al-top ===
+            # Binario normalizzato-al-top
             E_abs = E  # somma spikes note
             co_abs_energy_min = np.clip(0.05*E_abs, 2.0, 10.0)
             n = scores[:unknown_id] / (top + 1e-9)    # quota rispetto al top
@@ -2709,11 +2727,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             # Scegli i prototipi: se mix-like usa più "cop", altrimenti "pos"
             mix_like = is_mixture_like  # già calcolato da te
             w_mix_H   = float(np.clip((H - 0.80) / 0.60, 0.0, 1.0))
-
-            # opzionale (se vuoi usare anche PMR): più diffuso => più peso a P_cop
             w_mix_PMR = float(np.clip((0.70 - PMR) / (0.70 - 0.30 + 1e-9), 0.0, 1.0))
             w_mix     = 0.5*w_mix_H + 0.5*w_mix_PMR
-            #w_mix = w_mix_H
 
             # prototipo finale: P = (1-w)*P_pos + w*P_cop
             P = (1.0 - w_mix) * P_pos + w_mix * P_cop  # shape (C, C)
@@ -2740,40 +2755,36 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             top_idx_alpha  = int(np.argmax(alpha_w))
             top_alpha      = float(alpha_w[top_idx_alpha])
 
-            good_recon   = (err <= 0.38)             # più piccolo = meglio
-            good_coverage= (cover >= 0.65)           # quanta energia spiegata
-            sparse_enough= (k_active_alpha in (1,2,3))  # singolo gusto o mix corto
-            top_conf     = (top_alpha >= 0.32)       # top coefficiente sufficientemente alto
+            good_recon    = (err <= 0.38)
+            good_coverage = (cover >= 0.65)
+            sparse_enough = (k_active_alpha in (1, 2, 3))
+            top_conf      = (top_alpha >= 0.32)
 
             if good_recon and good_coverage and sparse_enough and top_conf:
-                # Proponi le etichette corrispondenti ai coeff > soglia
+                # candidati sopra soglia
                 cand = np.where(alpha_w >= 0.22)[0].tolist()
-                # Tieni al massimo 4
-                #cand = cand[:4]
-                if len(cand) >= 1:
-                    conf_unsup = conf_unsup_score(err, top_alpha, good_coverage)
-                    conf_ok = (conf_unsup >= 0.60)
-                    probe_ok, pmr_s, gap_s, z_s = probe_boost_candidates(
-                        cands=cand,
-                        base_rates=_rates_vec[:unknown_id],  # lo stimolo corrente senza UNKNOWN
-                        K=3, dur_ms=100, boost_frac=0.10
-                    )
+                # micro-prova: rinietta stimolo con leggero boost sui cand
+                probe_ok, pmr_s, gap_s, z_s = probe_boost_candidates(
+                    cands=cand,
+                    base_rates=_rates_vec[:unknown_id],
+                    K=3,
+                    dur_ms=120,
+                    boost_frac=0.12
+                )
 
-                    # Soglia prudente + probe passata
-                    if conf_ok and probe_ok:
-                        unsup_labels = cand
-                        did_unsup_relabel = True
-                        lab_txt = "+".join([taste_map[c] for c in cand])
-                        unsup_log = f"UNSUPERVISED:{lab_txt} (conf={conf_unsup:.2f}; err={err:.2f}; cover={cover:.2f}; probe_ok={probe_ok})"
-                        # stampa immediata su terminale
-                        print("[INFO]", unsup_log)
+                conf_unsup = conf_unsup_score(err, top_alpha, good_coverage)
+                accept = probe_ok and (conf_unsup >= 0.60)
 
-        # Se abbiamo una proposta sensata, usa quelle etichette invece di UNKNOWN
-        if did_unsup_relabel:
-            winners = unsup_labels
-            if unsup_log is not None:
-                print(f"[DECISION] accepted pseudo-labels � {unsup_log}")
-        
+                if accept and len(cand) >= 1:
+                    did_unsup_relabel = True
+                    winners = sorted(cand, key=lambda i: scores[i], reverse=True)
+                    # cap finale (stesso schema di k_cap)
+                    winners = winners[:max(1, min(k_cap, len(winners)))]
+                    unsup_labels = [taste_map[i] for i in winners]
+                    unsup_log = dict(err=float(err), cover=cover,
+                                 k=len(cand), top_alpha=float(top_alpha),
+                                 conf=conf_unsup)
+                    
         # # Rescue solo se NON diffuso: accetta il top se � quasi sopra soglia e con z decente
         '''if winners == [unknown_id] and (not is_diffuse):
             if (scores[top_idx] >= 0.80*thr_eff[top_idx]) and (z[top_idx] >= 0.45):  # 0.85 / 0.50 � 0.80 / 0.45
@@ -2809,6 +2820,10 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # 5) ultima guardia energetica
         if (scores[top_idx] < min_spikes_for_known_test) or (len(winners) == 0):
             winners = [unknown_id]
+        
+        # Se non abbiamo (ri)etichettato e la lista è ancora vuota, mantieni fallback
+        if not winners:
+            winners = [unknown_id] if (is_diffuse or not top_pass_strict or z[top_idx] < z_min) else [top_idx]
         
         # SPICY aversion check after TEST winners
         # is SPICY present in the ground truth or in the winners?
@@ -2885,6 +2900,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     predicted = [taste_map[w] for w in winners]
     hit = set(winners) == set(true_ids)
 
+    extra = ""
+    if did_unsup_relabel:
+        extra = f"[UNSUP@TEST accettato {unsup_labels} | {unsup_log}]"
+    elif winners == [unknown_id] and (not is_diffuse):
+        extra = "[UNSUP rifiutato]"
+
     # output visualization
     print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
     #results.append((label, expected, predicted, hit))
@@ -2908,6 +2929,35 @@ print("[DBG] FP su OOD/NULL per classe:", hot_fp)
 # clean the bar
 pbar_done()
 print(f"\nTEST phase done (elapsed: {fmt_mmss(time.perf_counter()-test_t0)})")
+
+# Print summary
+print("\n===== SUMMARY =====")
+known_trials = [ra for ra in results if all(xs != "UNKNOWN" for xs in ra[1])]
+unknown_trials = [ra for ra in results if ra[1] == ["UNKNOWN"]]
+acc_overall = 100.0 * sum(1 for ra in results if ra[3]) / max(1, len(results))
+acc_known   = 100.0 * sum(1 for ra in known_trials if ra[3]) / max(1, len(known_trials))
+rej_rate    = 100.0 * len(unknown_trials) / max(1, len(results))
+print(f"Total trials:           {len(results)}")
+print(f"Known-only trials:      {len(known_trials)}")
+print(f"NULL/OOD trials:        {len(unknown_trials)}")
+print(f"Exact match (overall):  {acc_overall:.2f}%")
+print(f"Exact match (known):    {acc_known:.2f}%")
+print(f"UNKNOWN rejection rate: {rej_rate:.2f}%")
+pred_flat = []
+tgt_flat = []
+for _, tgt, pred, _, _ in results:
+    for t in tgt:
+        if t != "UNKNOWN":
+            tgt_flat.append(t)
+    for p in pred:
+        pred_flat.append(p)
+# somewhat predicted counters
+print("\nPredicted counts:", dict(Counter(pred_flat)))
+print("Target counts:   ", dict(Counter(tgt_flat)))
+
+# salva pesi post-test e ripristina stato salvato
+w_after_test = S.w[:].copy()
+restore_state(snap)  # se vuoi riportarti allo snapshot pre-test
 
 # Metrics classification report with Jaccard class and confusion matrix
 # a. Test accuracy
@@ -3021,7 +3071,7 @@ if len(all_scores) > 0 and len(all_targets) > 0:
         # key points
         TPR = np.concatenate(([0.0], TPR, [1.0]))
         FPR = np.concatenate(([0.0], FPR, [1.0]))
-        auc = float(np.trapz(TPR, FPR))
+        auc = float(trapezoid(TPR, FPR))
         return FPR, TPR, auc
 
     def pr_auc(y, s):
@@ -3042,7 +3092,7 @@ if len(all_scores) > 0 and len(all_targets) > 0:
         # key points
         rec  = np.concatenate(([0.0], rec, [1.0]))
         prec = np.concatenate(([1.0], prec, [prec[-1]]))
-        return float(np.trapz(prec, rec))
+        return float(trapezoid(prec, rec))
 
     def average_precision(y, s):
         y = np.asarray(y, dtype=int)
@@ -3126,6 +3176,7 @@ for k in range(num_tastes-1):
 # end test
 print("\nEnded TEST phase successfully!")
 
+'''
 # 13. Plots
 # a) Spikes over time
 plt.figure(figsize=(10,4))
@@ -3259,4 +3310,4 @@ for idx in range(num_tastes-1):
     plt.title(f'Hedonic window for {taste_map[idx]}')
     plt.xlabel('ms')
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
