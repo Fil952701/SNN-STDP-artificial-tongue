@@ -1394,24 +1394,25 @@ net = b.Network(
     S_ff_gdi,
     S_fb_gdi
 )
+mon_clock = b.Clock(dt=5*b.ms)
 # monitoring all neuromodulators and aversion to SPICY
 net.add(w_mon)
-inh_mon = b.StateMonitor(inhibitory_S, 'inh_scale', record=True)
+inh_mon = b.StateMonitor(inhibitory_S, 'inh_scale', record=[0], clock=mon_clock)
 net.add(inh_mon)
-theta_mon = b.StateMonitor(taste_neurons, 'theta', record=True)
-s_mon = b.StateMonitor(taste_neurons, 's', record=True)
+theta_mon = b.StateMonitor(taste_neurons, 'theta', record=[0], clock=mon_clock)
+s_mon = b.StateMonitor(taste_neurons, 's', record=[0], clock=mon_clock)
 net.add(theta_mon, s_mon)
-mod_mon = b.StateMonitor(mod, ['DA_f','DA_t','HT','NE','HI','ACH','GABA'], record=True)
+mod_mon = b.StateMonitor(mod, ['DA_f','DA_t','HT','NE','HI','ACH','GABA'], record=[0], clock=mon_clock)
 net.add(mod_mon)
 # Hedonic window for SPICY nociceptive
 spice_mon = b.StateMonitor(taste_neurons, ['spice_drive','thr_spice','a_spice','da_gate'],
                            record=np.arange(taste_slice(spicy_id).start, taste_slice(spicy_id).stop))
 net.add(spice_mon)
 # Hedonic window monitor
-hed_mon = b.StateMonitor(taste_neurons, ['taste_drive','thr_hi','thr_lo','av_over','av_under','da_gate'], record=True)
+hed_mon = b.StateMonitor(taste_neurons, ['taste_drive','thr_hi','thr_lo','av_over','av_under','da_gate'], record=[0], clock=mon_clock)
 net.add(hed_mon)
 # Monitoring all the GDI states
-ge_mon = b.StateMonitor(taste_neurons, ['ge','gdi_eff'], record=[0])
+ge_mon = b.StateMonitor(taste_neurons, ['ge','gdi_eff'], record=[0], clock=mon_clock)
 net.add(ge_mon)
 net.add(gdi_mon)
 # unknown gate without learning it
