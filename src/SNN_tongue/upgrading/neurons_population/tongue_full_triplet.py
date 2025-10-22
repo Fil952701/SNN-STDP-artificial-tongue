@@ -2062,7 +2062,7 @@ for input_rates, true_ids, label in training_stimuli:
     net.run(dopamine_latency)
 
     # To monitor the effect of oversampling (dynamic or static), log for taste
-    log_population_stats(diff_counts, step=step, label="pre-reward") 
+    log_population_stats(diff_counts, step=step, label="PRE-REWARD") 
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
     for idx in range(num_tastes-1):
@@ -2380,7 +2380,7 @@ for input_rates, true_ids, label in training_stimuli:
         S.w[:] = w_all
 
     # To monitor the effect of oversampling (dynamic or static), log for taste
-    log_population_stats(diff_counts, step=step, label="post-reward")     
+    log_population_stats(diff_counts, step=step, label="POST-REWARD")     
 
     # 5) eligibility trace decay among trials
     net.run(pause_duration)
