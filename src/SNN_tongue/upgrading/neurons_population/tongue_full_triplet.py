@@ -1814,8 +1814,8 @@ for input_rates, true_ids, label in training_stimuli:
     #pmr = (float(diff_counts[:unknown_id].max()) / (E + 1e-9)) if E>0 else 0.0
     E = float(np.sum(dc_pop[:unknown_id]))
     pmr = (float(dc_pop[:unknown_id].max()) / (E + 1e-9)) if E>0 else 0.0
-    ######### REWARDING PHASE #########
 
+    ######### REWARDING PHASE #########
     # trial diffuso/ambiguo => usa gate negativo più severo
     is_diffuse_train = (pmr < 0.45)
     if is_diffuse_train:
@@ -1835,7 +1835,7 @@ for input_rates, true_ids, label in training_stimuli:
                 #spice_boost = 1.20 if q == spicy_id else 1.0
                 #r_off = - spice_boost * beta_offdiag * (1.0 + ht_gain * float(mod.HT[0])) * min(2.0, severity)
                 r_off = - 1.15 * beta_offdiag * (1.0 + ht_gain * float(mod.HT[0])) * min(2.0, severity)
-                # penalizza TUTTE le sinapsi *� q* (riduce l'attrattore spuriamente caldo)
+                # penalizza TUTTE le sinapsi *� q* (riduce l'attrattore spuriamente -> caldo)
                 #idx = np.where(np.asarray(S.j[:], int) == q)[0]
                 sl_q  = taste_slice(q)
                 idx   = np.where((j_all >= sl_q.start) & (j_all < sl_q.stop))[0]
