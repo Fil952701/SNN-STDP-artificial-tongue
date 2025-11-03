@@ -497,7 +497,7 @@ def log_population_stats(counts, step=None, label=""):
         mask = np.isin(js, np.arange(sl.start, sl.stop))
         mw = float(np.nanmean(ws[mask])) if np.any(mask) else float('nan')
         mean_w.append(mw)
-    h = f"[step {step}] " if step is not None else ""
+    h = f"[Step - {step}] " if step is not None else ""
     print(f"{h}{label} | scores={np.round(scores, 2).tolist()} | mean_w={[None if not np.isfinite(xd) else round(xd,4) for xd in mean_w]}")
 
 # print population stats
@@ -808,7 +808,7 @@ threshold_ratio      = 0.40             # threshold for winner spiking neurons
 min_spikes_for_known = 5                # minimum number of spikes for neuron, otherwise UNKNOWN
 top2_margin_ratio    = 1.05             # top/second >= 1.4 -> safe
 weight_decay         = 1e-4             # weight decay for trial
-verbose_rewards      = False            # dopamine reward logs
+verbose_rewards      = True            # dopamine reward logs
 test_emotion_mode    = "off"            # to test with active neuromodulators
 
 # Short-Term Plasticity STP (STF/STD) (Tsodyks-Markram) parameters
@@ -2789,7 +2789,7 @@ for input_rates, true_ids, label in training_stimuli:
                 set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * current
                 decays_done += 1
                 cooldown_left = COOLDOWN
-                print(f"[ReduceLROnPlateau] decay #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}")
+                print(f"[ReduceLROnPlateau] decay #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
 
         # cooldown scorre e impedisce di ridurre il plateau in modo troppo ravvicinato
         if cooldown_left > 0:
