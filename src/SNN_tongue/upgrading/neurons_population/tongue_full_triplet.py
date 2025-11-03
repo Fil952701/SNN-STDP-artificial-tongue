@@ -808,7 +808,7 @@ threshold_ratio      = 0.40             # threshold for winner spiking neurons
 min_spikes_for_known = 5                # minimum number of spikes for neuron, otherwise UNKNOWN
 top2_margin_ratio    = 1.05             # top/second >= 1.4 -> safe
 weight_decay         = 1e-4             # weight decay for trial
-verbose_rewards      = True            # dopamine reward logs
+verbose_rewards      = False            # dopamine reward logs
 test_emotion_mode    = "off"            # to test with active neuromodulators
 
 # Short-Term Plasticity STP (STF/STD) (Tsodyks-Markram) parameters
@@ -867,7 +867,7 @@ PLAST_GLOBAL         = 1.0
 PLAST_GLOBAL_FLOOR   = 0.15
 REDUCE_FACTOR        = 0.80
 COOLDOWN             = 8
-PLATEAU_WINDOW       = 5               # ogni 5 trial senza migliorie posso decidere un decay
+PLATEAU_WINDOW       = 5               # ogni 5 trial senza migliorie posso decidere un decay per il plateau
 cooldown_left        = 0
 
 # Connectivity switch: "diagonal" | "dense"
@@ -1248,7 +1248,7 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
     S.stdp_on[:] = 0.0
     saved_noise = pg_noise.rates # the same with noise
     pg_noise.rates = 0 * b.Hz
-    saved_gamma = float(S.gamma_gdi[0]) if 'gamma_gdi' in S.variables else None
+    saved_gamma = float(S.gamma_gdi_) if 'gamma_gdi' in S.variables else None
     if 'gamma_gdi' in S.variables: S.gamma_gdi = 0.0
 
     # list of lists to collect all negative spikes for each class
@@ -1321,7 +1321,9 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
     gap_thr_auto *= 0.8
 
     # restore states after OOD
-    if saved_gamma is not None: S.gamma_gdi = saved_gamma
+    if saved_gamma is not None:
+        # Se è dimensionless:
+        S.gamma_gdi_ = saved_gamma
     pg_noise.rates = saved_noise
     S.stdp_on[:] = saved_stdp
 
