@@ -4107,7 +4107,7 @@ plt.title("STDP + eligibility: diagonal synapses over time")
 if has_labels:
     plt.legend(loc='upper right')
 else:
-    print("[WARNING] No diagonal synapse (i�i) found among monitored synapses. Legend skipped.")
+    print("[WARNING] No diagonal synapse (i->i) found among monitored synapses. Legend skipped.")
 
 plt.tight_layout()
 plt.show()
@@ -4164,8 +4164,8 @@ for c in range(num_tastes-1):
     plt.figure(figsize=(5,3))
     plt.hist(neg, bins=20, alpha=0.6, label='neg')
     plt.hist(pos, bins=20, alpha=0.6, label='pos')
-    plt.axvline(thr_per_class[c], ls='--')
-    plt.title(f'{taste_map[c]}  | thr={int(thr_per_class[c])}')
+    plt.axvline(thr_per_class_test[c], ls='--')
+    plt.title(f'{taste_map[c]}  | thr={int(thr_per_class_test[c])}')
     plt.xlabel('#spike per trial')
     plt.ylabel('freq')
     plt.legend(loc="upper right")
@@ -4185,7 +4185,7 @@ plt.imshow(W[:unknown_id, :unknown_id], aspect='equal')
 plt.xticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)], rotation=45)
 plt.yticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)])
 plt.colorbar(label='w')
-plt.title('Weights matrix (taste�taste)')
+plt.title('Weights matrix (taste->taste)')
 plt.tight_layout()
 plt.show()
 
