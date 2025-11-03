@@ -497,7 +497,7 @@ def log_population_stats(counts, step=None, label=""):
         mask = np.isin(js, np.arange(sl.start, sl.stop))
         mw = float(np.nanmean(ws[mask])) if np.any(mask) else float('nan')
         mean_w.append(mw)
-    h = f"[Step: {step}] " if step is not None else ""
+    h = f"[Step {step}] " if step is not None else ""
     print(f"{h}{label} | scores={np.round(scores, 2).tolist()} | mean_w={[None if not np.isfinite(xd) else round(xd,4) for xd in mean_w]}")
 
 # print population stats
