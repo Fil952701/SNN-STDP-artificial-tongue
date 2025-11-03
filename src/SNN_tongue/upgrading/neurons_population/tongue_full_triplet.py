@@ -1661,7 +1661,7 @@ S_noise = b.Synapses(
 
 # Weak non-plastic uniform drive -> UNKNOWN (rifiuto guidato dall'energia diffusa)
 #S_unk = b.Synapses(pg, taste_neurons, on_pre='ge_post += 0.30*nS')  # small but on all tastes
-# Weak plastic uniform drive -> UNKNOWN (rifiuto guidato dall'energia diffusa)
+# Weak plastic uniform drive gated -> UNKNOWN (data driven from diffuse energy)
 S_unk = b.Synapses(pg, taste_neurons,
                    model='gain_unk : 1 (shared)',
                    on_pre='ge_post += gain_unk * (0.30*nS)') # small but only on real UNKNOWN tastes
