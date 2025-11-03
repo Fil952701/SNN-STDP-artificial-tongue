@@ -1242,14 +1242,24 @@ def restore_state_without(sd):
     if sd.get('gamma_gdi') is not None and 'gamma_gdi' in S.variables:
         S.variables['gamma_gdi'].set_value(sd['gamma_gdi'])
 
+# utilities to read and assign shared scalar variables
+# 1.
+def read_shared_scalar(S, name: str):
+    if name not in S.variables:
+        return None
+    val = S.get_states([name], units=False, format='dict')[name]
+    return float(np.asarray(val))  # gestisce 0-d array / numpy scalar
+# 2.
+def write_shared_scalar(S, name: str, value: float):
+    setattr(S, name, value)  # se dimensionless; altrimenti value * unit
+
 # OOD/NULL calibration: increase threshold on OOD queues
 def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None):
     saved_stdp = float(S.stdp_on[0]) # saved current plasticity state
     S.stdp_on[:] = 0.0
     saved_noise = pg_noise.rates # the same with noise
     pg_noise.rates = 0 * b.Hz
-    saved_gamma = float(S.gamma_gdi_) if 'gamma_gdi' in S.variables else None
-    if 'gamma_gdi' in S.variables: S.gamma_gdi = 0.0
+    saved_gamma = read_shared_scalar(S, 'gamma_gdi')
 
     # list of lists to collect all negative spikes for each class
     tmp_spikes = [[] for _ in range(num_tastes-1)] 
@@ -1322,8 +1332,7 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # restore states after OOD
     if saved_gamma is not None:
-        # Se è dimensionless:
-        S.gamma_gdi_ = saved_gamma
+        write_shared_scalar(S, 'gamma_gdi', saved_gamma)
     pg_noise.rates = saved_noise
     S.stdp_on[:] = saved_stdp
 
