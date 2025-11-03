@@ -845,7 +845,7 @@ perf_alpha           = 0.03     # smoothing dolce della performance
 DA_GATE_JACC         = 0.50   # sotto questa Jaccard per trial: niente DA (no consolidamento)
 VAL_EVERY            = 0         # 0 = solo proxy intra-trial; (>0 per mini-validation periodica)
 # Early stopping setup
-PATIENCE_LIMIT       = 10
+PATIENCE_LIMIT       = 15
 MIN_STEPS_BEFORE_STOP = 100      # per garantire un minimo di training
 IMPROVE_EPS          = 1e-4             # piccolo margine per evitare falsi miglioramenti
 best_score           = -float("inf")
