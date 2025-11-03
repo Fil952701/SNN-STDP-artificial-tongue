@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import sys
 import random
 import numpy as np
-from collections import Counter
+from collections import Counter, deque
 from numpy import trapezoid
 import time
 import math
@@ -834,37 +834,41 @@ BOOST_APPLY_GUARD_STEPS = fp_gate_warmup_steps  # non applicare boost nei primis
 
 # Biological per-class attention bias -> TRAIN ONLY (no oversampling)
 USE_ATTENTIONAL_BIAS = True
-ATTN_BIAS_GAIN_MV    = 0.8   # mV di bias max circa per unità "need_norm-1"
-ATTN_BIAS_CAP_MV     = 2.0   # cap di sicurezza per gusto
+ATTN_BIAS_GAIN_MV    = 0.8              # mV di bias max circa per unità "need_norm-1"
+ATTN_BIAS_CAP_MV     = 2.0              # cap di sicurezza per gusto
 
 # Bio-plausible early-stopping (DA gating + best snapshot)
-best_score           = -1.0
-best_state           = None
 ema_perf             = 0.0
-perf_alpha           = 0.03     # smoothing dolce della performance
-DA_GATE_JACC         = 0.50   # sotto questa Jaccard per trial: niente DA (no consolidamento)
-VAL_EVERY            = 0         # 0 = solo proxy intra-trial; (>0 per mini-validation periodica)
+perf_alpha           = 0.03             # smoothing dolce della performance
+DA_GATE_JACC         = 0.50             # sotto questa Jaccard per trial: niente DA (no consolidamento)
+VAL_EVERY            = 0                # 0 = solo proxy intra-trial; (>0 per mini-validation periodica)
 # Early stopping setup
-PATIENCE_LIMIT       = 15
-MIN_STEPS_BEFORE_STOP = 100      # per garantire un minimo di training
-IMPROVE_EPS          = 1e-4             # piccolo margine per evitare falsi miglioramenti
 best_score           = -float("inf")
 best_step            = -1
 best_state           = None
 patience             = 0
 # Bio-plausible consolidation & early-stop params
 USE_SLOW_CONSOLIDATION = True
-ETA_CONSOL            = 0.05   # slow capture rate (0..1) toward current fast weights
-DA_THR_CONSOL         = 0.35   # require enough DA to consolidate into w_slow
-BETA_MIX_TEST         = 0.10   # how much fast to keep when mixing slow→test (0..1)
-USE_SOFT_PULL         = True   # softly drift toward best-state when stagnating
-RHO_PULL              = 0.25   # 0..1, per-trial pull strength
-PLASTICITY_DECAY      = 0.90   # multiplicative decay on S.stdp_on when stagnating
-MAX_PLASTICITY_DECAYS = 4
+PATIENCE_LIMIT        = 25
+ETA_CONSOL            = 0.05            # slow capture rate (0..1) toward current fast weights
+DA_THR_CONSOL         = 0.35            # require enough DA to consolidate into w_slow
+BETA_MIX_TEST         = 0.10            # how much fast to keep when mixing slow→test (0..1)
+USE_SOFT_PULL         = True            # softly drift toward best-state when stagnating
+RHO_PULL              = 0.25            # 0..1, per-trial pull strength
+PLASTICITY_DECAY      = 0.90            # multiplicative decay on S.stdp_on when stagnating
+MAX_PLASTICITY_DECAYS = 5
+W_EMA                 = 12
+# storico corto per stimare il rumore dell'EMA
+ema_hist              = deque(maxlen=32)
+ema_perf_sd           = 0.0             # aggiornata ad ogni trial
 decays_done           = 0
-
-# global factor for the reinforcement
+# Reduce-on-plateau globals
 PLAST_GLOBAL = 1.0
+PLAST_GLOBAL_FLOOR = 0.15
+REDUCE_FACTOR = 0.80
+COOLDOWN = 8
+PLATEAU_WINDOW = 5                      # ogni 5 trial senza migliorie posso decidere un decay
+cooldown_left = 0
 
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode    = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
@@ -875,12 +879,12 @@ def set_plasticity_scale(scale: float):
     # 1) gate sinaptico esplicito
     if 'stdp_on' in S.variables:
         S.stdp_on[:] = s
-    # 2) scala globale del rinforzo (usala dove calcoli r_final)
+    # 2) scala globale del rinforzo
     global PLAST_GLOBAL
     PLAST_GLOBAL = s
     # 3) raffredda le tracce di eligibility già accumulate
     if 'elig' in S.variables:
-        S.elig[:] *= (0.5 + 0.5*s)  # p.es. compressione dolce
+        S.elig[:] *= (0.5 + 0.5*s)  # compressione dolce
 
 def soft_pull_toward_best(best_sd, rho: float = 0.25):
     """
@@ -888,7 +892,7 @@ def soft_pull_toward_best(best_sd, rho: float = 0.25):
     """
     if best_sd is None:
         return
-    # soft blend solo sui pesi sinaptici veloci + (opzionale) theta
+    # soft blend solo sui pesi sinaptici veloci + theta
     if best_sd.get('w') is not None:
         S.w[:] = (1.0 - rho) * S.w[:] + rho * best_sd['w']
     if hasattr(taste_neurons, 'theta'):
@@ -2509,6 +2513,18 @@ for input_rates, true_ids, label in training_stimuli:
         
     # questo gate moltiplica ogni rinforzo r (vedi A4) ⇒ se gate=0, nessun consolidamento
     perf_gate = 1.0 if (jacc_proxy >= DA_GATE_JACC) else 0.0
+    # aggiorna storico e stima della varianza della curva EMA
+    ema_hist.append(float(ema_perf))
+    if len(ema_hist) >= 8:
+        _arr = np.asarray(ema_hist, float)
+        mu   = float(_arr.mean())
+        ema_perf_sd = float(np.sqrt(np.mean(((_arr - mu) ** 2))))
+    else:
+        ema_perf_sd = 0.0
+
+    # soglia di “vero miglioramento” guidata dal rumore e dagli step dinamici
+    IMPROVE_EPS = max(0.002, 0.25 * ema_perf_sd)  # 25% del jitter recente, min 0.002
+    MIN_STEPS_BEFORE_STOP = max(200, int(0.15 * total_steps)) # step dinamici da considerare ad ogni trial
 
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
@@ -2737,42 +2753,52 @@ for input_rates, true_ids, label in training_stimuli:
     hi = np.array(taste_neurons.thr_hi[:]); lo = np.array(taste_neurons.thr_lo[:])
     hi = np.maximum(hi, lo + eps_thr)
     taste_neurons.thr_hi[:] = hi
-
-    # EARLY STOPPING tracking & bio-like stagnation handling to avoid overfitting and optimize training duration
+    
+    # EARLY STOPPING tracking & bio-like stagnation plateau handling to avoid overfitting and optimize training duration
     if ema_perf > best_score + IMPROVE_EPS:
         best_step  = step
         best_score = float(ema_perf)
-        best_state = snapshot_state()        # full state snapshot (for non-weight vars)
-        w_slow_best = w_slow.copy()          # keep slow consolidated at best point
+        best_state = snapshot_state()             # snapshot completo (pesate + stati)
+        if w_slow is not None:
+            w_slow_best = w_slow.copy()           # se usi consolidamento lento
+
         patience = 0
-        # se avevi ridotto la plasticità, riapri un po' (senza saltare a 1 di colpo)
+        decays_done = 0          # nuovo ciclo “explore”: azzero i decay conteggiati
+        cooldown_left = 0
+
+        # riapri un po’ la plasticità (senza saltare a 1 di colpo)
         if 'stdp_on' in S.variables:
             curs = float(np.mean(S.stdp_on[:]))
             target_s = 1.0
-            set_plasticity_scale(0.50*curs + 0.50*target_s)  # rialzo dolce
-        # opzionale: azzera il contatore decays per un nuovo “ciclo di esplorazione”
-        decays_done = 0
-        print(f"NEW BEST ema_perf improvement: {best_score} at step {best_step}\n")
+            set_plasticity_scale(0.50 * curs + 0.50 * target_s)
+
+        print(f"NEW BEST ema_perf: {best_score:.4f} at step {best_step}\n")
+
     else:
+        # nessun miglioramento “significativo”
         patience += 1
-        # 3a) Soft-pull verso il best snapshot mentre siamo in plateau (bio consolidamento)
-        if USE_SOFT_PULL and (best_state is not None) and (patience >= max(3, PATIENCE_LIMIT//3)):
+
+        # 3a) soft-pull verso il best durante plateau prolungato (bio consolidamento)
+        if USE_SOFT_PULL and (best_state is not None) and (patience >= max(3, PATIENCE_LIMIT // 3)):
             soft_pull_toward_best(best_state, rho=RHO_PULL)
 
-        # 3b) ReduceLR-on-Plateau biologico: riduci la plasticità a gradini
-        # Esegui un decay solo ogni PLATEAU_WINDOW ed entro un massimo di decays
-        PLATEAU_WINDOW = 5  # ogni 5 trial senza miglioramenti applica un decay
-        if (patience % PLATEAU_WINDOW == 0) and (decays_done < MAX_PLASTICITY_DECAYS):
+        # 3b) Reduce-on-plateau biologico: decresci la plasticità a gradini con cooldown
+        if patience >= PLATEAU_WINDOW and cooldown_left == 0 and decays_done < MAX_PLASTICITY_DECAYS:
             if 'stdp_on' in S.variables:
                 curs = float(np.mean(S.stdp_on[:]))
-                set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * cur
-            decays_done += 1
-            print(f"[ReduceLROnPlateau] decay plasticity #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}")
+                set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * current
+                decays_done += 1
+                cooldown_left = COOLDOWN
+                print(f"[ReduceLROnPlateau] decay #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}")
 
-        # 3c) Early Stopping finale se non si migliora per troppo tempo
+        # cooldown scorre e impedisce di ridurre il plateau in modo troppo ravvicinato
+        if cooldown_left > 0:
+            cooldown_left -= 1
+
+        # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
             print(f"[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} trials "
-                  f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
+                f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
@@ -2883,8 +2909,8 @@ P_cop = np.diag(proto_cop[:unknown_id])
 PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=96, n_ood=192, dur=test_duration, gap=0*b.ms, thr_vec=thr_per_class_test)
 # clamp minimo delle soglie OOD
 PMR_thr = max(PMR_thr, 0.22)   # prima 0.20
-H_thr   = max(H_thr,   1.15)   # prima 0.95
-gap_thr = max(gap_thr, 0.22)   # prima 0.22
+H_thr   = max(H_thr,   1.00)   # prima 0.95
+gap_thr = max(gap_thr, 0.18)   # prima 0.22
 # Overshoot OOD rispetto alla soglia corrente del TEST window
 overshoot = np.maximum(0.0, ood_q - thr_per_class_test[:unknown_id])
 # smorza overshoot con radice e riduci i gain
@@ -3066,8 +3092,8 @@ pg_noise.rates = 0 * b.Hz
 test_t0 = time.perf_counter()  # start stopwatch TEST
 
 min_spikes_for_known_base = 4 # soglia minima assoluta per gusti noti nella fase di test
-min_spikes_for_known_test = max(3, int(np.ceil(NEURONS_PER_TASTE))) # population mode on
-#min_spikes_for_known_test = max(3, int(min_spikes_for_known_base * dur_scale))
+#min_spikes_for_known_test = max(3, int(np.ceil(NEURONS_PER_TASTE))) # population mode on
+min_spikes_for_known_test = max(3, int(np.ceil(dur_scale * 0.6 * NEURONS_PER_TASTE)))
 print(f"[Decoder] dur_scale={dur_scale:.2f} -> min_spikes_for_known_test={min_spikes_for_known_test}")
 print("Scaled per-class thresholds:",
       {taste_map[idxs]: int(thr_per_class_test[idxs]) for idxs in range(num_tastes-1)})
@@ -3308,7 +3334,13 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     gap_dyn = gap_thr
     if k_active in (2,3):
         gap_dyn = max(0.10, 0.75 * gap_thr)   # 0.18 → ~0.15
-    is_diffuse = (PMR < PMR_thr) or (H > H_thr) or (gap < gap_dyn)
+    
+    flags = [
+        PMR is not None and PMR < PMR_thr,
+        H   is not None and H   > H_thr,
+        gap is not None and gap < gap_dyn,
+    ]
+    is_diffuse = sum(bool(x) for x in flags) >= 2
 
     # corsia soft per coppie: se i 2 top superano un assoluto “ragionevole”, accetta anche con gap basso
     if is_diffuse and is_mixture_like and k_active == 2:
@@ -3347,7 +3379,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         0.22*pos_expect_test,
         0.18*cop_expect_test
     )
-    should_try_nnls = ((winners == []) or (winners == [unknown_id])) and (not is_diffuse)
+    should_try_nnls = ((winners == []) or (winners == [unknown_id])) #and (not is_diffuse)
     if should_try_nnls:
         # criteri per consentire quintuple:
         may_allow_k5 = (
@@ -3669,8 +3701,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                     winners = [top_idx] if top_pass_strict else [unknown_id]
 
         # 5) ultima guardia energetica
-        if (scores[top_idx] < min_spikes_for_known_test) or (len(winners) == 0):
+        '''if (scores[top_idx] < min_spikes_for_known_test) or (len(winners) == 0):
+            winners = [unknown_id]'''
+        if (scores[top_idx] < min_spikes_for_known_test) and (len(winners) == 0) and is_diffuse:
             winners = [unknown_id]
+        elif not winners:
+            winners = [top_idx]
         
         # Se non abbiamo (ri)etichettato e la lista è ancora vuota, mantieni fallback
         if not winners:
