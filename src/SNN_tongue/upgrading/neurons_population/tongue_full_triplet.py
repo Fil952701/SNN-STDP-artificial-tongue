@@ -318,17 +318,18 @@ def decode_by_nnls(
     HHI = float((p**2).sum())
     k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, scores.size))
 
+    # conta coefficienti “significativi”
+    k_abs = int(np.sum(ws >= max(1e-12, thr_rel_base)))
+    k_abs5 = int(np.sum(ws >= max(1e-12, thr_rel_k5)))
+
     # criteri
-    basic_ok = (err <= 0.40 and cover >= 0.60 and k_abs in (1,2,3))
+    basic_ok = (err <= 0.40 and cover >= 0.60 and k_abs in (1,2,3,4,5))
 
     # soglie frazionarie: 0.10 base, 0.08 se target quintuple
     ws_sum = float(ws.sum())
     thr_rel_base = frac_thr * ws_sum
     thr_rel_k5   = min(frac_thr, 0.08) * ws_sum
 
-    # conta coefficienti “significativi”
-    k_abs = int(np.sum(ws >= max(1e-12, thr_rel_base)))
-    k_abs5 = int(np.sum(ws >= max(1e-12, thr_rel_k5)))
 
     k4_ok = False
     if allow_k4 and (k_abs == 4 or (k_est >= 4 and int(np.sum(ws >= thr_rel_base)) >= 4)):
@@ -468,9 +469,8 @@ def set_unknown_gate(pmr, gap, H, PMR_thr, gap_thr, H_thr):
     - gap basso   (<= gap_thr)
     - entropia alta (>= H_thr)
     """
-    triggers = (pmr <= PMR_thr) and (gap <= gap_thr) and (H >= H_thr)
-    #S_unk.gain_unk = 1.0 if triggers else 0.0
-    S_unk.gain_unk = 1.0 if triggers >= 1 else 0.0
+    triggers = ((pmr <= PMR_thr) and (gap <= gap_thr) and (H >= H_thr))
+    S_unk.gain_unk = 1.0 if triggers else 0.0
 
 # collapse all the population to its relevant taste to reward it
 def population_scores_from_counts(counts):
@@ -485,7 +485,7 @@ def population_scores_from_counts(counts):
         scores[tx] = float(np.sum(counts[sl]))
     return scores
 
-# OVERSAMPLING population neurons logging for each taste
+# population neurons logging for each taste
 def log_population_stats(counts, step=None, label=""):
     # pesi medi per gusto (solo S pg->taste_neurons)
     scores = population_scores_from_counts(np.asarray(counts, dtype=float))
@@ -632,8 +632,8 @@ g_step_inh_local     = 1.5 * b.nS       # lateral inhibition strength
 # Global Divisive Inhibition (GDI) parameters -> we need to balance very well this improvement
 # because it will break all the mixes otherwise
 tau_gdi              = 40 * b.ms        # global pool temporal window
-k_e2g_ff             = 0.08             # feed-forward contribute (Poisson input spikes) -> GDI
-k_e2g_fb             = 0.020            # feedback contribute (output neuron spikes) -> GDI
+k_e2g_ff             = 0.05             # feed-forward contribute (Poisson input spikes) -> GDI
+k_e2g_fb             = 0.010            # feedback contribute (output neuron spikes) -> GDI
 gamma_gdi_0          = 0.30             # scaled reward for (dimensionless)
 gdi_reset_each_trial = True             # managing carry-over thorugh trials
 
@@ -674,7 +674,7 @@ hi_pulse_miss        = 1.0              # burst on error
 # Acetylcholine (ACh) -> contextual plasticity / different attention on train and test
 tau_ACH              = 700 * b.ms       # decay for ACh
 ach_train_level      = 0.8              # high ACh during training
-ach_test_level       = 0.20             # low ACh during test
+ach_test_level       = 0.40             # low ACh during test
 k_ex_ACH             = 0.25             # exictement gain with ACh
 ach_plasticity_gain  = 0.40             # ACh -> reward effect on -> w
 k_noise_ACH          = 0.25             # ACh noise environment reduction
@@ -733,48 +733,48 @@ meta_lambda           = 0.05            # EMA velocity
 gwin_ema        = np.zeros(unknown_id)  # historical for every class
 
 # Off-diag hyperparameters
-beta                 = 0.03             # learning rate for negative reward
-beta_offdiag         = 0.5 * beta       # off-diag parameter
-use_offdiag_dopamine = True             # quick toggle to activate/deactivate reward for off-diagonals
-beta_offdiag_map     = np.ones(unknown_id)
-beta_offdiag_map[6]  = 1.80             # SPICY: punisci quando “ruba” fuori classe
-beta_offdiag_map[1]  = 1.25             # BITTER (rimetti la lieve stretta)
-beta_offdiag_map[2]  = 1.25             # SALTY (lieve)
-beta_offdiag_map[3]  = 1.60             # SOUR
-beta_offdiag_map[5]  = 1.20             # FATTY (lieve)
+beta                  = 0.03             # learning rate for negative reward
+beta_offdiag          = 0.5 * beta       # off-diag parameter
+use_offdiag_dopamine  = True             # quick toggle to activate/deactivate reward for off-diagonals
+beta_offdiag_map      = np.ones(unknown_id)
+beta_offdiag_map[6]   = 1.80             # SPICY: punisci quando “ruba” fuori classe
+beta_offdiag_map[1]   = 1.25             # BITTER (rimetti la lieve stretta)
+beta_offdiag_map[2]   = 1.25             # SALTY (lieve)
+beta_offdiag_map[3]   = 1.60             # SOUR
+beta_offdiag_map[5]   = 1.20             # FATTY (lieve)
 
 # Normalization per-column (synaptic scaling in input)
-use_col_norm         = True             # on the normalization
-col_norm_mode        = "l1"             # "l1" (sum=target) or "softmax" -> synaptic scaling that mantains input scale per post neuron to avoid unfair competition
-col_norm_every       = 1                # execute norm every N trial
-col_norm_temp        = 1.0              # temperature softmax (if mode="softmax")
-col_norm_target      = None             # if None, calculating the target at the beginning of the trial
-diag_bias_gamma      = 1.20             # >1.0 = light bias to the diagonal weight before normalization
-col_floor            = 0.02             # floor (0 or light epsilon) before norm
-col_allow_upscale    = True             # light up-scaling
-col_upscale_slack    = 0.95             # if L1 < 90% target � boost
-col_scale_max        = 1.10             # max factor per step
+use_col_norm          = True             # on the normalization
+col_norm_mode         = "l1"             # "l1" (sum=target) or "softmax" -> synaptic scaling that mantains input scale per post neuron to avoid unfair competition
+col_norm_every        = 1                # execute norm every N trial
+col_norm_temp         = 1.0              # temperature softmax (if mode="softmax")
+col_norm_target       = None             # if None, calculating the target at the beginning of the trial
+diag_bias_gamma       = 1.20             # >1.0 = light bias to the diagonal weight before normalization
+col_floor             = 0.02             # floor (0 or light epsilon) before norm
+col_allow_upscale     = True             # light up-scaling
+col_upscale_slack     = 0.95             # if L1 < 90% target � boost
+col_scale_max         = 1.10             # max factor per step
 
 # SPICY dynamic tolerance / aversion dynamics
-spicy_id             = 6                # spicy taste is the sixth one
-fatty_id             = 5                # fatty taste is the fifth one
-thr0_spice_var       = 0.36             # baseline aversive threshold -> driven unit
-tau_thr_spice        = 30 * b.second    # adapting threshold -> slow
-tau_sd_spice         = 80 * b.ms        # spicy intensity integration
-tau_a_spice          = 200 * b.ms       # dynamic aversion
-k_spike_spice        = 0.010            # spike contribution pre SPICY->drive
-k_a_spice            = 1.0              # aversion reward
-#k_hab_spice          = 0.0015          # upgrade threshold � with adapting to aversion
-eta_da_spice         = 2.0              # multiplier DA for adapting
-#k_sens_spice         = 0.001           # sensitization if above threshold but without reward -> just an adapting on the previous threshold: now higher
-reinforce_dur        = 150 * b.ms       # short window to push DA gate on SPICY
+spicy_id              = 6                # spicy taste is the sixth one
+fatty_id              = 5                # fatty taste is the fifth one
+thr0_spice_var        = 0.36             # baseline aversive threshold -> driven unit
+tau_thr_spice         = 30 * b.second    # adapting threshold -> slow
+tau_sd_spice          = 80 * b.ms        # spicy intensity integration
+tau_a_spice           = 200 * b.ms       # dynamic aversion
+k_spike_spice         = 0.010            # spike contribution pre SPICY->drive
+k_a_spice             = 1.0              # aversion reward
+#k_hab_spice          = 0.0015           # upgrade threshold � with adapting to aversion
+eta_da_spice          = 2.0              # multiplier DA for adapting
+#k_sens_spice         = 0.001            # sensitization if above threshold but without reward -> just an adapting on the previous threshold: now higher
+reinforce_dur         = 150 * b.ms       # short window to push DA gate on SPICY
 
 # Hedonic window for all the tastes (SWEET, SOUR ecc...) -> one taste is rewarding ONLY if his spikes fire during this period
-tau_drive_win        = 50 * b.ms        # intensity/taste integration
-tau_av_win           = 200 * b.ms       # aversion/sub-threshold integration
-tau_thr_win          = 30 * b.second    # thresholds adapting
-eta_da_win           = 2.0              # rewarding on the habit of the Hedonic window
-k_spike_drive        = 0.015            # driving kick on each input spike
+tau_drive_win         = 50 * b.ms        # intensity/taste integration
+tau_av_win            = 200 * b.ms       # aversion/sub-threshold integration
+tau_thr_win           = 30 * b.second    # thresholds adapting
+eta_da_win            = 2.0              # rewarding on the habit of the Hedonic window
+k_spike_drive         = 0.015            # driving kick on each input spike
 
 # Hedonic gating for DA state-dependente (fallback included) -> if a taste is recognized inside the hedonic window => full DA, otherwise if it is ricognized but it's not in the window => less DA
 use_hedonic_da       = True
@@ -849,7 +849,7 @@ best_state           = None
 patience             = 0
 # Bio-plausible consolidation & early-stop params
 USE_SLOW_CONSOLIDATION = True
-PATIENCE_LIMIT       = 25
+PATIENCE_LIMIT       = 30              # switching it between 15 and 45
 ETA_CONSOL           = 0.05            # slow capture rate (0..1) toward current fast weights
 DA_THR_CONSOL        = 0.35            # require enough DA to consolidate into w_slow
 BETA_MIX_TEST        = 0.10            # how much fast to keep when mixing slow→test (0..1)
@@ -1248,6 +1248,8 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
     S.stdp_on[:] = 0.0
     saved_noise = pg_noise.rates # the same with noise
     pg_noise.rates = 0 * b.Hz
+    saved_gamma = float(S.gamma_gdi[0]) if 'gamma_gdi' in S.variables else None
+    if 'gamma_gdi' in S.variables: S.gamma_gdi = 0.0
 
     # list of lists to collect all negative spikes for each class
     tmp_spikes = [[] for _ in range(num_tastes-1)] 
@@ -1310,10 +1312,16 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # open-set data-driven thresholds
     # (=> if during the test PMR/H/gap are inside the "negative typical part", refusing)
-    PMR_thr_auto = float(np.quantile(pmr_list, 0.95))
-    H_thr_auto   = float(np.quantile(h_list,  0.80))
-    gap_thr_auto = float(np.quantile(gap_list, 0.30))
+    PMR_thr_auto = float(np.quantile(pmr_list, 0.80))  # soglia più bassa -> meno trigger
+    H_thr_auto   = float(np.quantile(h_list,  0.90))  # entropia deve essere davvero alta
+    gap_thr_auto = float(np.quantile(gap_list, 0.20))  # gap molto basso per trigger
+    # failsafe
+    PMR_thr_auto *= 0.7
+    H_thr_auto    = max(H_thr_auto, 1.5)  # alza il requisito di entropia
+    gap_thr_auto *= 0.8
 
+    # restore states after OOD
+    if saved_gamma is not None: S.gamma_gdi = saved_gamma
     pg_noise.rates = saved_noise
     S.stdp_on[:] = saved_stdp
 
@@ -1575,7 +1583,7 @@ taste_neurons.k_sens_lo[:] = 0.0005
 
 # initializing GDI
 taste_neurons.gdi_center = 0.1
-taste_neurons.gdi_half   = 0.50 
+taste_neurons.gdi_half   = 0.80 
 
 # Diagonal or dense connection mode for SYNAPSES except for UNKNOWN with population method
 if NEURONS_PER_TASTE == 1:
@@ -2660,7 +2668,7 @@ for input_rates, true_ids, label in training_stimuli:
                             if verbose_rewards and step % 10 == 0:
                                 print(f"  offdiag[cls] - {taste_map[p]}->{taste_map[q]} | "
                                     f"spk_q={float(dc_pop[q]):.1f} fp_q={fp_gate[q]:.1f} sev={severity_q:.2f} hed={hed_mult_p:.2f} "
-                                    f"w={delta:+.4f}  w:{old_w:.3f}->{float(S.w[si]):.3f}")
+                                    f"w={delta:+.4f}  w:{old_w:.3f}->{float(S.w[si]):.3f}\n")
                         S.elig[si] = 0.0
                     
                     # light symmetrical pattern q->p with population support
@@ -2789,7 +2797,7 @@ for input_rates, true_ids, label in training_stimuli:
                 set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * current
                 decays_done += 1
                 cooldown_left = COOLDOWN
-                print(f"[ReduceLROnPlateau] → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
+                print(f"[ReduceLROnPlateau] at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
 
         # cooldown scorre e impedisce di ridurre il plateau in modo troppo ravvicinato
         if cooldown_left > 0:
@@ -2797,7 +2805,7 @@ for input_rates, true_ids, label in training_stimuli:
 
         # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
-            print(f"[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} trials "
+            print(f"\n[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} trials "
                 f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
@@ -2831,10 +2839,6 @@ for input_rates, true_ids, label in training_stimuli:
     net.run(pause_duration)
     S.elig[:] = 0
 
-# clean the bar
-pbar_done()
-print(f"\nEnded TRAINING phase! (elapsed: {fmt_mmss(time.perf_counter()-sim_t0)})")
-
 # best-snapshot CHECKPOINT restore states with the saved best_score until now
 # not replacing weights because it's not biological-like method, but pushing weights to become their better version saved until now
 if best_state is not None:
@@ -2853,9 +2857,13 @@ if best_state is not None:
     restore_state_without(best_state)   # restores the rest of the state without overwrite w
     S.w[:] = tmp_w              # re-apply our blended weights
     # final print logs
-    print(f"[BEST-CHECKPOINT] Restored bio-mixed state (ema_perf={best_score:.3f} @ step {best_step})\n")
+    print(f"[BEST-CHECKPOINT] Restored bio-mixed state (ema_perf={best_score:.3f} @ step {best_step}).")
 else:
     print("[BEST-CHECKPOINT] No best snapshot captured; proceeding with current state.")
+
+# clean the bar
+pbar_done()
+print(f"Ended TRAINING phase! (elapsed: {fmt_mmss(time.perf_counter()-sim_t0)})\n")
 
 # computing per-class thresholds
 thr_per_class_train = np.zeros(num_tastes)
@@ -3004,6 +3012,7 @@ taste_neurons.wfast[:] = 0 * b.mV
 S.x[:] = 0; S.xbar[:] = 0
 S.y[:] = 0; S.ybar[:] = 0
 S.elig[:] = 0
+S_unk.gain_unk = 0.15
 # NO NORMALIZATION during test
 col_allow_upscale    = False
 col_scale_max        = 1.10
@@ -3016,7 +3025,7 @@ theta_min, theta_max = -10*b.mV, 10*b.mV
 taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
 # deactivate state effect for DA and 5-HT for clean test phase
 taste_neurons.theta_bias[:] = 0 * b.mV
-inhibitory_S.inh_scale = 0.8
+inhibitory_S.inh_scale = 0.45
 mod.DA_f[:] = 0.0
 mod.DA_t[:] = 0.0
 mod.HT[:] = 0.0
@@ -3039,7 +3048,7 @@ if test_emotion_mode == "off":
     mod.HI[:] = 0.0
     #mod.ACH[:] = ach_test_level
     taste_neurons.theta_bias[:] = 0 * b.mV
-    inhibitory_S.inh_scale = 0.85
+    inhibitory_S.inh_scale = 0.45
     #S.ex_scale = (1.0 + k_ex_ACH * float(mod.ACH[0]))
     S.ex_scale = 1.0  # gain reset
     pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
@@ -3087,6 +3096,8 @@ S.u0[:]        = 0.06
 S.ex_scale_stp[:] = 1.0 
 results = []
 # low ACh in test phase
+ach_test_level = 0.35
+k_ex_ACH = 0.20   # leggermente meno del train, ma non troppo basso
 mod.ACH[:] = ach_test_level
 pg_noise.rates = 0 * b.Hz
 test_t0 = time.perf_counter()  # start stopwatch TEST
@@ -3240,8 +3251,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     sep = (top - second) / (top + 1e-9)  # relative separation
 
     # scaled z-score during test
-    #pos_expect_test = np.maximum(0.90 * ema_pos_m1 * float(test_duration / training_duration), 1.0)
-    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+    pos_expect_test = np.clip(ema_pos_m1, 0.2, None) 
+    #pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
     z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
 
     E = float(np.sum(scores[:unknown_id]))
@@ -4158,7 +4169,7 @@ plt.tight_layout()
 plt.show()
 
 # e) pos/neg EMA plot
-for c in range(num_tastes-1):
+'''for c in range(num_tastes-1):
     pos = np.array(pos_counts[c])
     neg = np.array(neg_counts[c])
     plt.figure(figsize=(5,3))
@@ -4170,7 +4181,7 @@ for c in range(num_tastes-1):
     plt.ylabel('freq')
     plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
 
 # f) Cross-talk off-diagonal weights
 W = np.zeros((num_tastes, num_tastes))
@@ -4201,7 +4212,7 @@ plt.xlabel('ms')
 plt.tight_layout()
 plt.show()
 
-'''
+
 # h) Plot dynamic taste i = 0..unknown_id-1
 for idx in range(num_tastes-1):
     plt.figure(figsize=(10,3))
@@ -4212,4 +4223,4 @@ for idx in range(num_tastes-1):
     plt.title(f'Hedonic window for {taste_map[idx]}')
     plt.xlabel('ms')
     plt.tight_layout()
-    plt.show()'''
+    plt.show()
