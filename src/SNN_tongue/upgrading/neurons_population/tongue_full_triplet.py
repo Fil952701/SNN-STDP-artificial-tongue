@@ -849,26 +849,26 @@ best_state           = None
 patience             = 0
 # Bio-plausible consolidation & early-stop params
 USE_SLOW_CONSOLIDATION = True
-PATIENCE_LIMIT        = 25
-ETA_CONSOL            = 0.05            # slow capture rate (0..1) toward current fast weights
-DA_THR_CONSOL         = 0.35            # require enough DA to consolidate into w_slow
-BETA_MIX_TEST         = 0.10            # how much fast to keep when mixing slow→test (0..1)
-USE_SOFT_PULL         = True            # softly drift toward best-state when stagnating
-RHO_PULL              = 0.25            # 0..1, per-trial pull strength
-PLASTICITY_DECAY      = 0.90            # multiplicative decay on S.stdp_on when stagnating
-MAX_PLASTICITY_DECAYS = 5
-W_EMA                 = 12
+PATIENCE_LIMIT       = 25
+ETA_CONSOL           = 0.05            # slow capture rate (0..1) toward current fast weights
+DA_THR_CONSOL        = 0.35            # require enough DA to consolidate into w_slow
+BETA_MIX_TEST        = 0.10            # how much fast to keep when mixing slow→test (0..1)
+USE_SOFT_PULL        = True            # softly drift toward best-state when stagnating
+RHO_PULL             = 0.25            # 0..1, per-trial pull strength
+PLASTICITY_DECAY     = 0.90            # multiplicative decay on S.stdp_on when stagnating
+MAX_PLASTICITY_DECAYS= 5
+W_EMA                = 12
 # storico corto per stimare il rumore dell'EMA
-ema_hist              = deque(maxlen=32)
-ema_perf_sd           = 0.0             # aggiornata ad ogni trial
-decays_done           = 0
+ema_hist             = deque(maxlen=32)
+ema_perf_sd          = 0.0             # aggiornata ad ogni trial
+decays_done          = 0
 # Reduce-on-plateau globals
-PLAST_GLOBAL = 1.0
-PLAST_GLOBAL_FLOOR = 0.15
-REDUCE_FACTOR = 0.80
-COOLDOWN = 8
-PLATEAU_WINDOW = 5                      # ogni 5 trial senza migliorie posso decidere un decay
-cooldown_left = 0
+PLAST_GLOBAL         = 1.0
+PLAST_GLOBAL_FLOOR   = 0.15
+REDUCE_FACTOR        = 0.80
+COOLDOWN             = 8
+PLATEAU_WINDOW       = 5               # ogni 5 trial senza migliorie posso decidere un decay
+cooldown_left        = 0
 
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode    = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
@@ -2789,7 +2789,7 @@ for input_rates, true_ids, label in training_stimuli:
                 set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * current
                 decays_done += 1
                 cooldown_left = COOLDOWN
-                print(f"[ReduceLROnPlateau] decay #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
+                print(f"[ReduceLROnPlateau] → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
 
         # cooldown scorre e impedisce di ridurre il plateau in modo troppo ravvicinato
         if cooldown_left > 0:
@@ -4078,7 +4078,6 @@ for p in range(unknown_id):
 # end test
 print("\nEnded TEST phase successfully!")
 
-'''
 # 13. Plots
 # a) Spikes over time
 plt.figure(figsize=(10,4))
@@ -4202,6 +4201,7 @@ plt.xlabel('ms')
 plt.tight_layout()
 plt.show()
 
+'''
 # h) Plot dynamic taste i = 0..unknown_id-1
 for idx in range(num_tastes-1):
     plt.figure(figsize=(10,3))
