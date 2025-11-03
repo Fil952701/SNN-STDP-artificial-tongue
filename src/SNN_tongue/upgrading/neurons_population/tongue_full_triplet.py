@@ -863,8 +863,36 @@ PLASTICITY_DECAY      = 0.90   # multiplicative decay on S.stdp_on when stagnati
 MAX_PLASTICITY_DECAYS = 4
 decays_done           = 0
 
+# global factor for the reinforcement
+PLAST_GLOBAL = 1.0
+
 # Connectivity switch: "diagonal" | "dense"
 connectivity_mode    = "dense"  # "dense" -> fully-connected | "diagonal" -> one to one
+
+# Plasticity pull (in Tensorflow's ReduceLROnPlateau style)
+def set_plasticity_scale(scale: float):
+    s = float(np.clip(scale, 0.0, 1.0))
+    # 1) gate sinaptico esplicito
+    if 'stdp_on' in S.variables:
+        S.stdp_on[:] = s
+    # 2) scala globale del rinforzo (usala dove calcoli r_final)
+    global PLAST_GLOBAL
+    PLAST_GLOBAL = s
+    # 3) raffredda le tracce di eligibility già accumulate
+    if 'elig' in S.variables:
+        S.elig[:] *= (0.5 + 0.5*s)  # p.es. compressione dolce
+
+def soft_pull_toward_best(best_sd, rho: float = 0.25):
+    """
+    Drift morbido dei pesi correnti verso il best snapshot (bio-plausibile “consolidation pull”).
+    """
+    if best_sd is None:
+        return
+    # soft blend solo sui pesi sinaptici veloci + (opzionale) theta
+    if best_sd.get('w') is not None:
+        S.w[:] = (1.0 - rho) * S.w[:] + rho * best_sd['w']
+    if hasattr(taste_neurons, 'theta'):
+        taste_neurons.theta[:] = (1.0 - 0.5*rho) * taste_neurons.theta[:] + (0.5*rho) * best_sd['theta']
 
 # helper to define states fallback for hedonic window during DA reinforcement
 def state_hed_fallback_vec(mod, base=hed_fallback):
@@ -2485,58 +2513,54 @@ for input_rates, true_ids, label in training_stimuli:
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
     for idx in range(num_tastes-1):
-       idx_list = diag_indices_for_taste(idx)
-       if idx_list.size == 0: 
+        idx_list = diag_indices_for_taste(idx)  # indici sinapsi verso la popolazione "idx"
+        if idx_list.size == 0:
             continue
-       spikes_i = float(dc_pop[idx])
-       #spikes_i = float(diff_counts[idx])
 
-       r = 0.0
-       if idx in true_ids:
-          # big TP
-          if spikes_i >= tp_gate[idx]:
-            # reward amplified by DA dopamine ACh acetylcholine and inhibited by 5-HT serotonine
-            ht_eff = min(HT_now, 0.5)   # max 0.5 serotonine unit as penalty
-            r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * ht_eff)
-            r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
-            conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
-            r *= 0.5 + 0.5 * conf  # 0.51.0
-            # hedonic fallback => if a taste is recognized but is not inside the hedonic window => minor DA reinforcement
-            if use_hedonic_da:
-                hed_mult = hed_fb_vec[idx] + (1.0 - hed_fb_vec[idx]) * float(g_win[idx])
-                r *= hed_mult
-            # metaplasticity: reinforcement scaling for TP
-            r *= meta_scale(idx)
-          # micro-reward per co-taste vero ma sotto soglia
-          elif idx in true_ids:
-            pos_mu_i = float(ema_pos_m1[idx])
-            pos_mu_t = max(1.0, pos_mu_i)
-            z_i = spikes_i / pos_mu_t
-            if z_i >= 0.40:  # presente ma debole
-                r = 0.25 * alpha * (1.0 + da_gain * DA_now) / (1.0 + ht_gain * HT_now)
+        spikes_i = float(dc_pop[idx])  # coerenza: usi la metrica "pop"
+
+        # calcolo r
+        r = 0.0
+        if idx in true_ids:
+            # TP forte
+            if spikes_i >= tp_gate[idx]:
+                ht_eff = min(HT_now, 0.5)
+                r = (alpha * (1.0 + da_gain * DA_now) * (1.0 + ach_plasticity_gain * ACH_now)) / (1.0 + ht_gain * ht_eff)
                 r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
+                conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
+                r *= (0.5 + 0.5 * conf)  # ∈ [0.5, 1.0]
                 if use_hedonic_da:
                     hed_mult = hed_fb_vec[idx] + (1.0 - hed_fb_vec[idx]) * float(g_win[idx])
                     r *= hed_mult
                 r *= meta_scale(idx)
-       else:
-         # big FP (after warm-up EMA)
-          if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
-            # punition amplified by 5-HT -> aversive state verified
-            r = - beta * (1.0 + ht_gain * HT_now)
-            # same for FP
-            r *= (1.0 + ne_gain_r * NE_now)
-        
-       # alla fine del calcolo di r lo moltiplico per il canale dell'early stopping:
-       r *= perf_gate
+            # TP debole (micro-reward)
+            else:
+                pos_mu_i = float(ema_pos_m1[idx]); pos_mu_t = max(1.0, pos_mu_i)
+                z_i = spikes_i / pos_mu_t
+                if z_i >= 0.40:
+                    r = 0.25 * alpha * (1.0 + da_gain * DA_now) / (1.0 + ht_gain * HT_now)
+                    r *= (1.0 + ne_gain_r * NE_now) * (1.0 + hi_gain_r * HI_now)
+                    if use_hedonic_da:
+                        hed_mult = hed_fb_vec[idx] + (1.0 - hed_fb_vec[idx]) * float(g_win[idx])
+                        r *= hed_mult
+                    r *= meta_scale(idx)
+        else:
+            # FP forte (dopo warmup)
+            if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
+                r = - beta * (1.0 + ht_gain * HT_now)
+                r *= (1.0 + ne_gain_r * NE_now)
 
-       for si in idx_list:
-            # calcola r come fai ora e applica delta a ciascuna sinapsi della popolazione
-            if r != 0.0:
-                delta = r * float(S.elig[si])
-                if delta != 0.0:
-                    S.w[si] = float(np.clip(S.w[si] + delta, 0, 1))
-                S.elig[si] = 0.0
+        # applicazione unica del rinforzo con gating
+        # perf_gate ∈ {0,1} o [0,1] (dipende da come lo calcoli); PLAST_GLOBAL ∈ [0,1]
+        r_final = perf_gate * PLAST_GLOBAL * r
+        if r_final != 0.0 and abs(r_final) * np.max(S.elig[idx_list]) >= 1e-6:
+            # vettorizzato su tutta la popolazione di "idx"
+            # S.elig è già il 3° fattore (eligibility trace)
+            delta_vec = r_final * S.elig[idx_list]
+            # applica e clampa
+            S.w[idx_list] = np.clip(S.w[idx_list] + delta_vec, 0.0, 1.0)
+            # svuota le tracce consumate
+            S.elig[idx_list] = 0.0
 
     # A5: OFF-DIAGONAL: punish p->q when q is big FP
     if use_offdiag_dopamine:
@@ -2721,23 +2745,34 @@ for input_rates, true_ids, label in training_stimuli:
         best_state = snapshot_state()        # full state snapshot (for non-weight vars)
         w_slow_best = w_slow.copy()          # keep slow consolidated at best point
         patience = 0
+        # se avevi ridotto la plasticità, riapri un po' (senza saltare a 1 di colpo)
+        if 'stdp_on' in S.variables:
+            curs = float(np.mean(S.stdp_on[:]))
+            target_s = 1.0
+            set_plasticity_scale(0.50*curs + 0.50*target_s)  # rialzo dolce
+        # opzionale: azzera il contatore decays per un nuovo “ciclo di esplorazione”
+        decays_done = 0
         print(f"NEW BEST ema_perf improvement: {best_score} at step {best_step}\n")
     else:
         patience += 1
-        # softly pull the fast weights toward the best checkpoint's weights
-        if USE_SOFT_PULL and (best_state is not None):
-            S.w[:] = (1.0 - RHO_PULL) * S.w[:] + RHO_PULL * best_state['w']
+        # 3a) Soft-pull verso il best snapshot mentre siamo in plateau (bio consolidamento)
+        if USE_SOFT_PULL and (best_state is not None) and (patience >= max(3, PATIENCE_LIMIT//3)):
+            soft_pull_toward_best(best_state, rho=RHO_PULL)
 
-        # gradually cool down plasticity when stagnating => like in the real brain
-        if (patience % 3 == 0) and (decays_done < MAX_PLASTICITY_DECAYS):
-            S.stdp_on[:] *= PLASTICITY_DECAY
+        # 3b) ReduceLR-on-Plateau biologico: riduci la plasticità a gradini
+        # Esegui un decay solo ogni PLATEAU_WINDOW ed entro un massimo di decays
+        PLATEAU_WINDOW = 5  # ogni 5 trial senza miglioramenti applica un decay
+        if (patience % PLATEAU_WINDOW == 0) and (decays_done < MAX_PLASTICITY_DECAYS):
+            if 'stdp_on' in S.variables:
+                curs = float(np.mean(S.stdp_on[:]))
+                set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * cur
             decays_done += 1
-            print(f"[PLASTICITY DECAY] for step: {step}.\nDecays done: {decays_done}.\nBecause of no better improvement.")
+            print(f"[ReduceLROnPlateau] decay plasticity #{decays_done} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}")
 
-        # triggering EARLY STOPPING
+        # 3c) Early Stopping finale se non si migliora per troppo tempo
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
-            print(f"[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} consecutive trials "
-                f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
+            print(f"[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} trials "
+                  f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
