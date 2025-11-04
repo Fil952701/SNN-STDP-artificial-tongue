@@ -1610,13 +1610,13 @@ else:
             S.connect(i=tx, j=np.arange(sl.start, sl.stop))
     else:  # "dense" popolazionale: p -> slice(q) per tutti i q
         all_posts = {q: np.arange(*taste_slice(q).indices(TOTAL_OUT)) for q in range(num_tastes)}
-        for p in range(num_tastes):
-            if p == unknown_id:
+        for ps in range(num_tastes):
+            if ps == unknown_id:
                 continue
             for q in range(num_tastes):
                 if q == unknown_id:
                     continue
-                S.connect(i=p, j=all_posts[q])
+                S.connect(i=ps, j=all_posts[q])
 
 # init weights
 if NEURONS_PER_TASTE == 1 and connectivity_mode == "dense":
@@ -2223,6 +2223,8 @@ for input_rates, true_ids, label in training_stimuli:
     inp_energy = float(np.sum(masked_boosted[:unknown_id]))
     pmr_in = (float(np.max(masked_boosted[:unknown_id])) / (inp_energy + 1e-9)) if inp_energy > 0 else 0.0
     cap_boost  = float(np.interp(pmr_in, [0.25, 0.45], [0.95, 0.60]))
+    if inp_energy < 1e-6:
+        cap_boost = 0.10  # cap molto stretto con energia nulla
     gamma_val *= (1.0 + 0.15 * np.tanh(inp_energy/800.0))  # più diffuso ⇒ più squeeze
     gamma_val = min(gamma_val, cap_boost)
      # s.ex_scale with STP and warmup
@@ -2348,11 +2350,16 @@ for input_rates, true_ids, label in training_stimuli:
         i_all = np.asarray(S.i[:], int)
         j_all = np.asarray(S.j[:], int)
         mask_off = (i_all != j_all) & (j_all != unknown_id) & (i_all != unknown_id)
-        w_all[mask_off] *= 0.992  # decadimento lieve e continuo
+        # light decay
+        factor = 0.995 if ema_perf < 0.45 else 0.992
+        w_all[mask_off] *= factor
         S.w[:] = np.clip(w_all, 0.0, 1.0)
 
     if dc_pop.max() <= 0:
         print("\nThere's no computed spike, skipping rewarding phase...")
+        # neuromodulators cooldown
+        mod.NE[:] *= 0.98
+        mod.HI[:] *= 0.98
         net.run(pause_duration)
         S.elig[:] = 0
         continue
@@ -2369,6 +2376,10 @@ for input_rates, true_ids, label in training_stimuli:
     tp_gate = np.zeros(num_tastes-1, dtype=float)
     fp_gate = np.zeros(num_tastes-1, dtype=float)
 
+    # weight arrays
+    i_all = np.asarray(S.i[:], int)
+    j_all = np.asarray(S.j[:], int)
+    w_all = np.asarray(S.w[:], float)
     for idx in range(num_tastes-1):
        # negative floor -> FP conservative threshold for EMA
        neg_mu_i = float(ema_neg_m1[idx])
@@ -2398,9 +2409,6 @@ for input_rates, true_ids, label in training_stimuli:
        fp_gate[idx] = fp_gate_i
 
        # LTD mirata sulle colonne “calde” che NON sono nel target
-       i_all = np.asarray(S.i[:], int)
-       j_all = np.asarray(S.j[:], int)
-       w_all = np.asarray(S.w[:], float)
        for q in range(unknown_id):
             if q in true_ids:
                 continue
@@ -2453,6 +2461,12 @@ for input_rates, true_ids, label in training_stimuli:
                 if float(scores[jas]) >= max(thr_rel, 0.4 * tp_gate[jas]):
                     if jas not in winners:
                         winners.append(jas)
+    
+    # absolute minimum on any co-winners:
+    if len(winners) > 1:
+        winners = [wa for wa in winners if scores[wa] >= max(0.25*top, min_spikes_for_known*0.5)]
+        if not winners:
+            winners = [int(np.argmax(scores))]
 
     # SPICY aversion management (if SPICY is present among true or winner ids)
     is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
@@ -2489,7 +2503,7 @@ for input_rates, true_ids, label in training_stimuli:
 
     # Dopo aver calcolato tp_gate/fp_gate
     is_mix_like = (0.35 <= PMR <= 0.60) and (0.8 <= H <= 1.4)
-    if is_mix_like:
+    if is_mix_like: # mix_like lo uso in training, mixture_like in test
         tp_gate = np.maximum(min_spikes_for_known * 0.6, tp_gate * mixture_thr_relax)  # mixture_thr_relax 0.55 già nel codice
         # meno WTA e meno squeeze GDI per far coesistere più gusti
         inhibitory_S.inh_scale[:] = np.maximum(0.30, float(inhibitory_S.inh_scale[0]) * 0.55)
@@ -2858,8 +2872,7 @@ if best_state is not None:
     S.w[:] = (1.0 - RHO_FINAL) * S.w[:] + RHO_FINAL * best_state['w']
 
     # 3b) mix in the slow consolidated trace for stability in test
-    if USE_SLOW_CONSOLIDATION:
-        # mix the just-blended fast with slow; keep a bit of fast detail
+    if USE_SLOW_CONSOLIDATION and (w_slow_best is not None):
         S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
     
     # 3c) restore NON-weight state from the best snapshot (thresholds, modulators, traces, etc.)
@@ -3041,9 +3054,6 @@ th = th - np.mean(th) # centered
 theta_min, theta_max = -10*b.mV, 10*b.mV
 inhibitory_S.g_step_inh = g_step_inh_local
 inhibitory_S.delay = 0.5*b.ms
-'''mod.DA_f[:] = 0.0
-mod.DA_t[:] = 0.0
-mod.HT[:] = 0.0'''
 # apply state bias
 apply_internal_state_bias(profile, mod, taste_neurons)
 
@@ -3222,30 +3232,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             tgt[tid] = 1
     all_targets.append(tgt)
 
-    sorted_idx = np.argsort(scores)[::-1]
-    top_idx = int(sorted_idx[0])
-    top = float(scores[top_idx])
-    second = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
-    sep = (top - second) / (top + 1e-9)  # relative separation
-
-    # scaled z-score during test
-    pos_expect_test = np.clip(ema_pos_m1, 0.2, None) 
-    #pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
-    z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
-
-    E = float(np.sum(scores[:unknown_id]))
-    PMR = top / (E + 1e-9)                         # peso del top rispetto all'energia totale
-    gap = (top - second) / (top + 1e-9)            # separazione relativa top-second
-    
-    # GABA little decay
-    if (E >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
-        mod.GABA[:] += 0.3 * gaba_pulse_stabilize
-
-    p = scores[:unknown_id] / (E + 1e-9)           # distribuzione normalizzata sulle classi note
-    p = np.clip(p, 1e-12, 1.0); p = p / p.sum()
-    H = float(-(p * np.log(p)).sum())              # entropia (nats)
-    HHI = float((p**2).sum())
-    k_est  = int(np.clip(round(1.0 / HHI), 1, n_noti))
 
     # 1) stimulus on target classes with UNKNOWN inputs
     set_unknown_gate(
@@ -3254,15 +3240,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         gap_thr=0.14,           # 0.12–0.18
         H_thr=0.80*np.log(n_known)
     )
-    # if the top has a high z-score → turn off UNKNOWN even if the other metrics are borderline
-    if z[top_idx] >= 0.90:     # 0.88–0.92
-        S_unk.gain_unk = 0.0
-    # decreasing inhibition in mix-like
-    '''if   k_est >= 5: inhibitory_S.inh_scale[:] = 0.28
-    elif k_est == 4: inhibitory_S.inh_scale[:] = 0.32
-    elif k_est == 3: inhibitory_S.inh_scale[:] = 0.36
-    else:            inhibitory_S.inh_scale[:] = 0.50'''
-
+ 
     # estensione on-demand della finestra (solo mix-like):
     '''If the trial is is_mixture_like but the co-tastes are a few spikes below your soft-abs,
     extend the test window by +50…80 ms for that trial only and recount. 
@@ -3270,8 +3248,13 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     without affecting the overall OOD calibration.'''
     mix_pmr_lo, mix_pmr_hi = 0.26, 0.72
     mix_H_lo,   mix_H_hi   = 0.50, 1.85
-    is_mixture_like = (PMR >= mix_pmr_lo and PMR <= mix_pmr_hi) and (H >= mix_H_lo and H <= mix_H_hi)
+    #is_mixture_like = (PMR >= mix_pmr_lo and PMR <= mix_pmr_hi) and (H >= mix_H_lo and H <= mix_H_hi)
+    is_mixture_like = (mix_pmr_lo <= PMR <= mix_pmr_hi) and (mix_H_lo <= H <= mix_H_hi)
     did_extend = False
+    #pos_expect_test = np.clip(ema_pos_m1, 0.2, None) 
+    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+
+    # se è mix
     if is_mixture_like:
         # soft-abs che usi già per i mix
         soft_abs = np.maximum(mix_abs_pos_frac * np.maximum(pos_expect_test, 1.0),
@@ -3294,28 +3277,36 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             scores = add_extra_scores(scores, diff_extra, unknown_id, reduce="sum") # scores updated with population
             did_extend = True
 
-    # dopo aver calcolato PMR,H
-    is_diffuse = (PMR < 0.38 and H > 1.2)
-    if is_diffuse:
-        inhibitory_S.inh_scale = float(np.clip(inhibitory_S.inh_scale[0]*1.20, 0.5, 2.0))
-        # e anche un pizzico di GDI
-        try:
-            cur = float(S.variables['gamma_gdi'].get_value().item())
-        except Exception:
-            cur = float(gamma_val)
-        S.gamma_gdi = min(cur * 1.15, 0.50)
+            sorted_idx = np.argsort(scores)[::-1]
+            top_idx = int(sorted_idx[0])
+            top = float(scores[top_idx])
+            second = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
+            sep = (top - second) / (top + 1e-9)  # relative separation
 
-    # blend dinamico (0=solo P_pos, 1=solo P_cop)
-    # più "mix-like" (PMR medio e H alto) ⇒ più peso a P_cop
-    lam_blend = float(np.clip(np.interp(PMR, [0.30, 0.55], [0.0, 1.0]) * np.interp(H, [0.7, 1.5], [0.0, 1.0]), 0.0, 1.0))
-    P_blend = (1.0 - lam_blend) * P_pos + lam_blend * P_cop
+            # scaled z-score during test
+            z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
+
+            E = float(np.sum(scores[:unknown_id]))
+            PMR = top / (E + 1e-9)                         # peso del top rispetto all'energia totale
+            gap = (top - second) / (top + 1e-9)            # separazione relativa top-second
+    
+            # GABA little decay
+            if (E >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
+                mod.GABA[:] += 0.3 * gaba_pulse_stabilize
+            
+            # Entropy distribution
+            p_local = scores[:unknown_id].astype(float)
+            E_local = float(p.sum())
+            if E_local > 0:
+                p_local /= E_local
+            else:
+                p_local[:] = 0.0
+            H = float(-(p_local * np.log(p_local)).sum())    # entropy (nats)
+            HHI = float((p_local**2).sum()) if E_local > 0 else 1.0
+            k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, n_noti))
     
     # intervalli stretti mantengono l'open-set. Sono centrati sui dati attuali
     k_active = int(np.sum(scores[:unknown_id] >= min_spikes_for_known_test))
-    if k_active >= 4: # with mixes there's need to shrink the divisive more
-        inhibitory_S.inh_scale[:] = np.minimum(1.40, float(inhibitory_S.inh_scale[0]) * 1.12)
-        S.gamma_gdi = min(S.gamma_gdi, 0.16) 
-    is_mixture_like = (k_active >= 2) and (mix_pmr_lo <= PMR <= mix_pmr_hi) and (mix_H_lo <= H <= mix_H_hi)
     n_strong = np.sum(scores[:unknown_id] >= min_spikes_for_known_test)
     is_mixture_like = is_mixture_like and (n_strong >= 2)
 
@@ -3323,7 +3314,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     gap_dyn = gap_thr
     if k_active in (2,3):
         gap_dyn = max(0.10, 0.75 * gap_thr)   # 0.18 → ~0.15
-    
+
+    # dopo aver calcolato PMR,H
     flags = [
         PMR is not None and PMR < PMR_thr,
         H   is not None and H   > H_thr,
@@ -3331,6 +3323,26 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     ]
     is_diffuse = sum(bool(x) for x in flags) >= 2
 
+    # 6) Politica UNICA per l’inibizione e GDI in questo trial (niente doppi set)
+    # base: usa il valore corrente come “ancora”
+    inh = float(inhibitory_S.inh_scale[0]) if hasattr(inhibitory_S, 'inh_scale') else 0.45
+    # più co-attivi => un po' più WTA
+    if k_active >= 3:
+        inh *= min(1.40, 1.0 + 0.12*(k_active - 2))
+    # se diffuso, spingi ancora
+    if is_diffuse:
+        inh *= 1.12
+    inhibitory_S.inh_scale[:] = float(np.clip(inh, 0.30, 1.40))
+
+    # 7) Gating UNKNOWN “forte”: se il top ha z alto, spegni UNKNOWN (dopo eventuale estensione)
+    if z[top_idx] >= 0.90:
+        S_unk.gain_unk = 0.0
+
+    # blend dinamico (0=solo P_pos, 1=solo P_cop)
+    # più "mix-like" (PMR medio e H alto) ⇒ più peso a P_cop
+    lam_blend = float(np.clip(np.interp(PMR, [0.30, 0.55], [0.0, 1.0]) * np.interp(H, [0.7, 1.5], [0.0, 1.0]), 0.0, 1.0))
+    P_blend = (1.0 - lam_blend) * P_pos + lam_blend * P_cop
+    
     # corsia soft per coppie: se i 2 top superano un assoluto “ragionevole”, accetta anche con gap basso
     if is_diffuse and is_mixture_like and k_active == 2:
         top2 = int(sorted_idx[1])
@@ -3340,41 +3352,42 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             winners = sorted([top_idx, top2], key=lambda ids: scores[ids], reverse=True)
             is_diffuse = False
 
+    # expected cop value
     cop_expect_test = np.maximum(ema_cop_m1 * float(test_duration / training_duration), 1.0)
-    # corsia soft per triple: se i 3 top superano un assoluto “ragionevole”, accetta anche con gap basso
-    if (not is_diffuse) and is_mixture_like and (k_active == 3):
-        top3 = np.argsort(scores[:unknown_id])[::-1][:3]
-        soft_abs3 = np.maximum(0.22 * pos_expect_test, 0.22 * cop_expect_test)
-        if all(scores[ids] >= max(soft_abs3[ids], 0.22*top) for ids in top3):
-            winners = list(top3)
-            
-    # mixture_shortcut -> solo se mix-like e NON diffuso
-    mixture_shortcut = []
-    if is_mixture_like and (not is_diffuse):
-        # soglia assoluta morbida proporzionale all'atteso positivo
-        soft_abs = np.maximum(mix_abs_pos_frac * np.maximum(pos_expect_test, 1.0),
-                          float(min_spikes_for_known_test))
-        # guardia relativa al top per evitare code spurie
-        rel_guard = norm_rel_ratio_test * top
-        for idx in range(unknown_id):
-            if (scores[idx] >= max(soft_abs[idx], rel_guard)) and (z[idx] >= max(0.18, z_rel_min)):
-                mixture_shortcut.append(idx)
-    z_min = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20
-    if (k_active >= 3) and (PMR < max(0.65, 1.05*PMR_thr)):
-        is_diffuse = True
 
-    # NNLS decoding before saying: "UNKNOWN" a priori
-    abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
-        0.22*pos_expect_test,
-        0.18*cop_expect_test
+
+    # mixture_shortcut -> solo se mix-like e NON diffuso 
+    mixture_shortcut = [] 
+    if is_mixture_like and (not is_diffuse): 
+        # soglia assoluta morbida proporzionale all'atteso positivo 
+        soft_abs = np.maximum(mix_abs_pos_frac * np.maximum(pos_expect_test, 1.0), 
+                          float(min_spikes_for_known_test)) # guardia relativa al top per evitare code spurie 
+        rel_guard = norm_rel_ratio_test * top 
+        for idx in range(unknown_id): 
+            if (scores[idx] >= max(soft_abs[idx], rel_guard)) and (z[idx] >= max(0.18, z_rel_min)): 
+                mixture_shortcut.append(idx) 
+                z_min = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20 
+                if (k_active >= 3) and (PMR < max(0.65, 1.05*PMR_thr)): 
+                    is_diffuse = True
+
+    # NNLS Unsupervised Learning - Labelling Discovery
+    did_unsup_relabel = False
+    unsup_labels = []
+    unsup_log = None
+    # criteri per consentire quintuple:
+    may_allow_k5 = (
+        is_mixture_like and
+        (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
+        PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
     )
+
+    # Gestione NNLS dell'Unsupervised Learning
     should_try_nnls = ((winners == []) or (winners == [unknown_id])) #and (not is_diffuse)
     if should_try_nnls:
-        # criteri per consentire quintuple:
-        may_allow_k5 = (
-            is_mixture_like and
-            (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
-            PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
+        # NNLS decoding before saying: "UNKNOWN" a priori
+        abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
+            0.22*pos_expect_test,
+            0.18*cop_expect_test
         )
         cand_nnls, info_nnls = decode_by_nnls(
             scores=scores[:unknown_id],
@@ -3438,13 +3451,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         net.run(recovery_between_trials)
         continue
 
-    # final decision
-    if is_mixture_like and (not is_diffuse):
-        inhibitory_S.inh_scale[:] = np.maximum(0.40, float(inhibitory_S.inh_scale[0]) * 0.65)  # 0.42/0.75 � 0.40/0.70
-        gamma_val = min(gamma_val, 0.024)  # 0.035 -> 0.030
-        S.gamma_gdi = gamma_val
-        S_noise.gamma_gdi = gamma_val
-
     # pulizia del trial: blending factor 0..1 (0 = tutto su EMA+, 1 = tutto su soglia dura)
     # aumentiamo il blending (=> soglia più dura) se il trial è più ambiguo/diffuso
     clean_pmr = np.clip((PMR - PMR_thr) / max(1e-9, 0.85 - PMR_thr), 0.0, 1.0)  # PMR rispetto alla soglia OOD
@@ -3453,7 +3459,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # blending: più peso al co-positive se siamo in un mix pulito
     # clean  [0,1] (già calcolato): più è alto, più il trial è "pulito"
-    cop_expect_test = np.maximum(ema_cop_m1 * float(test_duration / training_duration), 1.0)
     mix_blend = np.interp(clean, [0.0, 1.0], [0.55, 0.95])  # 0.90 � 0.95
     frac_pos  = np.interp(clean, [0.0, 1.0], [0.68, 0.28])  # 0.34 � 0.30
     pos_exp_blend = (1.0 - mix_blend) * pos_expect_test + mix_blend * cop_expect_test
@@ -3468,96 +3473,101 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     )
 
     # rendi un filo più tenera la soglia sui mix
-    if is_mixture_like:
-        frac_pos = max(0.38, frac_pos - 0.08)  # leggermente più tenera sui mix
-        # più tenera su coppie/terzine
-        if (not is_diffuse) and (k_active in (2,3)) and (mix_pmr_lo <= PMR <= mix_pmr_hi):
-            frac_pos = max(0.34, frac_pos - 0.06)  # prima 0.30–0.42 → un filo più tenero per 2-3 way
+    if is_mixture_like and (not is_diffuse):
+        frac_pos = max(0.38, frac_pos - 0.08)
+        if (k_active in (2, 3)) and (mix_pmr_lo <= PMR <= mix_pmr_hi):
+           frac_pos = max(0.34, frac_pos - 0.06)
 
     # soglia efficace per ogni classe nota
-    # - se il trial � pulito, usiamo un blend di soglia dura e soglia morbida
-    # - se il trial � diffuso, usiamo la soglia dura (OOD-based)
+    # - se il trial è pulito, usiamo un blend di soglia dura e soglia morbida
+    # - se il trial è diffuso, usiamo la soglia dura (OOD-based)
     if not is_diffuse:
         thr_eff = np.minimum(thr_per_class_test[:unknown_id], frac_pos * pos_exp_blend)
-        thr_eff = np.maximum(thr_eff,
-                         np.maximum(float(mix_min_abs),
-                                    dyn_abs_min_frac * np.maximum(pos_expect_test, 1.0)))
+        thr_eff = np.maximum(
+            thr_eff,
+            np.maximum(float(mix_min_abs), dyn_abs_min_frac * np.maximum(pos_expect_test, 1.0))
+        )
     else:
         thr_eff = np.maximum(thr_per_class_test[:unknown_id], float(mix_min_abs))
     
     # data-driven thresholds
     top_pass_strict = (
-        (scores[top_idx] >= 0.95 * thr_per_class_test[top_idx]) and   # prima 1.00x
-        (z[top_idx] >= z_min) and
-        (gap >= 0.95 * gap_thr)                                       # prima 1.00x
+        (scores[top_idx] >= 0.95 * thr_per_class_test[top_idx]) and
+        (z[top_idx]     >= z_min) and
+        (gap            >= 0.95 * gap_thr)
     )
-    # penalità anti-iper-reattivit� per classi "calde" su OOD/NULL
-    # usa overshoot e varianza negativa come proxy (già calcolati nella calibrazione)
-    neg_sd = np.array([ema_sd(ema_neg_m1[isd], ema_neg_m2[isd]) for isd in range(unknown_id)])
-    heat = np.clip((overshoot / (neg_sd + 1e-6)), 0.0, 4.0)  # grande se la classe eccede spesso sugli OOD
+
+    # 6) Penalità “classi calde” SOLO in diffuso (overshoot/neg_sd già disponibili dalla calibrazione)
     if is_diffuse:
-        # rafforza il malus di classe sui test diffusi
-        thr_eff[fatty_id] *= (1.0 + 0.40 * min(1.0, heat[fatty_id]))  # prima 0.45 su tutte → 0.60 SOLO FATTY
-        # piccola guardia extra: se il top è FATTY ma non “molto convinto”, rifiuta
+        neg_sd = np.array([ema_sd(ema_neg_m1[isd], ema_neg_m2[isd]) for isd in range(unknown_id)])
+        heat = np.clip((overshoot / (neg_sd + 1e-6)), 0.0, 4.0)
+        thr_eff[:unknown_id] *= (1.0 + 0.45 * heat)
+        # guardia extra su FATTY come nel tuo codice
         if top_idx == fatty_id and (z[fatty_id] < 1.45 or PMR < 0.66):
             winners = [unknown_id]
-    # clean  [0,1] come già calcolato
+
+    # 7) Stima locale di k_est (da HHI), poi k_cap
+    p_norm_local = scores[:unknown_id].astype(float)
+    E_local = float(p_norm_local.sum())
+    if E_local > 0:
+        p_norm_local /= E_local
+    else:
+        p_norm_local[:] = 0.0
+    HHI = float((p_norm_local**2).sum()) if E_local > 0 else 1.0
+    k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, unknown_id))
+
     k_cap_base = int(np.clip(k_est, 2, n_noti))
     bonus = 0 if k_active < 2 else (2 if clean >= 0.70 else (1 if clean >= 0.60 else 0))
-    k_cap = min(max(k_cap_base + bonus, 3), k_active, 9)  # garantisci almeno 3 nei mix puliti
-    if is_diffuse:
-        thr_eff[:unknown_id] *= (1.0 + 0.45 * heat)  # 0.35 � 0.45
+    k_cap = min(max(k_cap_base + bonus, 3), k_active, 9)  # ≥3 quando il mix è pulito
 
-    # soglia minima assoluta per i noti
+    #  WINNERS SELECTION
+    # A) Rejection diretto se diffuso e top non “strict”
     if is_diffuse and not top_pass_strict:
         winners = [unknown_id]
     else:
-        # 2) candidati "stretti": soglia assoluta vera + z
+        # B) candidati "stretti": soglia assoluta vera + z
         strict_winners = [
             idx for idx in range(unknown_id)
             if (scores[idx] >= (thr_eff[idx] + abs_margin_test)) and (z[idx] >= z_min)
         ]
         winners = list(strict_winners)
 
-        # 3) co-vincitori SOLO se il top è davvero "known" e NON diffuso
+         # C) Mixture shortcut (solo top forte e NON diffuso)
         top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
         if top_known and (not is_diffuse) and mixture_shortcut:
             add = [c for c in mixture_shortcut if c != top_idx and c not in winners]
-            if add:  # < NEW: safe guard
+            if add:
                 add.sort(key=lambda ia: scores[ia], reverse=True)
-                add = add[:max(0, k_cap-1)]  # k_cap già calcolato sopra
-                if scores[add].sum() >= 0.20 * E:  # somma solo se add non � vuota
+                add = add[:max(0, k_cap - 1)]
+                # guardrail energetico
+                if scores[add].sum() >= 0.20 * E:
                     winners.extend(add)
         
-        # Negative rel gate
+        # D) Negative rel gate
         if use_rel_gate_in_test and top_known and (not is_diffuse):
-            rel_thr = rel_gate_ratio_test * top  # soglia relativa al top
-            # soglia assoluta "soft" per co-taste (blend già calcolato in thr_eff)
-            co_abs_soft = np.maximum(0.32 * thr_eff, 0.30 * cop_expect_test)  # 0.32�0.30
-
-            co_abs_cap = 1.05 * rel_thr               # cap per evitare sforamenti strani
+            rel_thr = rel_gate_ratio_test * top
+            co_abs_soft = np.maximum(0.32 * thr_eff, 0.30 * cop_expect_test)
+            co_abs_cap = 1.05 * rel_thr
             co_abs = np.minimum(co_abs_soft, co_abs_cap)
 
-            # Binario normalizzato-al-top
-            E_abs = E  # somma spikes note
-            co_abs_energy_min = np.clip(0.05*E_abs, 2.0, 10.0)
-            n = scores[:unknown_id] / (top + 1e-9)    # quota rispetto al top
-            # candidatura: abbastanza vicini al top OPPURE sopra l'assoluto soft
+            E_abs = E
+            co_abs_energy_min = np.clip(0.05 * E_abs, 2.0, 10.0)
+            nrel = scores[:unknown_id] / (top + 1e-9)
+
             cand = [idx for idx in range(unknown_id)
-                    if (idx != top_idx) and (z[idx] >= z_rel_min) and
-                    ((n[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
-                    (scores[idx] >= max(rel_thr, co_abs[idx])) ) and
-                    (scores[idx] >= co_abs_energy_min)]
-            
+                if (idx != top_idx) and (z[idx] >= z_rel_min) and
+                   ((nrel[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
+                    (scores[idx] >= max(rel_thr, co_abs[idx]))) and
+                   (scores[idx] >= co_abs_energy_min)]
             cand.sort(key=lambda idx: scores[idx], reverse=True)
 
-            add_max = max(0, k_cap - 1)             # -1 perché il top � già dentro
+            add_max = max(0, k_cap - 1)  # top già incluso
             add = cand[:min(add_max, len(cand))]
             if add and scores[add].sum() >= 0.22 * E:
                 winners.extend(add)
 
             # Weak co-taste rescue (solo se NON diffuso e top � forte)
-            if (not is_diffuse) and top_pass_strict:
+            if top_pass_strict:
                 rescue = []
                 abs_co_min = 0.25 * min_spikes_for_known_test      # co-gusto davvero debole ma reale
                 rel_min    = 0.05                                  # quota minima vs top
@@ -3573,15 +3583,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
                 # tieni al massimo 1 co-gusto extra, e solo se contribuisce davvero
                 rescue.sort(key=lambda js: scores[js], reverse=True)
-                if rescue:
-                    js = rescue[0]
-                    # guardrail energetico: non attivare co-accettazioni spurie
-                    if scores[js] >= max(0.18 * E, 2.0):
-                        winners.append(js)
-            
+                if rescue and scores[rescue[0]] >= max(0.18 * E, 2.0):
+                    winners.append(rescue[0])
+
             # Top-only fallback severo in scene borderline
             if (k_active >= 3) and (clean < 0.35):
-                winners = [top_idx] if top_pass_strict else [unknown_id]  # 0.35�0.40
+                winners = [top_idx] if top_pass_strict else [unknown_id]  # 0.35->0.40
             
             # NEW: cap finale sul numero totale di vincitori (mantieni il top)
             if len(winners) > k_cap:
@@ -3590,117 +3597,13 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 rest.sort(key=lambda isa: scores[isa], reverse=True)
                 winners = [top_idx] + rest[:max(0, k_cap-1)]
 
-        # 4) fallback top-only se ancora vuoto
+        # F) Fallback se ancora vuoto
         if not winners:
             if (not is_diffuse) and top_pass_strict and (z[top_idx] >= z_min):
                 winners = [top_idx]
-
-        # TENTATIVO DI LABEL DISCOVERY NON SUPERVISIONATO before UNKNOWN fallback
-        did_unsup_relabel = False
-        unsup_labels = []
-        unsup_log = None
-
-        # Attivo SOLO se ha vinto UNKNOWN e il pattern non è "diffuso cattivo": quindi potrebbe esserci una speranza di corretta classificazione
-        if winners == [unknown_id] and (not is_diffuse):
-            # α fisso: più "copresenza" nei mix-like, altrimenti più "pulito"
-            alpha = 0.60 if is_mixture_like else 0.20
-            P = (1.0 - alpha) * P_pos + alpha * P_cop   # shape (C, C)
-
-            # vettore punteggi (solo gusti noti)
-            b_vec = scores[:unknown_id].astype(float)
-
-            # Normalizzazione leggera per robustezza numerica
-            b_sum = float(b_vec.sum())
-            if b_sum > 0:
-                b_n = b_vec / b_sum
-                colsum = P.sum(axis=0, keepdims=True)
-                P_n = P / np.maximum(colsum, 1e-9) # colonne ~somma 1
             else:
-                b_n = b_vec.copy()
-                P_n = P.copy()
+                winners = [unknown_id]
 
-            # NNLS con proiezione su simplex
-            alpha_w = nnls_projected_grad(P_n, b_n, iters=250, lr=None, l1_cap=1.0, tol=1e-6)
-
-            # Metriche di qualità ricostruzione
-            err   = recon_error(P_n, b_n, alpha_w)   # ||b - P w||
-            cover = float((P_n @ alpha_w).sum())     # energia "spiegata"
-            k_active = int(np.sum(alpha_w >= 1e-3))
-            top_idx  = int(np.argmax(alpha_w))
-            top_w    = float(alpha_w[top_idx])
-
-            # Guardie conservative ma non bloccanti
-            good_recon    = (err <= 0.33)
-            good_cover    = (cover >= 0.68)
-            sparse_ok     = (k_active in (1, 2, 3))
-            top_conf_ok   = (top_w >= 0.28)
-
-            if good_recon and good_cover and sparse_ok and top_conf_ok:
-                # selezione candidati con SOGLIA FRAZIONARIA
-                w_sum = float(alpha_w.sum()) + 1e-9
-                frac = 0.14                    # 14% della massa totale
-                cand = np.where(alpha_w >= frac * w_sum)[0].tolist()
-
-                # micro-probe per robustezza solo nei mix
-                if is_mixture_like:
-                    probe_ok, pmr_s, gap_s, z_s = probe_boost_candidates(
-                        cands=cand,
-                        base_rates=_rates_vec[:unknown_id], # vettore rate originali del trial
-                        K=3, dur_ms=120, boost_frac=0.12
-                    )
-
-                # conf_unsup già definita a monte
-                conf_unsup = conf_unsup_score(err, top_w, good_cover)
-                accept = probe_ok and (conf_unsup >= 0.60)
-
-                if accept and len(cand) >= 1:
-                    did_unsup_relabel = True
-                    # ordina i candidati per punteggio osservato in base a cosa potrebbero realmente essere (non per w)
-                    winners = sorted(cand, key=lambda ia: scores[ia], reverse=True)
-                    winners = winners[:max(1, min(k_cap, len(winners)))]  # rispetta k_cap se lo usi
-                    unsup_labels = [taste_map[ia] for ia in winners]
-                    unsup_log = dict(err=float(err), cover=cover, kd=len(cand),
-                                     top_alpha=float(top_w), conf=conf_unsup)
-                
-        # guarded version only when you’re about to refuse as UNKNOWN and the trial is not diffuse:
-        if winners == [unknown_id] and (not is_diffuse):
-            # probe top-3 candidates a little
-            cand_top = np.argsort(scores[:unknown_id])[::-1][:3].tolist()
-            probe_ok, _, _, _ = probe_boost_candidates(
-                cands=cand_top,
-                base_rates=_rates_vec[:unknown_id],
-                K=3, dur_ms=100, boost_frac=0.10
-            )
-            if probe_ok:
-            # accept the top one as tentative known if it is close to its eff threshold
-                if scores[cand_top[0]] >= 0.9 * thr_eff[cand_top[0]]:
-                    winners = [cand_top[0]]
-        
-        # Integra probe_boost_candidates prima di cedere a UNKNOWN:
-        if winners == [unknown_id] and is_mixture_like:
-            # prova sui 4 migliori candidati
-            cand4 = np.argsort(scores[:unknown_id])[::-1][:4].tolist()
-            ok, pmr_series, gap_series, z_series = probe_boost_candidates(cand4, _rates_vec[:unknown_id])
-            if ok:
-                # ricalcola con gli ultimi diff_counts (già aggiornati dentro la probe)
-                # e riapplica la stessa logica di winners
-                # (anche solo: accetta i cand con z>=z_rel_min e scores>=0.85*thr_eff)
-                winners = [idx for idx in cand4 if (z[idx] >= z_rel_min and scores[idx] >= 0.85*thr_eff[idx])]
-                if not winners:
-                    winners = [top_idx] if top_pass_strict else [unknown_id]
-
-        # 5) ultima guardia energetica
-        '''if (scores[top_idx] < min_spikes_for_known_test) or (len(winners) == 0):
-            winners = [unknown_id]'''
-        if (scores[top_idx] < min_spikes_for_known_test) and (len(winners) == 0) and is_diffuse:
-            winners = [unknown_id]
-        elif not winners:
-            winners = [top_idx]
-        
-        # Se non abbiamo (ri)etichettato e la lista è ancora vuota, mantieni fallback
-        if not winners:
-            winners = [unknown_id] if (is_diffuse or not top_pass_strict or z[top_idx] < z_min) else [top_idx]
-        
         # SPICY aversion check after TEST winners
         # is SPICY present in the ground truth or in the winners?
         # If so, trigger the aversion response
