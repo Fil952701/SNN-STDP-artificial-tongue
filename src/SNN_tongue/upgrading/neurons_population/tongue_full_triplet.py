@@ -318,18 +318,17 @@ def decode_by_nnls(
     HHI = float((p**2).sum())
     k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, scores.size))
 
-    # conta coefficienti “significativi”
-    k_abs = int(np.sum(ws >= max(1e-12, thr_rel_base)))
-    k_abs5 = int(np.sum(ws >= max(1e-12, thr_rel_k5)))
-
-    # criteri
-    basic_ok = (err <= 0.40 and cover >= 0.60 and k_abs in (1,2,3,4,5))
-
     # soglie frazionarie: 0.10 base, 0.08 se target quintuple
     ws_sum = float(ws.sum())
     thr_rel_base = frac_thr * ws_sum
     thr_rel_k5   = min(frac_thr, 0.08) * ws_sum
 
+    # conta coefficienti “significativi”
+    k_abs = int(np.sum(ws >= max(1e-12, thr_rel_base)))
+    k_abs5 = int(np.sum(ws >= max(1e-12, thr_rel_k5)))
+
+    # criteria acceptation
+    basic_ok = (err <= 0.40 and cover >= 0.60 and k_abs in (1,2,3,4,5))
 
     k4_ok = False
     if allow_k4 and (k_abs == 4 or (k_est >= 4 and int(np.sum(ws >= thr_rel_base)) >= 4)):
@@ -1563,7 +1562,6 @@ taste_neurons.v[:] = EL
 taste_neurons.s[:] = 0
 taste_neurons.theta[:] = theta_init
 taste_neurons.homeo_on = 1.0 # ON during training
-taste_neurons.theta_bias[:] = 0 * b.mV
 
 # dynamic SPICY states initialization
 sl_spice = taste_slice(spicy_id)
@@ -2862,9 +2860,8 @@ if best_state is not None:
     # 3b) mix in the slow consolidated trace for stability in test
     if USE_SLOW_CONSOLIDATION:
         # mix the just-blended fast with slow; keep a bit of fast detail
-        #S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
-        S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow + BETA_MIX_TEST * S.w[:]
-
+        S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
+    
     # 3c) restore NON-weight state from the best snapshot (thresholds, modulators, traces, etc.)
     tmp_w = S.w[:].copy()
     restore_state_without(best_state)   # restores the rest of the state without overwrite w
@@ -3022,69 +3019,33 @@ taste_neurons.ge[:] = 0 * b.nS
 taste_neurons.gi[:] = 0 * b.nS
 taste_neurons.s[:]  = 0
 taste_neurons.wfast[:] = 0 * b.mV
-S.x[:] = 0; S.xbar[:] = 0
-S.y[:] = 0; S.ybar[:] = 0
+# Intrinsic homeostasis frozen
+taste_neurons.homeo_on = 0.0
+th = taste_neurons.theta[:]
+# to manage Hedonic window
+taste_neurons.taste_drive[:] = 0.0
+taste_neurons.av_over[:]  = 0.0
+taste_neurons.av_under[:] = 0.0
+taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
+S.x[:] = 0
+S.xbar[:] = 0
+S.y[:] = 0
+S.ybar[:] = 0
 S.elig[:] = 0
 S_unk.gain_unk = 0.15
 # NO NORMALIZATION during test
 col_allow_upscale    = False
 col_scale_max        = 1.10
 col_norm_every       = 999999
-# Intrinsic homeostasis frozen
-taste_neurons.homeo_on = 0.0
-th = taste_neurons.theta[:]
 th = th - np.mean(th) # centered
 theta_min, theta_max = -10*b.mV, 10*b.mV
-taste_neurons.theta[:] = np.clip((th/b.mV), float(theta_min/b.mV), float(theta_max/b.mV)) * b.mV
-# deactivate state effect for DA and 5-HT for clean test phase
-taste_neurons.theta_bias[:] = 0 * b.mV
-inhibitory_S.inh_scale = 0.45
-mod.DA_f[:] = 0.0
-mod.DA_t[:] = 0.0
-mod.HT[:] = 0.0
-# to manage Hedonic window
-taste_neurons.taste_drive[:] = 0.0
-taste_neurons.av_over[:]  = 0.0
-taste_neurons.av_under[:] = 0.0
-# cap to avoid "hot" tests
-S.gamma_gdi = max(S.gamma_gdi, 0.40)
-S_noise.gamma_gdi = S.gamma_gdi
-apply_internal_state_bias(profile, mod, taste_neurons)
-
-# "emotive state" in test phase
-if test_emotion_mode == "off":
-    # neutral test
-    mod.DA_f[:] = 0.0
-    mod.DA_t[:] = 0.0
-    mod.HT[:] = 0.0
-    mod.NE[:] = 0.0
-    mod.HI[:] = 0.0
-    #mod.ACH[:] = ach_test_level
-    taste_neurons.theta_bias[:] = 0 * b.mV
-    inhibitory_S.inh_scale = 0.45
-    #S.ex_scale = (1.0 + k_ex_ACH * float(mod.ACH[0]))
-    S.ex_scale = 1.0  # gain reset
-    pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
-else:
-    # test with neuromodulators
-    HT_now = float(mod.HT[0])
-    NE_now = float(mod.NE[0])
-    HI_now = float(mod.HI[0])
-    # thresholds (HT � threshold, HI � threshold)
-    taste_neurons.theta_bias[:] = (k_theta_HT * HT_now + k_theta_HI_test * HI_now) * b.mV
-    # synaptic gain
-    S.ex_scale = (1.0 + k_ex_NE * NE_now) * (1.0 + k_ex_HI_test * HI_now)
-    # WTA (HI push the model to explore better � decrease WTA a bit)
-    _inh = 1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI_test * HI_now
-    inhibitory_S.inh_scale = max(0.3, _inh)
-    # noise (NE decrease, HI increase)
-    ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
-    pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * np.ones(num_tastes) * b.Hz
-
-# to compute more mixtures
-#inhibitory_S.g_step_inh = 0.5 * g_step_inh_local
 inhibitory_S.g_step_inh = g_step_inh_local
 inhibitory_S.delay = 0.5*b.ms
+'''mod.DA_f[:] = 0.0
+mod.DA_t[:] = 0.0
+mod.HT[:] = 0.0'''
+# apply state bias
+apply_internal_state_bias(profile, mod, taste_neurons)
 
 # Set da valutare con la pipeline di TEST:
 snap = snapshot_state() # weights/states saved
@@ -3195,6 +3156,13 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
         ach_noise_scale = max(0.05, 1.0 - k_noise_ACH * ACH_now)
         pg_noise.rates = test_baseline_hz * ne_noise_scale * (1.0 + k_noise_HI_test * HI_now) * ach_noise_scale * np.ones(num_tastes) * b.Hz
+    else:
+        # neutral profile -> no modulators
+        mod.DA_f[:] = mod.DA_t[:] = mod.HT[:] = mod.NE[:] = mod.HI[:] = 0.0
+        inhibitory_S.inh_scale = 0.45
+        S.ex_scale = 1.0
+        pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
+        taste_neurons.theta_bias[:] = 0 * b.mV
 
     if len(true_ids) == 1 and true_ids[0] == unknown_id:
         # OOD/NULL � no normalization
@@ -3207,15 +3175,15 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # initializing the rewarding for GDI
     # divisive gain test-time proporzionale all'energia di input (proxy: somma rates noti)
-    _input_energy = float(np.sum(_rates_vec[:unknown_id]))
+    input_energy = float(np.sum(_rates_vec[:unknown_id]))
     ref_rate = float(BASE_RATE_PER_CLASS)
 
     inp = np.asarray(_rates_vec[:unknown_id], dtype=float)
     pmr_in = (inp.max() / (inp.sum() + 1e-9)) if inp.sum() > 0 else 0.0
 
     cap_base   = 0.45
-    cap_boost  = float(np.interp(pmr_in, [0.25, 0.45], [0.95, 0.60]))     # più diffuso � più cap
-    cap_energy = float(np.interp(_input_energy / (ref_rate + 1e-9), [0.5, 2.0], [cap_base, 0.90]))
+    cap_boost  = float(np.interp(pmr_in, [0.25, 0.45], [0.95, 0.60]))     # più diffuso -> più cap
+    cap_energy = float(np.interp(input_energy / (ref_rate + 1e-9), [0.5, 2.0], [cap_base, 0.90]))
     cap        = min(cap_boost, cap_energy)
 
     gamma_val  = float(np.clip(gamma_gdi_0, 0.08, cap))
@@ -3229,8 +3197,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     S_unk.gain_unk = 0.0
 
     # inject 5-HT for the generic TASTE aversion
-    #drv = np.array(taste_neurons.taste_drive[:unknown_id])
-    #thr = np.array(taste_neurons.thr_hi[:unknown_id])
     known = slice(0, taste_slice(unknown_id).start)
     drv = np.array(taste_neurons.taste_drive[known])
     thr = np.array(taste_neurons.thr_hi[known])
@@ -3246,7 +3212,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # 3) take the winners using per-class thresholds
     # strong decision with OOD and NULL
     scores = population_scores_from_counts(diff_counts) # neurons population management
-    #scores = diff_counts.astype(float)
     scores[unknown_id] = -1e9
     mx = scores.max()
 
@@ -3285,18 +3250,18 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # 1) stimulus on target classes with UNKNOWN inputs
     set_unknown_gate(
         pmr=PMR, gap=gap, H=H,
-        PMR_thr=0.58,           # 0.56–0.62 ok
-        gap_thr=0.14,           # 0.12–0.18 (mai >1.0!)
+        PMR_thr=0.58,           # 0.56–0.62
+        gap_thr=0.14,           # 0.12–0.18
         H_thr=0.80*np.log(n_known)
     )
     # if the top has a high z-score → turn off UNKNOWN even if the other metrics are borderline
     if z[top_idx] >= 0.90:     # 0.88–0.92
         S_unk.gain_unk = 0.0
     # decreasing inhibition in mix-like
-    if   k_est >= 5: inhibitory_S.inh_scale[:] = 0.28
+    '''if   k_est >= 5: inhibitory_S.inh_scale[:] = 0.28
     elif k_est == 4: inhibitory_S.inh_scale[:] = 0.32
     elif k_est == 3: inhibitory_S.inh_scale[:] = 0.36
-    else:            inhibitory_S.inh_scale[:] = 0.50
+    else:            inhibitory_S.inh_scale[:] = 0.50'''
 
     # estensione on-demand della finestra (solo mix-like):
     '''If the trial is is_mixture_like but the co-tastes are a few spikes below your soft-abs,
