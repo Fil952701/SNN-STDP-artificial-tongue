@@ -2815,6 +2815,7 @@ for input_rates, true_ids, label in training_stimuli:
 
         # 3b) Reduce-on-plateau biologico: decresci la plasticità a gradini con cooldown
         if patience >= PLATEAU_WINDOW:
+            did_decay = False
             if cooldown_left > 0:
                 cooldown_left -= 1
             else:
@@ -2825,9 +2826,11 @@ for input_rates, true_ids, label in training_stimuli:
                         set_plasticity_scale(new_scale)
                         decays_done += 1
                         cooldown_left = COOLDOWN   # reset cooldown reale
+                        did_decay = True
                         print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓ (decays={decays_done}/{MAX_PLASTICITY_DECAYS}).\n")
-                    # reset la pazienza dopo l’intervento per misurare i nuovi trend
-                    patience = 0
+            # reset solo se è avvenuto il decay contrassegnato dal flag apposito
+            if did_decay:
+                patience = 0  
 
         # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
@@ -3231,15 +3234,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         if tid != unknown_id:
             tgt[tid] = 1
     all_targets.append(tgt)
-
-
-    # 1) stimulus on target classes with UNKNOWN inputs
-    set_unknown_gate(
-        pmr=PMR, gap=gap, H=H,
-        PMR_thr=0.58,           # 0.56–0.62
-        gap_thr=0.14,           # 0.12–0.18
-        H_thr=0.80*np.log(n_known)
-    )
  
     # estensione on-demand della finestra (solo mix-like):
     '''If the trial is is_mixture_like but the co-tastes are a few spikes below your soft-abs,
@@ -3304,7 +3298,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             H = float(-(p_local * np.log(p_local)).sum())    # entropy (nats)
             HHI = float((p_local**2).sum()) if E_local > 0 else 1.0
             k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, n_noti))
-    
+
     # intervalli stretti mantengono l'open-set. Sono centrati sui dati attuali
     k_active = int(np.sum(scores[:unknown_id] >= min_spikes_for_known_test))
     n_strong = np.sum(scores[:unknown_id] >= min_spikes_for_known_test)
@@ -3335,6 +3329,13 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     inhibitory_S.inh_scale[:] = float(np.clip(inh, 0.30, 1.40))
 
     # 7) Gating UNKNOWN “forte”: se il top ha z alto, spegni UNKNOWN (dopo eventuale estensione)
+    # stimulus on target classes with UNKNOWN inputs
+    set_unknown_gate(
+        pmr=PMR, gap=gap, H=H,
+        PMR_thr=0.58,           # 0.56–0.62
+        gap_thr=0.14,           # 0.12–0.18
+        H_thr=0.80*np.log(n_known)
+    )
     if z[top_idx] >= 0.90:
         S_unk.gain_unk = 0.0
 
@@ -3355,7 +3356,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # expected cop value
     cop_expect_test = np.maximum(ema_cop_m1 * float(test_duration / training_duration), 1.0)
 
-
     # mixture_shortcut -> solo se mix-like e NON diffuso 
     mixture_shortcut = [] 
     if is_mixture_like and (not is_diffuse): 
@@ -3370,7 +3370,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 if (k_active >= 3) and (PMR < max(0.65, 1.05*PMR_thr)): 
                     is_diffuse = True
 
-    # NNLS Unsupervised Learning - Labelling Discovery
+    # NNLS Unsupervised Learning - Labeling Discovery
     did_unsup_relabel = False
     unsup_labels = []
     unsup_log = None
