@@ -2260,12 +2260,12 @@ for input_rates, true_ids, label in training_stimuli:
     # OOD/NULL hard-negative mining on-the-fly
     #E = float(np.sum(diff_counts[:unknown_id]))
     #pmr = (float(diff_counts[:unknown_id].max()) / (E + 1e-9)) if E>0 else 0.0
-    E = float(np.sum(dc_pop[:unknown_id]))
-    pmr = (float(dc_pop[:unknown_id].max()) / (E + 1e-9)) if E>0 else 0.0
+    E_pop = float(np.sum(dc_pop[:unknown_id]))
+    pmr_pop = (float(dc_pop[:unknown_id].max()) / (E_pop + 1e-9)) if E_pop>0 else 0.0
 
     ######### REWARDING PHASE #########
     # trial diffuso/ambiguo => usa gate negativo più severo
-    is_diffuse_train = (pmr < 0.45)
+    is_diffuse_train = (pmr_pop < 0.45)
     if is_diffuse_train:
         j_all = np.asarray(S.j[:], int)
         for q in range(unknown_id):
@@ -2420,21 +2420,21 @@ for input_rates, true_ids, label in training_stimuli:
                 w_all[mask_col] -= beta_offdiag * 0.12 * min(2.0, excess) * w_all[mask_col]
        S.w[:] = np.clip(w_all, 0.0, 1.0)
 
-       # bisogno per classe: TP sotto soglia sui veri; FP sopra soglia sui falsi
-       need = np.zeros(unknown_id, dtype=float)
-       for ta in range(unknown_id):
-            if ta in true_ids:
-                need[ta] = max(0.0, float(tp_gate[ta]) - float(dc_pop[ta]))
-            else:
-                need[ta] = max(0.0, float(scores[ta]) - float(fp_gate[ta]))
+    # bisogno per classe: TP sotto soglia sui veri; FP sopra soglia sui falsi
+    need = np.zeros(unknown_id, dtype=float)
+    for ta in range(unknown_id):
+        if ta in true_ids:
+            need[ta] = max(0.0, float(tp_gate[ta]) - float(dc_pop[ta]))
+        else:
+            need[ta] = max(0.0, float(scores[ta]) - float(fp_gate[ta]))
 
-       # normalizza il need per stabilità
-       m = float(np.mean(need) + 1e-9)
-       need_norm = need / m
+    # normalizza il need per stabilità
+    m = float(np.mean(need) + 1e-9)
+    need_norm = need / m
 
-       # aggiorna il vettore boost (EMA) e clampa
-       CLASS_BOOST[:] = (1.0 - BOOST_LAM) * CLASS_BOOST + BOOST_LAM * (1.0 + BOOST_GAIN * need_norm)
-       CLASS_BOOST[:] = np.clip(CLASS_BOOST, BOOST_CAP[0], BOOST_CAP[1])
+    # aggiorna il vettore boost (EMA) e clampa
+    CLASS_BOOST[:] = (1.0 - BOOST_LAM) * CLASS_BOOST + BOOST_LAM * (1.0 + BOOST_GAIN * need_norm)
+    CLASS_BOOST[:] = np.clip(CLASS_BOOST, BOOST_CAP[0], BOOST_CAP[1])
 
     # selecting all the spiking winning neurons >= threshold_ratio
     sorted_idx = np.argsort(scores)[::-1]
@@ -2494,10 +2494,10 @@ for input_rates, true_ids, label in training_stimuli:
     # ANALYSIS of the scores distribution to detect mix-like patterns
     # prima di applicare i rinforzi, analizza il pattern di punteggi
     # stai per decidere i winner e dare rinforzi. Allentare WTA/GDI prima del rinforzo permette a più classi vere di sparare insieme nei mix (e poi ricevere reward).
-    E = float(np.sum(scores[:unknown_id]))
-    top = float(np.max(scores[:unknown_id])) if E > 0 else 0.0
-    PMR = top / (E + 1e-9) if E > 0 else 0.0
-    p = scores[:unknown_id] / (E + 1e-9) if E > 0 else np.zeros(unknown_id)
+    E_scores = float(np.sum(scores[:unknown_id]))
+    top = float(np.max(scores[:unknown_id])) if E_scores > 0 else 0.0
+    PMR = top / (E_scores + 1e-9) if E_scores > 0 else 0.0
+    p = scores[:unknown_id] / (E_scores + 1e-9) if E_scores > 0 else np.zeros(unknown_id)
     p = np.clip(p, 1e-12, 1.0); p /= p.sum()
     H = float(-(p*np.log(p)).sum())
 
@@ -2821,8 +2821,9 @@ for input_rates, true_ids, label in training_stimuli:
             else:
                 # Applica un solo decay e avvia cooldown
                 if decays_done < MAX_PLASTICITY_DECAYS:
+                    current_state = float(np.mean(S.stdp_on[:])) # stato di decay attuale
                     new_scale = max(PLAST_GLOBAL_FLOOR, PLAST_GLOBAL * REDUCE_FACTOR)
-                    if new_scale < PLAST_GLOBAL:  # evita no-op
+                    if new_scale < current_state:  # evita no-op
                         set_plasticity_scale(new_scale)
                         decays_done += 1
                         cooldown_left = COOLDOWN   # reset cooldown reale
