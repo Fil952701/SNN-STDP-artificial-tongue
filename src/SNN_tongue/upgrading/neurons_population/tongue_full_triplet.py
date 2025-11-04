@@ -3457,7 +3457,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         ]
         winners = list(strict_winners)
 
-         # C) Mixture shortcut (solo top forte e NON diffuso)
+        # C) Mixture shortcut (solo top forte e NON diffuso)
         top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
         if top_known and (not is_diffuse) and mixture_shortcut:
             add = [c for c in mixture_shortcut if c != top_idx and c not in winners]
@@ -3465,7 +3465,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 add.sort(key=lambda ia: scores[ia], reverse=True)
                 add = add[:max(0, k_cap - 1)]
                 # guardrail energetico
-                if scores[add].sum() >= 0.20 * E:
+                if scores[add].sum() >= 0.20 * E_local:
                     winners.extend(add)
         
         # D) Negative rel gate
@@ -3529,32 +3529,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             else:
                 winners = [unknown_id]
 
-        # SPICY aversion check after TEST winners
-        # is SPICY present in the ground truth or in the winners?
-        # If so, trigger the aversion response
-        is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
-
-        if is_spicy_present: # trigger spicy aversion
-            happened, p_now = spicy_aversion_triggered( # returns bool, p_now
-                taste_neurons, mod, spicy_id,
-                p_base=p_aversion_base,
-                slope=p_aversion_slope,
-                cap=p_aversion_cap,
-                trait=profile['spicy_aversion_trait'],
-                k_hun=profile['k_hun_spice'],
-                k_h2o=profile['k_h2o_spice']
-            )
-            # apply spicy aversion effects
-            if happened:
-                mod.HT[:]  += ht_pulse_aversion
-                mod.DA_f[:] *= da_penalty_avers
-                mod.DA_t[:] *= da_penalty_avers
-                sl = taste_slice(spicy_id)
-                taste_neurons.thr_spice[sl] = taste_neurons.thr_spice[sl] + thr_spice_kick
-                if verbose_rewards:
-                    print(f"[SPICY-AVERSION] p={p_now:.2f} → HT+{ht_pulse_aversion}, DA×{da_penalty_avers}, thr_spice+={thr_spice_kick:.3f}")
-
-        # NNLS Unsupervised Learning - Labeling Discovery
+        # NNLS Unsupervised Learning - Labeling Discovery if are still UNKNOWN winners
         did_unsup_relabel = False
         unsup_labels = []
         unsup_log = None
@@ -3564,8 +3539,12 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
             PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
         )
-        # Gestione NNLS dell'Unsupervised Learning
-        should_try_nnls = ((winners == []) or (winners == [unknown_id])) #and (not is_diffuse)
+        # Gestione NNLS dell'Unsupervised Learning con anche top-only pulito
+        should_try_nnls = (
+            (winners == []) or
+            (winners == [unknown_id]) or
+            (winners == [top_idx] and is_mixture_like and top_pass_strict)
+        )
         if should_try_nnls:
             # NNLS decoding before saying: "UNKNOWN" a priori
             abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
@@ -3633,6 +3612,31 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             results.append((label, expected, predicted, hit, ""))
             net.run(recovery_between_trials)
             continue
+
+        # SPICY aversion check after TEST winners
+        # is SPICY present in the ground truth or in the winners?
+        # If so, trigger the aversion response
+        is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
+
+        if is_spicy_present: # trigger spicy aversion
+            happened, p_now = spicy_aversion_triggered( # returns bool, p_now
+                taste_neurons, mod, spicy_id,
+                p_base=p_aversion_base,
+                slope=p_aversion_slope,
+                cap=p_aversion_cap,
+                trait=profile['spicy_aversion_trait'],
+                k_hun=profile['k_hun_spice'],
+                k_h2o=profile['k_h2o_spice']
+            )
+            # apply spicy aversion effects
+            if happened:
+                mod.HT[:]  += ht_pulse_aversion
+                mod.DA_f[:] *= da_penalty_avers
+                mod.DA_t[:] *= da_penalty_avers
+                sl = taste_slice(spicy_id)
+                taste_neurons.thr_spice[sl] = taste_neurons.thr_spice[sl] + thr_spice_kick
+                if verbose_rewards:
+                    print(f"[SPICY-AVERSION] p={p_now:.2f} → HT+{ht_pulse_aversion}, DA×{da_penalty_avers}, thr_spice+={thr_spice_kick:.3f}")
 
         # debug prints
         print(f"\n[DBG] decision: PMR={PMR:.3f} H={H:.3f} gap={gap:.3f} top={taste_map[top_idx]} "
