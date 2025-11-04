@@ -2774,7 +2774,7 @@ for input_rates, true_ids, label in training_stimuli:
     taste_neurons.thr_hi[:] = hi
     
     # EARLY STOPPING tracking & bio-like stagnation plateau handling to avoid overfitting and optimize training duration
-    if ema_perf > best_score + IMPROVE_EPS:
+    if ema_perf > (best_score + IMPROVE_EPS):
         best_step  = step
         best_score = float(ema_perf)
         best_state = snapshot_state()             # snapshot completo (pesate + stati)
@@ -2785,44 +2785,45 @@ for input_rates, true_ids, label in training_stimuli:
         decays_done = 0          # nuovo ciclo “explore”: azzero i decay conteggiati
         cooldown_left = 0
 
-        # riapri un po’ la plasticità (senza saltare a 1 di colpo)
+        # re-opening plasticity in a slower way
         if 'stdp_on' in S.variables:
             curs = float(np.mean(S.stdp_on[:]))
             target_s = 1.0
             set_plasticity_scale(0.50 * curs + 0.50 * target_s)
 
-        print(f"NEW BEST ema_perf: {best_score:.4f} at step {best_step}\n")
+        print(f"NEW BEST ema_perf: {best_score:.4f} at step {best_step} (+>{IMPROVE_EPS:.4f} increment)\n")
 
     else:
-        # nessun miglioramento “significativo”
+        # no best improvement
         patience += 1
 
         # 3a) soft-pull verso il best durante plateau prolungato (bio consolidamento)
-        if USE_SOFT_PULL and (best_state is not None) and (patience >= max(3, PATIENCE_LIMIT // 3)):
+        if USE_SOFT_PULL and patience >= max(W_EMA, PLATEAU_WINDOW) and best_state is not None:
             soft_pull_toward_best(best_state, rho=RHO_PULL)
 
         # 3b) Reduce-on-plateau biologico: decresci la plasticità a gradini con cooldown
-        if patience >= PLATEAU_WINDOW and cooldown_left == 0 and decays_done < MAX_PLASTICITY_DECAYS:
-            if 'stdp_on' in S.variables:
-                curs = float(np.mean(S.stdp_on[:]))
-                set_plasticity_scale(PLASTICITY_DECAY * curs)  # es. 0.90 * current
-                decays_done += 1
-                cooldown_left = COOLDOWN
-                print(f"[ReduceLROnPlateau] at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f}\n")
-
-        # cooldown scorre e impedisce di ridurre il plateau in modo troppo ravvicinato
-        if cooldown_left > 0:
-            cooldown_left -= 1
+        if patience >= PLATEAU_WINDOW:
+            if cooldown_left > 0:
+                cooldown_left -= 1
+            else:
+                # Applica un solo decay e avvia cooldown
+                if decays_done < MAX_PLASTICITY_DECAYS:
+                    new_scale = max(PLAST_GLOBAL_FLOOR, PLAST_GLOBAL * REDUCE_FACTOR)
+                    if new_scale < PLAST_GLOBAL:  # evita no-op
+                        set_plasticity_scale(new_scale)
+                        decays_done += 1
+                        cooldown_left = COOLDOWN   # reset cooldown reale
+                        print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓\n")
+               # reset la pazienza dopo l’intervento per misurare i nuovi trend
+                patience = 0
 
         # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
-            print(f"\n[EARLY STOPPING] no improvement for {PATIENCE_LIMIT} trials "
+            print(f"\n[EARLY STOPPING] no plasticity best improvement for {PATIENCE_LIMIT} consecutive trials "
                 f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
     # with many strong FP, increase 5-HT -> future caution in the next trial
-    #has_strong_fp = any((idx not in true_ids) and (float(diff_counts[idx]) >= fp_gate[idx])
-                    #for idx in range(num_tastes-1))
     has_strong_fp = any(
             (idx not in true_ids) and (float(scores[idx]) >= fp_gate[idx])
             for idx in range(num_tastes-1)
@@ -2861,16 +2862,17 @@ if best_state is not None:
     # 3b) mix in the slow consolidated trace for stability in test
     if USE_SLOW_CONSOLIDATION:
         # mix the just-blended fast with slow; keep a bit of fast detail
-        S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
+        #S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
+        S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow + BETA_MIX_TEST * S.w[:]
 
     # 3c) restore NON-weight state from the best snapshot (thresholds, modulators, traces, etc.)
     tmp_w = S.w[:].copy()
     restore_state_without(best_state)   # restores the rest of the state without overwrite w
     S.w[:] = tmp_w              # re-apply our blended weights
     # final print logs
-    print(f"[BEST-CHECKPOINT] Restored bio-mixed state (ema_perf={best_score:.3f} @ step {best_step}).")
+    print(f"\n[BEST-CHECKPOINT] Restored bio-mixed state (ema_perf={best_score:.3f} @ step {best_step}).")
 else:
-    print("[BEST-CHECKPOINT] No best snapshot captured; proceeding with current state.")
+    print("\n[BEST-CHECKPOINT] No best snapshot captured; proceeding with current state.")
 
 # clean the bar
 pbar_done()
