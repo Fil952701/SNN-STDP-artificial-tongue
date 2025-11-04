@@ -497,7 +497,7 @@ def log_population_stats(counts, step=None, label=""):
         mask = np.isin(js, np.arange(sl.start, sl.stop))
         mw = float(np.nanmean(ws[mask])) if np.any(mask) else float('nan')
         mean_w.append(mw)
-    h = f"[Step {step}] " if step is not None else ""
+    h = f"[Trial {step}] " if step is not None else ""
     print(f"{h}{label} | scores={np.round(scores, 2).tolist()} | mean_w={[None if not np.isfinite(xd) else round(xd,4) for xd in mean_w]}")
 
 # print population stats
@@ -2814,12 +2814,12 @@ for input_rates, true_ids, label in training_stimuli:
                         decays_done += 1
                         cooldown_left = COOLDOWN   # reset cooldown reale
                         print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓ (decays={decays_done}/{MAX_PLASTICITY_DECAYS}).\n")
-               # reset la pazienza dopo l’intervento per misurare i nuovi trend
-                patience = 0
+                    # reset la pazienza dopo l’intervento per misurare i nuovi trend
+                    patience = 0
 
         # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
-            print(f"\n[EARLY STOPPING] no plasticity best improvement for {PATIENCE_LIMIT} consecutive trials "
+            print(f"\n[EARLY STOPPING] No plasticity best improvement for {PATIENCE_LIMIT} consecutive trials "
                 f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
