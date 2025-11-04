@@ -2813,7 +2813,7 @@ for input_rates, true_ids, label in training_stimuli:
                         set_plasticity_scale(new_scale)
                         decays_done += 1
                         cooldown_left = COOLDOWN   # reset cooldown reale
-                        print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓\n")
+                        print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓ (decays={decays_done}/{MAX_PLASTICITY_DECAYS}).\n")
                # reset la pazienza dopo l’intervento per misurare i nuovi trend
                 patience = 0
 
