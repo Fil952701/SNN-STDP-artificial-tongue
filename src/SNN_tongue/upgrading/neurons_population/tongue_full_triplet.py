@@ -469,7 +469,7 @@ def set_unknown_gate(pmr, gap, H, PMR_thr, gap_thr, H_thr):
     - entropia alta (>= H_thr)
     """
     triggers = ((pmr <= PMR_thr) and (gap <= gap_thr) and (H >= H_thr))
-    S_unk.gain_unk = 1.0 if triggers else 0.0
+    S_unk.gain_unk = 1.0 if triggers >= 2 else 0.0
 
 # collapse all the population to its relevant taste to reward it
 def population_scores_from_counts(counts):
@@ -1269,11 +1269,19 @@ def write_shared_scalar(S, name: str, value: float):
 
 # OOD/NULL calibration: increase threshold on OOD queues
 def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None):
-    saved_stdp = float(S.stdp_on[0]) # saved current plasticity state
-    S.stdp_on[:] = 0.0
-    saved_noise = pg_noise.rates # the same with noise
-    pg_noise.rates = 0 * b.Hz
+    #saved_stdp = float(S.stdp_on[0]) # saved current plasticity state
+    #S.stdp_on[:] = 0.0
+
     saved_gamma = read_shared_scalar(S, 'gamma_gdi')
+    def read_stdp_on():
+        try:
+            return float(S.stdp_on[0])
+        except Exception:
+            return float(S.stdp_on)  # scalar fallback
+    saved_stdp = read_stdp_on()
+    S.stdp_on[:] = 0.0
+    saved_noise = (pg_noise.rates * 1.0).copy() # the same with noise
+    pg_noise.rates = 0 * b.Hz
 
     # list of lists to collect all negative spikes for each class
     tmp_spikes = [[] for _ in range(num_tastes-1)] 
@@ -1285,6 +1293,11 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
         prev = spike_mon.count[:].copy() # saving previous trial spikes
         net.run(dur) # starting simulation
         diff = (spike_mon.count[:] - prev).astype(float) # misuring current spikes with substract previous to current ones
+        # evita quantili su array vuoti / degenerate
+        if not np.any(diff):
+            pmr_list.append(0.0)
+            h_list.append(np.log(num_tastes-1))
+            gap_list.append(0.0)
         diff_pop = population_scores_from_counts(diff) # population management
         # storing per-class
         for idx in range(num_tastes-1):
@@ -1305,6 +1318,10 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
         pmr_list.append(pmr)
         h_list.append(h)
         gap_list.append(gap_rel)
+
+    # safeguard for small samples
+    def _q(x, q, default=0.0):
+        return float(np.quantile(x, q)) if len(x) else default
 
     # NULL
     for _ in range(n_null):
@@ -1328,11 +1345,8 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
     if thr_vec is not None:
         for idx in range(num_tastes-1):
             if tmp_spikes[idx]:
-                neg_q = 0.9995 if idx not in (3,6) else 0.997
-                thr_vec[idx] = max(
-                    float(thr_vec[idx]),
-                    float(np.quantile(tmp_spikes[idx], neg_q))
-                )
+                neg_q = 0.9995 if idx not in (3, 6) else 0.997
+                thr_vec[idx] = max(float(thr_vec[idx]), _q(tmp_spikes[idx], neg_q, 0.0))
 
     # open-set data-driven thresholds
     # (=> if during the test PMR/H/gap are inside the "negative typical part", refusing)
@@ -1340,9 +1354,9 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
     H_thr_auto   = float(np.quantile(h_list,  0.90))  # entropia deve essere davvero alta
     gap_thr_auto = float(np.quantile(gap_list, 0.20))  # gap molto basso per trigger
     # failsafe
-    PMR_thr_auto *= 0.7
-    H_thr_auto    = max(H_thr_auto, 1.5)  # alza il requisito di entropia
-    gap_thr_auto *= 0.8
+    PMR_thr_auto = 0.7 * _q(pmr_list, 0.80, 0.0)
+    H_thr_auto   = max(_q(h_list,  0.90, np.log(num_tastes-1)), 1.5)
+    gap_thr_auto = 0.8 * _q(gap_list, 0.20, 0.0)
 
     # restore states after OOD
     if saved_gamma is not None:
@@ -3138,7 +3152,7 @@ all_targets = []
 # hyperparameters
 sep_min    = max(0.12, 0.25 / np.sqrt(n_noti))
 abs_margin_test = 0.0 # to avoid margin during test
-for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
+for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # reset GDI
     if gdi_reset_each_trial:
         gdi_pool.x[:] = 0.0
@@ -3188,25 +3202,25 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # neutral profile -> no modulators
         mod.DA_f[:] = mod.DA_t[:] = mod.HT[:] = mod.NE[:] = mod.HI[:] = 0.0
         inhibitory_S.inh_scale = 0.45
-        S.ex_scale = 1.0
+        S.ex_scale = 1.10
         pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
         taste_neurons.theta_bias[:] = 0 * b.mV
 
     if len(true_ids) == 1 and true_ids[0] == unknown_id:
         # OOD/NULL � no normalization
-        set_test_stimulus(_rates_vec)
+        set_test_stimulus(rates_vec)
     else:
         if USE_GDI:
-            set_test_stimulus(_rates_vec)
+            set_test_stimulus(rates_vec)
         else:
-            set_stimulus_vect_norm(_rates_vec, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
+            set_stimulus_vect_norm(rates_vec, total_rate=BASE_RATE_PER_CLASS * len(true_ids), include_unknown=False)
 
     # initializing the rewarding for GDI
     # divisive gain test-time proporzionale all'energia di input (proxy: somma rates noti)
-    input_energy = float(np.sum(_rates_vec[:unknown_id]))
+    input_energy = float(np.sum(rates_vec[:unknown_id]))
     ref_rate = float(BASE_RATE_PER_CLASS)
 
-    inp = np.asarray(_rates_vec[:unknown_id], dtype=float)
+    inp = np.asarray(rates_vec[:unknown_id], dtype=float)
     pmr_in = (inp.max() / (inp.sum() + 1e-9)) if inp.sum() > 0 else 0.0
 
     cap_base   = 0.45
@@ -3215,6 +3229,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     cap        = min(cap_boost, cap_energy)
 
     gamma_val  = float(np.clip(gamma_gdi_0, 0.08, cap))
+    gamma_val  = min(gamma_val, 0.18) 
     S.gamma_gdi = gamma_val
     S_noise.gamma_gdi = gamma_val
     # 2) spikes counting during trials
@@ -3538,12 +3553,11 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 winners = [top_idx] + rest[:max(0, k_cap-1)]
 
         # F) Fallback se ancora vuoto
-        if not winners:
-            if (not is_diffuse) and top_pass_strict and (z[top_idx] >= z_min_guards):
-                winners = [top_idx]
-            else:
-                winners = [unknown_id]
-
+        if (scores[top_idx] < min_spikes_for_known_test) and (len(winners) == 0) and is_diffuse:
+            winners = [unknown_id]
+        elif not winners:
+            winners = [top_idx]
+            
         # NNLS Unsupervised Learning - Labeling Discovery if are still UNKNOWN winners
         did_unsup_relabel = False
         unsup_labels = []
