@@ -3235,18 +3235,40 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             tgt[tid] = 1
     all_targets.append(tgt)
  
-    # estensione on-demand della finestra (solo mix-like):
+    # estensione on-demand della finestra:
     '''If the trial is is_mixture_like but the co-tastes are a few spikes below your soft-abs,
     extend the test window by +50…80 ms for that trial only and recount. 
     This way, you can take advantage of the extra latency to bring out the co-tastes, 
     without affecting the overall OOD calibration.'''
+    sorted_idx = np.argsort(scores)[::-1]
+    top_idx = int(sorted_idx[0])
+    top = float(scores[top_idx])
+    second = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
+    sep = (top - second) / (top + 1e-9)  # relative separation
+    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
+
+    # Entropy distribution
+    E_local    = float(np.sum(scores[:unknown_id]))
+    p_local    = scores[:unknown_id].astype(float)
+    p_local    = p_local / (E_local + 1e-12)
+    if E_local > 0:
+        p_local /= E_local
+    else:
+        p_local[:] = 0.0
+    H          = float(-(p_local * np.log(p_local + 1e-12)).sum())
+    PMR        = top / (E_local + 1e-9)
+    gap        = sep
+    z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
+
+    # GABA little decay
+    if (E >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
+        mod.GABA[:] += 0.3 * gaba_pulse_stabilize
+
+    # decide mix-like con questi valori "base"
     mix_pmr_lo, mix_pmr_hi = 0.26, 0.72
     mix_H_lo,   mix_H_hi   = 0.50, 1.85
-    #is_mixture_like = (PMR >= mix_pmr_lo and PMR <= mix_pmr_hi) and (H >= mix_H_lo and H <= mix_H_hi)
     is_mixture_like = (mix_pmr_lo <= PMR <= mix_pmr_hi) and (mix_H_lo <= H <= mix_H_hi)
     did_extend = False
-    #pos_expect_test = np.clip(ema_pos_m1, 0.2, None) 
-    pos_expect_test = np.maximum(ema_pos_m1 * float(test_duration / training_duration), 1e-6)
 
     # se è mix
     if is_mixture_like:
@@ -3271,34 +3293,23 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             scores = add_extra_scores(scores, diff_extra, unknown_id, reduce="sum") # scores updated with population
             did_extend = True
 
+            # eventuale estensione e ricalcolo (solo se mix-like in caso borderline)
             sorted_idx = np.argsort(scores)[::-1]
-            top_idx = int(sorted_idx[0])
-            top = float(scores[top_idx])
-            second = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
-            sep = (top - second) / (top + 1e-9)  # relative separation
+            top_idx    = int(sorted_idx[0])
+            top        = float(scores[top_idx])
+            second     = float(scores[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
+            sep        = (top - second) / (top + 1e-9)
 
-            # scaled z-score during test
-            z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
-
-            E = float(np.sum(scores[:unknown_id]))
-            PMR = top / (E + 1e-9)                         # peso del top rispetto all'energia totale
-            gap = (top - second) / (top + 1e-9)            # separazione relativa top-second
-    
-            # GABA little decay
-            if (E >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
-                mod.GABA[:] += 0.3 * gaba_pulse_stabilize
-            
-            # Entropy distribution
-            p_local = scores[:unknown_id].astype(float)
-            E_local = float(p.sum())
-            if E_local > 0:
-                p_local /= E_local
+            E   = float(np.sum(scores[:unknown_id]))
+            p   = scores[:unknown_id].astype(float)
+            if E > 0:
+                p /= E
             else:
-                p_local[:] = 0.0
-            H = float(-(p_local * np.log(p_local)).sum())    # entropy (nats)
-            HHI = float((p_local**2).sum()) if E_local > 0 else 1.0
-            k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, n_noti))
-
+                p[:] = 0.0
+            H   = float(-(p*np.log(p + 1e-12)).sum())
+            PMR = top / (E + 1e-9)
+            gap = sep
+        
     # intervalli stretti mantengono l'open-set. Sono centrati sui dati attuali
     k_active = int(np.sum(scores[:unknown_id] >= min_spikes_for_known_test))
     n_strong = np.sum(scores[:unknown_id] >= min_spikes_for_known_test)
@@ -3334,7 +3345,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         pmr=PMR, gap=gap, H=H,
         PMR_thr=0.58,           # 0.56–0.62
         gap_thr=0.14,           # 0.12–0.18
-        H_thr=0.80*np.log(n_known)
+        H_thr=0.80*np.log(unknown_id)
     )
     if z[top_idx] >= 0.90:
         S_unk.gain_unk = 0.0
@@ -3371,6 +3382,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                     is_diffuse = True
 
     # NNLS Unsupervised Learning - Labeling Discovery
+    winners = []
     did_unsup_relabel = False
     unsup_labels = []
     unsup_log = None
@@ -3507,13 +3519,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             winners = [unknown_id]
 
     # 7) Stima locale di k_est (da HHI), poi k_cap
-    p_norm_local = scores[:unknown_id].astype(float)
-    E_local = float(p_norm_local.sum())
-    if E_local > 0:
-        p_norm_local /= E_local
-    else:
-        p_norm_local[:] = 0.0
-    HHI = float((p_norm_local**2).sum()) if E_local > 0 else 1.0
+    HHI = float((p_local**2).sum()) if E_local > 0 else 1.0
     k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, unknown_id))
 
     k_cap_base = int(np.clip(k_est, 2, n_noti))
