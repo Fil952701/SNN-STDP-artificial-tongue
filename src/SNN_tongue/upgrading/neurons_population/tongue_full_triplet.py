@@ -3227,6 +3227,8 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     scores = population_scores_from_counts(diff_counts) # neurons population management
     scores[unknown_id] = -1e9
     mx = scores.max()
+    # base: soglia di rifiuto per-classe
+    fp_gate_test = thr_per_class_test[:unknown_id].astype(float)  
 
     all_scores.append(scores[:unknown_id].astype(float))
     tgt = np.zeros(num_tastes-1, dtype=int)
@@ -3250,7 +3252,6 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # Entropy distribution
     E_local    = float(np.sum(scores[:unknown_id]))
     p_local    = scores[:unknown_id].astype(float)
-    p_local    = p_local / (E_local + 1e-12)
     if E_local > 0:
         p_local /= E_local
     else:
@@ -3261,7 +3262,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     z = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
 
     # GABA little decay
-    if (E >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
+    if (E_local >= 3.0*min_spikes_for_known_test) and (gap < 0.14):
         mod.GABA[:] += 0.3 * gaba_pulse_stabilize
 
     # decide mix-like con questi valori "base"
@@ -3369,99 +3370,17 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # mixture_shortcut -> solo se mix-like e NON diffuso 
     mixture_shortcut = [] 
+    z_min_guards = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20  
     if is_mixture_like and (not is_diffuse): 
         # soglia assoluta morbida proporzionale all'atteso positivo 
         soft_abs = np.maximum(mix_abs_pos_frac * np.maximum(pos_expect_test, 1.0), 
                           float(min_spikes_for_known_test)) # guardia relativa al top per evitare code spurie 
         rel_guard = norm_rel_ratio_test * top 
         for idx in range(unknown_id): 
-            if (scores[idx] >= max(soft_abs[idx], rel_guard)) and (z[idx] >= max(0.18, z_rel_min)): 
+            if (scores[idx] >= max(soft_abs[idx], rel_guard)) and (z[idx] >= max(0.18, z_rel_min)):
                 mixture_shortcut.append(idx) 
-                z_min = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20 
                 if (k_active >= 3) and (PMR < max(0.65, 1.05*PMR_thr)): 
                     is_diffuse = True
-
-    # NNLS Unsupervised Learning - Labeling Discovery
-    winners = []
-    did_unsup_relabel = False
-    unsup_labels = []
-    unsup_log = None
-    # criteri per consentire quintuple:
-    may_allow_k5 = (
-        is_mixture_like and
-        (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
-        PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
-    )
-
-    # Gestione NNLS dell'Unsupervised Learning
-    should_try_nnls = ((winners == []) or (winners == [unknown_id])) #and (not is_diffuse)
-    if should_try_nnls:
-        # NNLS decoding before saying: "UNKNOWN" a priori
-        abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
-            0.22*pos_expect_test,
-            0.18*cop_expect_test
-        )
-        cand_nnls, info_nnls = decode_by_nnls(
-            scores=scores[:unknown_id],
-            P_pos=P_pos, P_cop=P_cop,
-            is_mixture_like=is_mixture_like,
-            z_scores=z[:unknown_id],
-            frac_thr=0.10,                     # 0.12–0.15
-            z_min_guard=max(0.01, z_rel_min),
-            allow_k4=True,
-            allow_k5=may_allow_k5,
-            gap=gap, gap_thr=gap_thr,
-            pmr=PMR, pmr_thr=PMR_thr,
-            abs_floor=abs_floor_vec,        
-            nnls_iters=250, nnls_lr=None, l1_cap=1.0
-        )
-
-        if cand_nnls:
-            # ordina preferendo score reale, poi peso NNLS
-            w_nnls = info_nnls.get("w", None)
-            if w_nnls is not None:
-                cand_nnls = sorted(cand_nnls, key=lambda isa: (scores[isa], w_nnls[isa]), reverse=True)
-            else:
-                cand_nnls = sorted(cand_nnls, key=lambda isa: scores[isa], reverse=True)
-
-            # cap finale: permetti fino a 5 solo se consentito globalmente
-            allow_k5_globally = True  # to allow 5-mix
-            k_cap_eff = min(k_cap, 5 if (allow_k5_globally and may_allow_k5) else 4)
-            winners = cand_nnls[:k_cap_eff]
-
-            did_unsup_relabel = True
-            unsup_labels = [taste_map[isa] for isa in winners]
-            unsup_log = dict(
-                stage="nnls",
-                err=float(info_nnls["err"]),
-                cover=float(info_nnls["cover"]),
-                k_abs=int(info_nnls["k_abs"]),
-                k_est=int(info_nnls["k_est"]),
-                thr_rel=float(info_nnls["thr_rel"])
-            )
-
-    # veto rapido su molti attivi diffusi senza considerare falsi allarmi
-    nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
-    too_many_active_diffuse = (
-        # blocca solo se > 5
-        (k_active > 5) and
-        # e la distribuzione non giustifica mix complessi
-        ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr)) and
-        # e non abbiamo un segnale affidabile di quintupla
-        (not may_allow_k5) and
-        # e NNLS non ha già “validato” (>=5) in modo controllato
-        (nnls_k < 5)
-    )
-    if too_many_active_diffuse:
-        winners = [unknown_id]
-        # passa direttamente alla chiusura del trial:
-        expected  = [taste_map[idxs] for idxs in true_ids]
-        predicted = [taste_map[wx] for wx in winners]
-        hit = set(winners) == set(true_ids)
-        print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
-        results.append((label, expected, predicted, hit, ""))
-        net.run(recovery_between_trials)
-        continue
 
     # pulizia del trial: blending factor 0..1 (0 = tutto su EMA+, 1 = tutto su soglia dura)
     # aumentiamo il blending (=> soglia più dura) se il trial è più ambiguo/diffuso
@@ -3505,7 +3424,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # data-driven thresholds
     top_pass_strict = (
         (scores[top_idx] >= 0.95 * thr_per_class_test[top_idx]) and
-        (z[top_idx]     >= z_min) and
+        (z[top_idx]     >= z_min_guards) and
         (gap            >= 0.95 * gap_thr)
     )
 
@@ -3534,7 +3453,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         # B) candidati "stretti": soglia assoluta vera + z
         strict_winners = [
             idx for idx in range(unknown_id)
-            if (scores[idx] >= (thr_eff[idx] + abs_margin_test)) and (z[idx] >= z_min)
+            if (scores[idx] >= (thr_eff[idx] + abs_margin_test)) and (z[idx] >= z_min_guards)
         ]
         winners = list(strict_winners)
 
@@ -3556,7 +3475,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             co_abs_cap = 1.05 * rel_thr
             co_abs = np.minimum(co_abs_soft, co_abs_cap)
 
-            E_abs = E
+            E_abs = E_local
             co_abs_energy_min = np.clip(0.05 * E_abs, 2.0, 10.0)
             nrel = scores[:unknown_id] / (top + 1e-9)
 
@@ -3569,7 +3488,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
             add_max = max(0, k_cap - 1)  # top già incluso
             add = cand[:min(add_max, len(cand))]
-            if add and scores[add].sum() >= 0.22 * E:
+            if add and scores[add].sum() >= 0.22 * E_local:
                 winners.extend(add)
 
             # Weak co-taste rescue (solo se NON diffuso e top � forte)
@@ -3589,7 +3508,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
                 # tieni al massimo 1 co-gusto extra, e solo se contribuisce davvero
                 rescue.sort(key=lambda js: scores[js], reverse=True)
-                if rescue and scores[rescue[0]] >= max(0.18 * E, 2.0):
+                if rescue and scores[rescue[0]] >= max(0.18 * E_local, 2.0):
                     winners.append(rescue[0])
 
             # Top-only fallback severo in scene borderline
@@ -3605,7 +3524,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
         # F) Fallback se ancora vuoto
         if not winners:
-            if (not is_diffuse) and top_pass_strict and (z[top_idx] >= z_min):
+            if (not is_diffuse) and top_pass_strict and (z[top_idx] >= z_min_guards):
                 winners = [top_idx]
             else:
                 winners = [unknown_id]
@@ -3635,6 +3554,86 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 if verbose_rewards:
                     print(f"[SPICY-AVERSION] p={p_now:.2f} → HT+{ht_pulse_aversion}, DA×{da_penalty_avers}, thr_spice+={thr_spice_kick:.3f}")
 
+        # NNLS Unsupervised Learning - Labeling Discovery
+        did_unsup_relabel = False
+        unsup_labels = []
+        unsup_log = None
+        # criteri per consentire quintuple:
+        may_allow_k5 = (
+            is_mixture_like and
+            (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
+            PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
+        )
+        # Gestione NNLS dell'Unsupervised Learning
+        should_try_nnls = ((winners == []) or (winners == [unknown_id])) #and (not is_diffuse)
+        if should_try_nnls:
+            # NNLS decoding before saying: "UNKNOWN" a priori
+            abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
+                0.22*pos_expect_test,
+                0.18*cop_expect_test
+            )
+            cand_nnls, info_nnls = decode_by_nnls(
+                scores=scores[:unknown_id],
+                P_pos=P_pos, P_cop=P_cop,
+                is_mixture_like=is_mixture_like,
+                z_scores=z[:unknown_id],
+                frac_thr=0.10,                     # 0.12–0.15
+                z_min_guard=max(0.01, z_rel_min),
+                allow_k4=True,
+                allow_k5=may_allow_k5,
+                gap=gap, gap_thr=gap_thr,
+                pmr=PMR, pmr_thr=PMR_thr,
+                abs_floor=abs_floor_vec,        
+                nnls_iters=250, nnls_lr=None, l1_cap=1.0
+            )
+
+            if cand_nnls:
+                # ordina preferendo score reale, poi peso NNLS
+                w_nnls = info_nnls.get("w", None)
+                if w_nnls is not None:
+                    cand_nnls = sorted(cand_nnls, key=lambda isa: (scores[isa], w_nnls[isa]), reverse=True)
+                else:
+                    cand_nnls = sorted(cand_nnls, key=lambda isa: scores[isa], reverse=True)
+
+                # cap finale: permetti fino a 5 solo se consentito globalmente
+                allow_k5_globally = True  # to allow 5-mix
+                k_cap_eff = min(k_cap, 5 if (allow_k5_globally and may_allow_k5) else 4)
+                winners = cand_nnls[:k_cap_eff]
+
+                did_unsup_relabel = True
+                unsup_labels = [taste_map[isa] for isa in winners]
+                unsup_log = dict(
+                    stage="nnls",
+                    err=float(info_nnls["err"]),
+                    cover=float(info_nnls["cover"]),
+                    k_abs=int(info_nnls["k_abs"]),
+                    k_est=int(info_nnls["k_est"]),
+                    thr_rel=float(info_nnls["thr_rel"])
+                )
+
+        # veto rapido su molti attivi diffusi senza considerare falsi allarmi
+        nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
+        too_many_active_diffuse = (
+            # blocca solo se > 5
+            (k_active > 5) and
+            # e la distribuzione non giustifica mix complessi
+            ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr)) and
+            # e non abbiamo un segnale affidabile di quintupla
+            (not may_allow_k5) and
+            # e NNLS non ha già “validato” (>=5) in modo controllato
+            (nnls_k < 5)
+        )
+        if too_many_active_diffuse:
+            winners = [unknown_id]
+            # passa direttamente alla chiusura del trial:
+            expected  = [taste_map[idxs] for idxs in true_ids]
+            predicted = [taste_map[wx] for wx in winners]
+            hit = set(winners) == set(true_ids)
+            print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
+            results.append((label, expected, predicted, hit, ""))
+            net.run(recovery_between_trials)
+            continue
+
         # debug prints
         print(f"\n[DBG] decision: PMR={PMR:.3f} H={H:.3f} gap={gap:.3f} top={taste_map[top_idx]} "
             f"score_top={scores[top_idx]:.1f} thr_eff_top={thr_eff[top_idx]:.1f} z_top={z[top_idx]:.2f}")
@@ -3663,7 +3662,7 @@ for step, (_rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             mod.DA_f[:] += da_pulse_reward    # phasic burst
             mod.DA_t[:] += da_tonic_tail      # tonic tail
         has_strong_fp = any(
-            (idx not in true_ids) and (float(scores[idx]) >= fp_gate[idx])
+            (idx not in true_ids) and (float(scores[idx]) >= fp_gate_test[idx])
             for idx in range(num_tastes-1)
         )
         if has_strong_fp:
