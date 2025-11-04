@@ -807,7 +807,7 @@ threshold_ratio      = 0.40             # threshold for winner spiking neurons
 min_spikes_for_known = 5                # minimum number of spikes for neuron, otherwise UNKNOWN
 top2_margin_ratio    = 1.05             # top/second >= 1.4 -> safe
 weight_decay         = 1e-4             # weight decay for trial
-verbose_rewards      = False            # dopamine reward logs
+verbose_rewards      = True             # dopamine reward logs
 test_emotion_mode    = "off"            # to test with active neuromodulators
 
 # Short-Term Plasticity STP (STF/STD) (Tsodyks-Markram) parameters
@@ -874,16 +874,31 @@ connectivity_mode    = "dense"  # "dense" -> fully-connected | "diagonal" -> one
 
 # Plasticity pull (in Tensorflow's ReduceLROnPlateau style)
 def set_plasticity_scale(scale: float):
-    s = float(np.clip(scale, 0.0, 1.0))
-    # 1) gate sinaptico esplicito
-    if 'stdp_on' in S.variables:
-        S.stdp_on[:] = s
-    # 2) scala globale del rinforzo
+    prev = float(np.mean(S.stdp_on[:])) if hasattr(S, 'stdp_on') else float(globals().get('PLAST_GLOBAL', 1.0))
+    floor = float(globals().get('PLAST_GLOBAL_FLOOR', 0.0))
+    s = float(np.clip(scale, floor, 1.0))
+    # Hysteresis/floor (evita flap su micro variazioni)
+    EPS = 1e-3
+    if abs(s - prev) < EPS:
+        return prev, prev
+    
+    # states application
+    prev_raw = float(globals().get('PLAST_GLOBAL', 1.0))
+    if hasattr(S, 'stdp_on') and S.stdp_on[:].size:
+        prev_raw = float(np.mean(np.asarray(S.stdp_on[:], dtype=float)))
+    prev = 0.0 if not np.isfinite(prev_raw) else prev_raw
     global PLAST_GLOBAL
     PLAST_GLOBAL = s
-    # 3) raffredda le tracce di eligibility già accumulate
-    if 'elig' in S.variables:
-        S.elig[:] *= (0.5 + 0.5*s)  # compressione dolce
+    if hasattr(S, 'elig'):
+        cool = 0.5 + 0.5*s
+        if s < prev:            # stai riducendo (plateau/instabilità)
+            cool *= 0.9         # raffredda un filo di più
+        S.elig[:] *= cool
+    
+    # update log
+    if globals().get('PLAST_LOG', False):
+        print(f"[Plasticity Scale] {prev:.3f} → {s:.3f} (cool={cool:.3f})")
+    return prev, s
 
 def soft_pull_toward_best(best_sd, rho: float = 0.25):
     """
@@ -2828,14 +2843,14 @@ for input_rates, true_ids, label in training_stimuli:
                         decays_done += 1
                         cooldown_left = COOLDOWN   # reset cooldown reale
                         did_decay = True
-                        print(f"[ReduceLROnPlateau] plasticity at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓ (decays={decays_done}/{MAX_PLASTICITY_DECAYS}).\n")
+                        print(f"[ReduceLROnPlateau] Synaptic plasticity decay at step {step} → stdp_on≈{float(np.mean(S.stdp_on[:])):.3f} ↓ (decays={decays_done}/{MAX_PLASTICITY_DECAYS}).\n")
             # reset solo se è avvenuto il decay contrassegnato dal flag apposito
             if did_decay:
                 patience = 0  
 
         # 3c) Early Stopping finale
         if (patience >= PATIENCE_LIMIT) and (step >= MIN_STEPS_BEFORE_STOP):
-            print(f"\n[EARLY STOPPING] No plasticity best improvement for {PATIENCE_LIMIT} consecutive trials "
+            print(f"\n[EARLY STOPPING] No synaptic plasticity best improvement for {PATIENCE_LIMIT} consecutive trials "
                 f"(best={best_score:.4f} @ step {best_step}) — stopping training.")
             break
 
@@ -3049,7 +3064,6 @@ S.xbar[:] = 0
 S.y[:] = 0
 S.ybar[:] = 0
 S.elig[:] = 0
-S_unk.gain_unk = 0.15
 # NO NORMALIZATION during test
 col_allow_upscale    = False
 col_scale_max        = 1.10
