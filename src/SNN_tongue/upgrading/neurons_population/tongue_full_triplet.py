@@ -3475,197 +3475,207 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     bonus = 0 if k_active < 2 else (2 if clean >= 0.70 else (1 if clean >= 0.60 else 0))
     k_cap = min(max(k_cap_base + bonus, 3), k_active, 9)  # ≥3 quando il mix è pulito
 
+    # Debug log diagnostico
+    print(f"[DBG] top_idx={top_idx} top={top:.1f} thr={thr_eff[top_idx]:.1f} "
+      f"min_known={min_spikes_for_known_test} E={E_local:.1f} "
+      f"PMR={PMR:.3f}/{PMR_thr:.3f} H={H:.3f}/{H_thr:.3f} gap={gap:.3f}/{gap_thr:.3f} "
+      f"is_diffuse={is_diffuse} top_pass_strict={top_pass_strict}")
+    print(f"[DBG] scores[:unknown_id]={scores[:unknown_id]}")
+
     #  WINNERS SELECTION
-    # A) Rejection diretto se diffuso e top non “strict”
-    if is_diffuse and not top_pass_strict:
-        winners = [unknown_id]
-    else:
-        # B) candidati "stretti": soglia assoluta vera + z
-        strict_winners = [
-            idx for idx in range(unknown_id)
-            if (scores[idx] >= (thr_eff[idx] + abs_margin_test)) and (z[idx] >= z_min_guards)
-        ]
-        winners = list(strict_winners)
+    # A) candidati "stretti": soglia assoluta vera + z
+    strict_winners = [
+        idx for idx in range(unknown_id)
+        if (scores[idx] >= (thr_eff[idx] + abs_margin_test)) and (z[idx] >= z_min_guards)
+    ]
+    winners = list(strict_winners)
 
-        # C) Mixture shortcut (solo top forte e NON diffuso)
-        top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
-        if top_known and (not is_diffuse) and mixture_shortcut:
-            add = [c for c in mixture_shortcut if c != top_idx and c not in winners]
-            if add:
-                add.sort(key=lambda ia: scores[ia], reverse=True)
-                add = add[:max(0, k_cap - 1)]
-                # guardrail energetico
-                if scores[add].sum() >= 0.20 * E_local:
-                    winners.extend(add)
-        
-        # D) Negative rel gate
-        if use_rel_gate_in_test and top_known and (not is_diffuse):
-            rel_thr = rel_gate_ratio_test * top
-            co_abs_soft = np.maximum(0.32 * thr_eff, 0.30 * cop_expect_test)
-            co_abs_cap = 1.05 * rel_thr
-            co_abs = np.minimum(co_abs_soft, co_abs_cap)
-
-            E_abs = E_local
-            co_abs_energy_min = np.clip(0.05 * E_abs, 2.0, 10.0)
-            nrel = scores[:unknown_id] / (top + 1e-9)
-
-            cand = [idx for idx in range(unknown_id)
-                if (idx != top_idx) and (z[idx] >= z_rel_min) and
-                   ((nrel[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
-                    (scores[idx] >= max(rel_thr, co_abs[idx]))) and
-                   (scores[idx] >= co_abs_energy_min)]
-            cand.sort(key=lambda idx: scores[idx], reverse=True)
-
-            add_max = max(0, k_cap - 1)  # top già incluso
-            add = cand[:min(add_max, len(cand))]
-            if add and scores[add].sum() >= 0.22 * E_local:
+    # B) Mixture shortcut (solo top forte e NON diffuso)
+    top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
+    if top_known and (not is_diffuse) and mixture_shortcut:
+        add = [c for c in mixture_shortcut if c != top_idx and c not in winners]
+        if add:
+            add.sort(key=lambda ia: scores[ia], reverse=True)
+            add = add[:max(0, k_cap - 1)]
+            # guardrail energetico
+            if scores[add].sum() >= 0.20 * E_local:
                 winners.extend(add)
+        
+    # C) Negative rel gate
+    if use_rel_gate_in_test and top_known and (not is_diffuse):
+        rel_thr = rel_gate_ratio_test * top
+        co_abs_soft = np.maximum(0.32 * thr_eff, 0.30 * cop_expect_test)
+        co_abs_cap = 1.05 * rel_thr
+        co_abs = np.minimum(co_abs_soft, co_abs_cap)
 
-            # Weak co-taste rescue (solo se NON diffuso e top � forte)
-            if top_pass_strict:
-                rescue = []
-                abs_co_min = 0.25 * min_spikes_for_known_test      # co-gusto davvero debole ma reale
-                rel_min    = 0.05                                  # quota minima vs top
-                z_min_resc = 0.20                                  # z minimo del co-gusto
+        E_abs = E_local
+        co_abs_energy_min = np.clip(0.05 * E_abs, 2.0, 10.0)
+        nrel = scores[:unknown_id] / (top + 1e-9)
 
-                for idx in range(unknown_id):
-                    if idx == top_idx or (idx in winners):
-                        continue
-                    if (z[idx] >= z_min_resc and
-                        scores[idx] >= abs_co_min and
-                        (scores[idx] / (top + 1e-9) >= rel_min)):
-                        rescue.append(idx)
+        cand = [idx for idx in range(unknown_id)
+            if (idx != top_idx) and (z[idx] >= z_rel_min) and
+                ((nrel[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
+                (scores[idx] >= max(rel_thr, co_abs[idx]))) and
+                (scores[idx] >= co_abs_energy_min)]
+        cand.sort(key=lambda idx: scores[idx], reverse=True)
 
-                # tieni al massimo 1 co-gusto extra, e solo se contribuisce davvero
-                rescue.sort(key=lambda js: scores[js], reverse=True)
-                if rescue and scores[rescue[0]] >= max(0.18 * E_local, 2.0):
-                    winners.append(rescue[0])
+        add_max = max(0, k_cap - 1)  # top già incluso
+        add = cand[:min(add_max, len(cand))]
+        if add and scores[add].sum() >= 0.22 * E_local:
+            winners.extend(add)
 
-            # Top-only fallback severo in scene borderline
-            if (k_active >= 3) and (clean < 0.35):
-                winners = [top_idx] if top_pass_strict else [unknown_id]  # 0.35->0.40
+        # Weak co-taste rescue (solo se NON diffuso e top � forte)
+        if top_pass_strict:
+            rescue = []
+            abs_co_min = 0.25 * min_spikes_for_known_test      # co-gusto davvero debole ma reale
+            rel_min    = 0.05                                  # quota minima vs top
+            z_min_resc = 0.20                                  # z minimo del co-gusto
+
+            for idx in range(unknown_id):
+                if idx == top_idx or (idx in winners):
+                    continue
+                if (z[idx] >= z_min_resc and
+                    scores[idx] >= abs_co_min and
+                    (scores[idx] / (top + 1e-9) >= rel_min)):
+                    rescue.append(idx)
+
+            # tieni al massimo 1 co-gusto extra, e solo se contribuisce davvero
+            rescue.sort(key=lambda js: scores[js], reverse=True)
+            if rescue and scores[rescue[0]] >= max(0.18 * E_local, 2.0):
+                winners.append(rescue[0])
+
+        # Top-only fallback severo in scene borderline
+        if (k_active >= 3) and (clean < 0.35):
+            winners = [top_idx] if top_pass_strict else [unknown_id]  # 0.35->0.40
             
-            # NEW: cap finale sul numero totale di vincitori (mantieni il top)
-            if len(winners) > k_cap:
-                # ordina per score decrescente e preserva il top
-                rest = [isa for isa in winners if isa != top_idx]
-                rest.sort(key=lambda isa: scores[isa], reverse=True)
-                winners = [top_idx] + rest[:max(0, k_cap-1)]
+    # D) NNLS Unsupervised Learning - Labeling Discovery if are still UNKNOWN winners
+    did_unsup_relabel = False
+    unsup_labels = []
+    unsup_log = None
 
-        # F) Fallback se ancora vuoto
-        if (scores[top_idx] < min_spikes_for_known_test) and (len(winners) == 0) and is_diffuse:
-            winners = [unknown_id]
-        elif not winners:
-            winners = [top_idx]
-            
-        # NNLS Unsupervised Learning - Labeling Discovery if are still UNKNOWN winners
-        did_unsup_relabel = False
-        unsup_labels = []
-        unsup_log = None
-        # criteri per consentire quintuple:
-        may_allow_k5 = (
-            is_mixture_like and
-            (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
-            PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
+    # criteri per consentire quintuple:
+    may_allow_k5 = (
+        is_mixture_like and
+        (gap is not None and gap_thr is not None and gap >= 1.00*gap_thr or
+        PMR is not None and PMR_thr is not None and PMR >= 1.10*PMR_thr)
+    )
+    # Gestione NNLS dell'Unsupervised Learning con anche top-only pulito
+    should_try_nnls = (
+        (winners == []) or
+        (winners == [unknown_id]) or
+        (winners == [top_idx] and is_mixture_like and top_pass_strict)
+    )
+    if should_try_nnls:
+        # NNLS decoding before saying: "UNKNOWN" a priori
+        abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
+            0.22*pos_expect_test,
+            0.18*cop_expect_test
         )
-        # Gestione NNLS dell'Unsupervised Learning con anche top-only pulito
-        should_try_nnls = (
-            (winners == []) or
-            (winners == [unknown_id]) or
-            (winners == [top_idx] and is_mixture_like and top_pass_strict)
+        cand_nnls, info_nnls = decode_by_nnls(
+            scores=scores[:unknown_id],
+            P_pos=P_pos, P_cop=P_cop,
+            is_mixture_like=is_mixture_like,
+            z_scores=z[:unknown_id],
+            frac_thr=0.10,                     # 0.12–0.15
+            z_min_guard=max(0.01, z_rel_min),
+            allow_k4=True,
+            allow_k5=may_allow_k5,
+            gap=gap, gap_thr=gap_thr,
+            pmr=PMR, pmr_thr=PMR_thr,
+            abs_floor=abs_floor_vec,        
+            nnls_iters=250, nnls_lr=None, l1_cap=1.0
         )
-        if should_try_nnls:
-            # NNLS decoding before saying: "UNKNOWN" a priori
-            abs_floor_vec = np.maximum(  # “soft-abs” per non far crollare i co-gusti
-                0.22*pos_expect_test,
-                0.18*cop_expect_test
+
+        if cand_nnls:
+            # ordina preferendo score reale, poi peso NNLS
+            w_nnls = info_nnls.get("w", None)
+            if w_nnls is not None:
+                cand_nnls = sorted(cand_nnls, key=lambda isa: (scores[isa], w_nnls[isa]), reverse=True)
+            else:
+                cand_nnls = sorted(cand_nnls, key=lambda isa: scores[isa], reverse=True)
+
+            # cap finale: permetti fino a 5 solo se consentito globalmente
+            allow_k5_globally = True  # to allow 5-mix
+            k_cap_eff = min(k_cap, 5 if (allow_k5_globally and may_allow_k5) else 4)
+            winners = cand_nnls[:k_cap_eff]
+
+            did_unsup_relabel = True
+            unsup_labels = [taste_map[isa] for isa in winners]
+            unsup_log = dict(
+                stage="nnls",
+                err=float(info_nnls["err"]),
+                cover=float(info_nnls["cover"]),
+                k_abs=int(info_nnls["k_abs"]),
+                k_est=int(info_nnls["k_est"]),
+                thr_rel=float(info_nnls["thr_rel"])
             )
-            cand_nnls, info_nnls = decode_by_nnls(
-                scores=scores[:unknown_id],
-                P_pos=P_pos, P_cop=P_cop,
-                is_mixture_like=is_mixture_like,
-                z_scores=z[:unknown_id],
-                frac_thr=0.10,                     # 0.12–0.15
-                z_min_guard=max(0.01, z_rel_min),
-                allow_k4=True,
-                allow_k5=may_allow_k5,
-                gap=gap, gap_thr=gap_thr,
-                pmr=PMR, pmr_thr=PMR_thr,
-                abs_floor=abs_floor_vec,        
-                nnls_iters=250, nnls_lr=None, l1_cap=1.0
-            )
 
-            if cand_nnls:
-                # ordina preferendo score reale, poi peso NNLS
-                w_nnls = info_nnls.get("w", None)
-                if w_nnls is not None:
-                    cand_nnls = sorted(cand_nnls, key=lambda isa: (scores[isa], w_nnls[isa]), reverse=True)
-                else:
-                    cand_nnls = sorted(cand_nnls, key=lambda isa: scores[isa], reverse=True)
+    # E) Reject early su scene davvero povere
+    reject_early = (
+        is_diffuse and
+        (scores[top_idx] < max(min_spikes_for_known_test, 0.5*thr_eff[top_idx])) and
+        (E_local < 0.35 * np.maximum(1.0, pos_expect_test.sum()))
+    )
+    if (len(winners) == 0) and reject_early:
+        winners = [unknown_id]
 
-                # cap finale: permetti fino a 5 solo se consentito globalmente
-                allow_k5_globally = True  # to allow 5-mix
-                k_cap_eff = min(k_cap, 5 if (allow_k5_globally and may_allow_k5) else 4)
-                winners = cand_nnls[:k_cap_eff]
+    # F) Fallback finale se ancora vuoto
+    if len(winners) == 0:
+        winners = [top_idx] if (scores[top_idx] >= min_spikes_for_known_test) else [unknown_id]
 
-                did_unsup_relabel = True
-                unsup_labels = [taste_map[isa] for isa in winners]
-                unsup_log = dict(
-                    stage="nnls",
-                    err=float(info_nnls["err"]),
-                    cover=float(info_nnls["cover"]),
-                    k_abs=int(info_nnls["k_abs"]),
-                    k_est=int(info_nnls["k_est"]),
-                    thr_rel=float(info_nnls["thr_rel"])
-                )
+    # G) cap finale sul numero totale di vincitori (mantieni il top)
+    if len(winners) > k_cap:
+        rest = [isa for isa in winners if isa != top_idx]
+        rest.sort(key=lambda ia: scores[ia], reverse=True)
+        winners = [top_idx] + rest[:max(0, k_cap-1)]
 
-        # veto rapido su molti attivi diffusi senza considerare falsi allarmi
-        nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
-        too_many_active_diffuse = (
-            # blocca solo se > 5
-            (k_active > 5) and
-            # e la distribuzione non giustifica mix complessi
-            ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr)) and
-            # e non abbiamo un segnale affidabile di quintupla
-            (not may_allow_k5) and
-            # e NNLS non ha già “validato” (>=5) in modo controllato
-            (nnls_k < 5)
+    # H) veto rapido su molti attivi diffusi senza considerare falsi allarmi
+    nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
+    too_many_active_diffuse = (
+        # blocca solo se > 5
+        (k_active > 5) and
+        # e la distribuzione non giustifica mix complessi
+        ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr)) and
+        # e non abbiamo un segnale affidabile di quintupla
+        (not may_allow_k5) and
+        # e NNLS non ha già “validato” (>=5) in modo controllato
+        (nnls_k < 5)
+    )
+    if too_many_active_diffuse:
+        winners = [unknown_id]
+        # passa direttamente alla chiusura del trial:
+        expected  = [taste_map[idxs] for idxs in true_ids]
+        predicted = [taste_map[wx] for wx in winners]
+        hit = set(winners) == set(true_ids)
+        print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
+        results.append((label, expected, predicted, hit, ""))
+        net.run(recovery_between_trials)
+        continue
+
+    # I) SPICY aversion check after TEST winners
+    # is SPICY present in the ground truth or in the winners?
+    # If so, trigger the aversion response
+    is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
+
+    if is_spicy_present: # trigger spicy aversion
+        happened, p_now = spicy_aversion_triggered( # returns bool, p_now
+            taste_neurons, mod, spicy_id,
+            p_base=p_aversion_base,
+            slope=p_aversion_slope,
+            cap=p_aversion_cap,
+            trait=profile['spicy_aversion_trait'],
+            k_hun=profile['k_hun_spice'],
+            k_h2o=profile['k_h2o_spice']
         )
-        if too_many_active_diffuse:
-            winners = [unknown_id]
-            # passa direttamente alla chiusura del trial:
-            expected  = [taste_map[idxs] for idxs in true_ids]
-            predicted = [taste_map[wx] for wx in winners]
-            hit = set(winners) == set(true_ids)
-            print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
-            results.append((label, expected, predicted, hit, ""))
-            net.run(recovery_between_trials)
-            continue
-
-        # SPICY aversion check after TEST winners
-        # is SPICY present in the ground truth or in the winners?
-        # If so, trigger the aversion response
-        is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
-
-        if is_spicy_present: # trigger spicy aversion
-            happened, p_now = spicy_aversion_triggered( # returns bool, p_now
-                taste_neurons, mod, spicy_id,
-                p_base=p_aversion_base,
-                slope=p_aversion_slope,
-                cap=p_aversion_cap,
-                trait=profile['spicy_aversion_trait'],
-                k_hun=profile['k_hun_spice'],
-                k_h2o=profile['k_h2o_spice']
-            )
-            # apply spicy aversion effects
-            if happened:
-                mod.HT[:]  += ht_pulse_aversion
-                mod.DA_f[:] *= da_penalty_avers
-                mod.DA_t[:] *= da_penalty_avers
-                sl = taste_slice(spicy_id)
-                taste_neurons.thr_spice[sl] = taste_neurons.thr_spice[sl] + thr_spice_kick
-                if verbose_rewards:
-                    print(f"[SPICY-AVERSION] p={p_now:.2f} → HT+{ht_pulse_aversion}, DA×{da_penalty_avers}, thr_spice+={thr_spice_kick:.3f}")
+        # apply spicy aversion effects
+        if happened:
+            mod.HT[:]  += ht_pulse_aversion
+            mod.DA_f[:] *= da_penalty_avers
+            mod.DA_t[:] *= da_penalty_avers
+            sl = taste_slice(spicy_id)
+            taste_neurons.thr_spice[sl] = taste_neurons.thr_spice[sl] + thr_spice_kick
+            if verbose_rewards:
+                print(f"[SPICY-AVERSION] p={p_now:.2f} → HT+{ht_pulse_aversion}, DA×{da_penalty_avers}, thr_spice+={thr_spice_kick:.3f}")
 
         # debug prints
         print(f"\n[DBG] decision: PMR={PMR:.3f} H={H:.3f} gap={gap:.3f} top={taste_map[top_idx]} "
