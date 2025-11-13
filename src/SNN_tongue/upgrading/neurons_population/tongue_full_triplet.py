@@ -299,16 +299,16 @@ def decode_by_nnls(
     scores, P_pos, P_cop,
     z_scores,                          # array z per-gusto (C,)
     frac_thr=0.08,                     # soglia frazionaria per i pesi -> between 0.10 and 0.15
-    z_min_guard=0.01,                  # guardia minima su z
+    z_min_guard=0.01,                  # guardia minima su z per accettare un candidato
     allow_k4=True,                     # flag per quadruple
     allow_k5=True,                     # flag per quintuple
-    gap=None, gap_thr=None,            # opzionale (se già calcolati)
-    pmr=None, pmr_thr=None,            # opzionale
+    gap=None, gap_thr=None,            # calcolati a monte da ood_calibration
+    pmr=None, pmr_thr=None,            #
     abs_floor=None,                    # None, float o array per-gusto
-    nnls_iters=250, nnls_lr=None, l1_cap=1.0
+    nnls_iters=250, nnls_lr=None, l1_cap=1.0 # iperparametri di NNLS proiettato sul simplesso
 ):
     # blend fisso
-    alpha = 0.55 if is_mixture_like else 0.20 # più copioso se mix
+    alpha = 0.55 if is_mixture_like else 0.20 # più copioso se mix, mentre 0.20 se positivi puri
     P = alpha * P_cop + (1.0 - alpha) * P_pos
 
     b = scores.astype(float).copy()
@@ -3579,7 +3579,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         if not is_mixture_like:
             winners = [unknown_id]
             expected  = [taste_map[idxs] for idxs in true_ids]
-            predicted = [taste_map[w] for w in winners]
+            predicted = [taste_map[wa] for wa in winners]
             hit = set(winners) == set(true_ids)
             print(f"\n{label}\n  expected:   {expected}\n  predicted: {predicted}\n  exact:   {hit}")
             results.append((label, expected, predicted, hit, ""))
@@ -3659,13 +3659,16 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             ((nrel[idx] >= norm_rel_ratio_test and scores[idx] >= min_norm_abs_spikes) or
                 (scores[idx] >= max(rel_thr, co_abs[idx]))) and
             (scores[idx] >= co_abs_energy_min)]
+        
         cand.sort(key=lambda idx: scores[idx], reverse=True)
 
         add_max = max(0, k_cap - 1)
+        # Filtro su winners già presenti e aggiunta di winners univoci
+        cand = [c for c in cand if c not in winners]
         add = cand[:min(add_max, len(cand))]
         if add and scores[add].sum() >= 0.22 * E_local:
             winners.extend(add)
-
+            
         # weak co-taste rescue (invariato)
         if top_pass_strict:
             rescue = []
@@ -3875,9 +3878,13 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             f" ACH={float(mod.ACH[0]):.2f} GABA={float(mod.GABA[0]):.2f}")
     pbar_update(msg)
 
+    # clamp finale: winners unici preservando l'ordine
+    seen = set()
+    winners = [wa for wa in winners if (wa not in seen and not seen.add(wa))]
+    
     # to make a confrontation: expected vs predicted values
     expected  = [taste_map[idxs] for idxs in true_ids]
-    predicted = [taste_map[w] for w in winners]
+    predicted = [taste_map[wa] for wa in winners]
     hit = set(winners) == set(true_ids)
 
     extra = ""
