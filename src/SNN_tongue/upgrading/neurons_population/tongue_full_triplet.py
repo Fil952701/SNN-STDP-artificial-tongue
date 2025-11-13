@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import sys
 import random
 import numpy as np
-from collections import Counter, deque
+from collections import Counter, deque, OrderedDict
 from numpy import trapezoid
 import time
 import math
@@ -241,10 +241,10 @@ def conf_unsup_score(err, top_alpha, good_coverage):
 # 5.
 def probe_boost_candidates(cands, base_rates, K=3, dur_ms=120, boost_frac=0.12):
     """
-    Micro-trial: re-inietta lo stimolo K volte aumentando i canali candidati di +1015%.
+    Micro-trial: re-inietta lo stimolo K volte aumentando i canali candidati di +10-15%.
     Ritorna (ok, pmr_series, gap_series, z_series_dict)
     - ok=True se PMR/gap e z dei candidati crescono "abbastanza" in maniera consistente.
-    Nota: non tocca STDP (� già frozen nel TEST).
+    Nota: non tocca STDP (è già frozen nel TEST).
     """
     dur = dur_ms * b.ms
     pmr_list, gap_list = [], []
@@ -328,6 +328,10 @@ def decode_by_nnls(
     p = b_n / (b_n.sum() + 1e-9)
     HHI = float((p**2).sum())
     k_est = int(np.clip(round(1.0 / max(HHI, 1e-9)), 1, scores.size))
+    
+    # clamp l1_cap in base a k_est (più piccolo => più sparso)
+    l1_cap_eff = min(l1_cap, 0.80 + 0.05*min(k_est, 5))  # 0.85..1.05 clamp a ~0.85-0.95
+    ws = nnls_projected_grad(P_n, b_n, iters=nnls_iters, lr=nnls_lr, l1_cap=l1_cap_eff)
 
     # soglie frazionarie: 0.10 base, 0.08 se target quintuple
     ws_sum = float(ws.sum())
@@ -411,6 +415,17 @@ def decode_by_nnls(
     # se per rumore cand > 5, tieni i migliori 5 per peso ws -> si ordina per score di ognuno
     if len(cand) > 5:
         cand = sorted(cand, key=lambda ids: ws[ids], reverse=True)[:5]
+    
+    # cardinality priority
+    if len(cand) > k_est:
+        # tieni i top-k_est per ws, ma consenti +1 se quasi pari
+        order = np.argsort(ws[cand])[::-1]
+        keep = list(np.array(cand)[order[:k_est]])
+        if len(cand) >= k_est+1:
+            nxt = cand[order[k_est]]
+            if ws[nxt] >= 0.95*ws[keep[-1]] and z_scores[nxt] >= 0.9*max(z_scores[keep[-1]], z_min_guard):
+                keep.append(nxt)  # tolleranza +1
+        cand = keep
 
     return cand, dict(err=float(err), cover=cover,
                       k_abs=int(len(cand)), k_est=k_est,
@@ -626,9 +641,151 @@ for idx, lbl in normal_tastes.items():
 print("\nSpecial taste:")
 for idx, lbl in special_taste.items():
     print(f"{idx}: {lbl}")
+    
+# UNKNOWN ID
 unknown_id = num_tastes-1
 
+#############################################################################
+
+'''THE FOLLOWING PART IS ALL ABOUT CRAVING AND DESIRE HEDONIC WINDOW STATE'''
+
+#############################################################################
+
+# CRAVING state
+crave_f = np.zeros(num_tastes, dtype=float)    # fast trace per class
+crave_s = np.zeros(num_tastes, dtype=float)    # slow trace per class
+crave_hedonic = np.full(num_tastes, -1, dtype=int)  # hedonic window per class
+mix_desire = OrderedDict()  # key: tuple di classi attive (ordinata); val: dict(f,s,deadline)
+trial_idx = 0  # trial global counter
+
+# DESIRE e CRAVING toggles & hyperparams
+# toggle ON/OFF
+ENABLE_DESIRE        = True
+ENABLE_DESIRE_TEST   = True
+# plasticity overall scaling
+CRAVE_KF             = 0.40            # fast trace weight
+CRAVE_KS             = 0.25            # slow trace weight
+CRAVE_MAX            = 1.5             # saturation
+# exponential decays
+CR_TAU_F_TRIALS      = 40              # memory of minutes/hours
+CR_TAU_S_TRIALS      = 400             # long term consolidation
+# hedonic window crawing satisfaction
+CR_WIN_TRIALS        = 30
+# finestra di soddisfazione del desiderio (in trial)
+CR_WIN_TRIALS        = 30
+# quanto aumenta la voglia se “piace” (scalato da confidenza)
+CR_INIT_BOOST        = 0.25
+# bonus dopaminergico addizionale se soddisfi il desiderio in finestra
+CR_SAT_BONUS         = 0.35
+# penalità se esperienza è avversiva (spicy cattivo, mix pessimo, ecc.)
+CR_NEG_PENALTY       = 0.20
+# soglia minima di confidenza per generare desiderio potente
+CR_MIN_CONF          = 0.65
+# memoria mix con LRU
+CR_MIX_CACHE         = 128
+
+# HELPERS FOR CRAVING
+# 1. Clamp
+def clamp(xc, lo=0.0, hi=CRAVE_MAX):
+    return float(np.clip(xc, lo, hi))
+
+# 2. Decay step
+def decay_step(arr, tau_trials):
+    if tau_trials <= 0:
+        return
+    decay = np.exp(-1.0 / float(tau_trials))
+    arr *= decay
+
+# 3. Mixture key => returns a key for the current mix (without UNKNOWN).
+#                   active_tastes_list: lista di id classe 'attive' nello stimolo
+def mixture_key(active_tastes):
+    lst = [int(xs) for xs in active_tastes if xs != unknown_id]
+    if not lst:
+        return None
+    return tuple(sorted(lst))
+
+# 4. Crave scale => plasticity scaling factor for idx class
+def crave_scale(idx: int) -> float:
+    return 1.0 + CRAVE_KF*float(crave_f[idx]) + CRAVE_KS*float(crave_s[idx])
+
+# 5. Mix cache set => easy LRU buffer to store all the desires
+def mix_cache_set(kd, st):
+    if kd in mix_desire:
+        mix_desire.move_to_end(kd)
+    mix_desire[kd] = st
+    if len(mix_desire) > CR_MIX_CACHE:
+        mix_desire.popitem(last=False)
+
+# 6. Update desire => effective function to update taste desire after trial
+def update_desire(
+    winners,                 # lista di vincitori (id classe)
+    top_idx,                 # miglior classe
+    conf_score,              # conf_unsup_score(...) / altra conf
+    liked_flag: bool,        # flag per "mix godurioso"
+    active_tastes,           # stimolo presentato (classi attive)
+    aversion_flag: bool      # p.es. spicy avversivo o mix pessimo
+):
+    
+    global trial_idx         # trial global counter
+    
+    # 1) global decay at every trial
+    decay_step(crave_f, CR_TAU_F_TRIALS)
+    decay_step(crave_s, CR_TAU_S_TRIALS)
+    
+    # 2) desiderio "arde" quando il mix è particolarmente piaciuto e la rete è sicura
+    liked = bool(liked_flag)
+    if liked and (conf_score >= CR_MIN_CONF) and (top_idx != unknown_id):
+        inc = CR_INIT_BOOST * float(conf_score)
+        crave_f[top_idx] = clamp(crave_f[top_idx] + inc)
+        crave_s[top_idx] = clamp(crave_s[top_idx] + 0.25*inc) # because it's slower than fast one
+        crave_hedonic[top_idx] = trial_idx + CR_WIN_TRIALS # hedonic window if it is liked
+        
+        # what is that taste?
+        # we recover all data about it
+        mk = mixture_key(active_tastes)
+        if mk:
+            st = mix_desire.get(mk, {"fast": 0.0, "slow": 0.0, "hedonic": trial_idx + CR_WIN_TRIALS})
+            st["fast"] = clamp(st["fast"] + inc)
+            st["slow"] = clamp(st["slow"] + 0.25*inc)
+            st["hedonic"] = trial_idx + CR_WIN_TRIALS
+            mix_cache_set(mk, st)
+    
+    # 3) penalty where there is aversion
+    if aversion_flag and (top_idx != unknown_id):
+        dec = CR_NEG_PENALTY * max(0.25, float(conf_score))
+        crave_f[top_idx] = clamp(crave_f[top_idx] - dec)
+        crave_s[top_idx] = clamp(crave_s[top_idx] - 0.5*dec)
+    
+    # 4) soddisfazione del desiderio: se lo stimolo del trial
+    # coincide con un desiderio "aperto", dai un bonus DA e chiudi la finestra
+    if (top_idx != unknown_id) and (crave_hedonic[top_idx] >= trial_idx):
+        try:
+            # fast DA
+            mod.DA_f = float(np.clip(mod.DA_f + CR_SAT_BONUS, 0.0, 1.0))
+        except Exception:
+            pass
+        crave_hedonic[top_idx] = -1  # finestra consumata
+    
+    # 5) decay and cleanup mix: delete all the offload voices outside hedonic window
+    to_del = []
+    for mk, st in mix_desire.items():
+        st["fast"] *= np.exp(-1.0/CR_TAU_F_TRIALS)
+        st["slow"] *= np.exp(-1.0/CR_TAU_S_TRIALS)
+        if (st["fast"] + st["slow"] < 1e-3) and (trial_idx > st["hedonic"] + CR_WIN_TRIALS):
+            to_del.append(mk)
+    for mk in to_del:
+        mix_desire.pop(mk, None)
+
+    # 6) avanzamento tempo trial-based
+    trial_idx += 1
+
+#############################################################################
+
+'''ENDING OF THE CRAVING AND DESIRE PART'''
+
+#############################################################################
 # 3. Simulation global parameters
+#############################################################################
 # LIF (conductance-based) parameters:
 C                    = 200 * b.pF       # membrane potential
 gL                   =  10 * b.nS       # leak conductance
@@ -648,9 +805,9 @@ g_step_inh_local     = 1.5 * b.nS       # lateral inhibition strength
 # Global Divisive Inhibition (GDI) parameters -> we need to balance very well this improvement
 # because it will break all the mixes otherwise
 tau_gdi              = 80 * b.ms        # global pool temporal window
-k_e2g_ff             = 0.004            # feed-forward contribute (Poisson input spikes) -> GDI
-k_e2g_fb             = 0.0010            # feedback contribute (output neuron spikes) -> GDI
-gamma_gdi_0          = 0.08             # scaled reward for (dimensionless)
+k_e2g_ff             = 0.0048            # feed-forward contribute (Poisson input spikes) -> GDI
+k_e2g_fb             = 0.0011            # feedback contribute (output neuron spikes) -> GDI
+gamma_gdi_0          = 0.10             # scaled reward for (dimensionless)
 gdi_reset_each_trial = True             # managing carry-over thorugh trials
 
 # Neuromodulators (DA Dopamine: reward, 5-HT Serotonine: aversion/fear, NE Noradrenaline: arousal/attention)
@@ -729,11 +886,11 @@ fp_gate_warmup_steps  = 200             # delay punitions to loser classes if EM
 decoder_adapt_on_test = False           # updating decoder EMA in test phase
 ema_factor            = 0.40            # EMA factor to punish more easy samples
 use_rel_gate_in_test  = True            # using relative gates for mixtures and not only absolute gates
-rel_gate_ratio_test   = 0.10            # second > 45 % rel_gate
+rel_gate_ratio_test   = 0.15            # second > 45 % rel_gate
 mixture_thr_relax     = 0.25            # e 50% of threshold per-class
 z_rel_min             = 0.006           # z margin threshold to let enter taste in relative gate
-z_min_base            = 0.050           # prima 0.20
-z_min_mix             = 0.030           # prima 0.10
+z_min_base            = 0.09           # prima 0.20
+z_min_mix             = 0.055           # prima 0.10
 # dynamic absolute thresholds for spikes counting  
 rel_cap_abs           = 10.0            # absolute value for spikes
 dyn_abs_min_frac      = 0.22            # helper for weak co-tastes -> it needs at least 30% of positive expected
@@ -824,10 +981,9 @@ n_repeats            = 10               # repetitions per taste
 progress_bar_len     = 30               # characters
 weight_monitors      = []               # list for weights to monitor
 threshold_ratio      = 0.40             # threshold for winner spiking neurons
-min_spikes_for_known = 3                # minimum number of spikes for neuron, otherwise UNKNOWN
-top2_margin_ratio    = 1.05             # top/second >= 1.4 -> safe
-weight_decay         = 1e-4             # weight decay for trial
-verbose_rewards      = True             # dopamine reward logs
+min_spikes_for_known = 5                # minimum number of spikes for neuron, otherwise UNKNOWN
+top2_margin_ratio    = 1.10             # top/second >= 1.4 -> safe
+verbose_rewards      = False             # dopamine reward logs
 test_emotion_mode    = "off"            # to test with active neuromodulators
 
 # Short-Term Plasticity STP (STF/STD) (Tsodyks-Markram) parameters
@@ -1377,9 +1533,9 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # open-set data-driven thresholds
     # (=> if during the test PMR/H/gap are inside the "negative typical part", refusing)
-    PMR_thr_auto = float(np.quantile(pmr_list, 0.95))  # soglia più bassa -> meno trigger
-    H_thr_auto   = float(np.quantile(h_list,  0.97))  # entropia deve essere davvero alta
-    gap_thr_auto = float(np.quantile(gap_list, 0.95))  # gap molto basso per trigger
+    PMR_thr_auto = float(np.quantile(pmr_list, 0.98))  # soglia più bassa -> meno trigger
+    H_thr_auto   = float(np.quantile(h_list,  0.99))  # entropia deve essere davvero alta
+    gap_thr_auto = float(np.quantile(gap_list, 0.98))  # gap molto basso per trigger
 
     # restore states after OOD
     if saved_gamma is not None:
@@ -1389,7 +1545,7 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # 0.997 per-class quantile on negatives OOD/NULL
     ood_q = np.array([
-        (np.quantile(tmp_spikes[idx], 0.999) if len(tmp_spikes[idx]) else 0.0)
+        (np.quantile(tmp_spikes[idx], 0.9995) if len(tmp_spikes[idx]) else 0.0)
         for idx in range(num_tastes-1)
     ], dtype=float)
 
@@ -1543,12 +1699,13 @@ gdi_mon = b.StateMonitor(gdi_pool, 'x', record=[0], clock=mon_clock)
 #   on_pre  : A2p * y_post      + A3p * y_post * ybar_post
 #   on_post : A2m * x_pre       + A3m * x_pre  * xbar_pre
 #
-# NB: accumuliamo in 'elig' (che poi decresce con Te). Il segno finale lo d� il rinforzo r
+# NB: accumuliamo in 'elig' (che poi decresce con Te). Il segno finale lo dà il rinforzo r
 #     (positivo -> LTP; negativo -> LTD)
 S = b.Synapses(
     pg, taste_neurons,
     model='''
         w            : 1
+        cr_gate      : 1                 # gate per-sinapsi (>=0) -> 1.0 = neutro, >1 potenzia, <1 smorza
         x_stp        : 1                 # risorsa disponibile (0..1)
         u            : 1                 # utilizzo corrente (0..1)
         u0           : 1                 # set-point di u
@@ -1556,7 +1713,11 @@ S = b.Synapses(
         tau_rec      : second            # STD recovery
         tau_facil    : second            # STF decay
         ex_scale_stp : 1                 # gain STP
-
+        
+        # versioni effettive (calcolate on-the-fly)
+        Aplus   : 1
+        Aminus  : 1
+        
         dx/dt     = -x/tau_x_minus        : 1 (event-driven)   # pre  (veloce, LTD)
         dxbar/dt  = -xbar/tau_xbar_minus  : 1 (event-driven)   # Triplet pre  (lenta)
         dy/dt     = -y/tau_y_plus         : 1 (event-driven)   # post (veloce, LTP)
@@ -1571,9 +1732,8 @@ S = b.Synapses(
     ''',
     on_pre='''
         u     = u + uinc * (1 - u)
-        ge_post += (w * u * x_stp * g_step_exc * ex_scale * ex_scale_stp) / (1.0 + gamma_gdi * gdi_eff_post)
+        ge_post += (w * u * x_stp * cr_gate * g_step_exc * ex_scale * ex_scale_stp) / (1.0 + gamma_gdi * gdi_eff_post)        
         x_stp = x_stp * (1 - u)
-
         x    += 1.0
         xbar += 1.0
 
@@ -1603,7 +1763,7 @@ S = b.Synapses(
     }
 )
 
-# Continual recovery between spikes: x grow up, u go back to U0
+# STP continual recovery between spikes: x grow up, u go back to U0
 S.run_regularly('''
     x_stp += (1 - x_stp) * (dt / tau_rec)
     u     += (u0 - u)    * (dt / tau_facil)
@@ -1800,6 +1960,8 @@ S.gamma_gdi = gamma_gdi_0
 S_noise.gamma_gdi = gamma_gdi_0
 # UNKNOWN demand gain initialization
 S_unk.gain_unk = 0.0
+# craving initialization
+S.cr_gate[:] = 1.0
 
 # DA, 5-HT, NE, HI, ACh, GABA neuromodulators that decay over time
 mod = b.NeuronGroup(
@@ -2245,6 +2407,7 @@ for input_rates, true_ids, label in training_stimuli:
         else:
             masked_boosted = masked  # nei primissimi step non boostare
 
+
     # MORE BIOLOGICAL OVERSAMPLING -> Meta-plasticity Homeostatic/Attention population-level aware
     # (5-HT/HI neuromodulators modulate the attentional state gated) with attentional gain control
     # state gating guidato da 5-HT/HI (bias globale già presente)
@@ -2272,6 +2435,18 @@ for input_rates, true_ids, label in training_stimuli:
             taste_neurons.theta_bias[sl] = bias_ta * b.mV
     else:
         taste_neurons.theta_bias[:] = base_bias_mv * b.mV
+
+    # craving abilitation during training
+    if ENABLE_DESIRE:
+        # soft gain clamp
+        S.cr_gate[:] = np.clip(S.cr_gate[:], 0.5, CRAVE_MAX)  # 0.5–1.5 nel tuo setup
+        # fattore per gusto (solo classi note)
+        # stesso mix della tua formula per gli score (0.5 KF + 0.5 KS)
+        boost = 1.0 + 0.5*CRAVE_KF*crave_f[:unknown_id] + 0.5*CRAVE_KS*crave_s[:unknown_id]
+        # scrivi cr_gate per sinapsi con pre-sinaptico = gusto t (puoi limitarlo ai j della sua popolazione, ma non è obbligatorio)
+        for ts in range(unknown_id):
+            sl = taste_slice(ts)
+            S.cr_gate[f"(i == {ts}) and (j >= {sl.start}) and (j < {sl.stop})"] = float(np.clip(boost[ts], 0.25, CRAVE_MAX))
 
     # 1) training stimulus with masking on no-target neurons
     if USE_GDI:
@@ -2354,7 +2529,7 @@ for input_rates, true_ids, label in training_stimuli:
                 sl_q  = taste_slice(q)
                 idx   = np.where((j_all >= sl_q.start) & (j_all < sl_q.stop))[0]
                 if idx.size:
-                    S.w[idx] = np.clip(S.w[idx] + r_off * S.elig[idx], 0.0, 1.0)
+                    S.w[idx] = np.clip(S.w[idx] + r_off * S.elig[idx] * (S.cr_gate[idx] if ENABLE_DESIRE else 1.0), 0.0, 1.0)
                     S.elig[idx] = 0.0
         # piccolo boost GABA per stabilit�
         mod.GABA[:] += 0.3 * gaba_pulse_stabilize
@@ -2435,6 +2610,13 @@ for input_rates, true_ids, label in training_stimuli:
     # A3: TP/FP threshold for each class
     #scores = diff_counts.astype(float)
     scores = population_scores_from_counts(diff_counts) # neurons population management
+    
+    # applica craving desiderio solo alle classi note
+    if ENABLE_DESIRE:
+        scores[:unknown_id] *= (
+            1.0 + 0.5*CRAVE_KF*crave_f[:unknown_id] + 0.5*CRAVE_KS*crave_s[:unknown_id]
+        )
+    
     scores[unknown_id] = -1e9
     mx = scores.max()
     rel = threshold_ratio * mx
@@ -2663,13 +2845,17 @@ for input_rates, true_ids, label in training_stimuli:
                 r = - beta * (1.0 + ht_gain * HT_now)
                 r *= (1.0 + ne_gain_r * NE_now)
 
-        # applicazione unica del rinforzo con gating
+        # applicazione unica del rinforzo con gating + craving and hedonic desire
         # perf_gate ∈ {0,1} o [0,1] (dipende da come lo calcoli); PLAST_GLOBAL ∈ [0,1]
-        r_final = perf_gate * PLAST_GLOBAL * r
+        cr_scale = 1.0
+        gain_crav = (S.cr_gate[idx_list] if (ENABLE_DESIRE and r > 0) else 1.0)
+        if ENABLE_DESIRE and (idx != unknown_id):
+            cr_scale = crave_scale(idx)
+        r_final = perf_gate * PLAST_GLOBAL * cr_scale * r
         if r_final != 0.0 and abs(r_final) * np.max(S.elig[idx_list]) >= 1e-6:
             # vettorizzato su tutta la popolazione di "idx"
             # S.elig è già il 3° fattore (eligibility trace)
-            delta_vec = r_final * S.elig[idx_list]
+            delta_vec = r_final * (S.elig[idx_list] * gain_crav)
             # applica e clampa
             S.w[idx_list] = np.clip(S.w[idx_list] + delta_vec, 0.0, 1.0)
             # svuota le tracce consumate
@@ -3309,6 +3495,16 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         S.ex_scale = 1.10
         pg_noise.rates = test_baseline_hz * np.ones(num_tastes) * b.Hz
         taste_neurons.theta_bias[:] = 0 * b.mV
+
+    # craving abilitation during test
+    if ENABLE_DESIRE_TEST:
+        # fattore per gusto (solo classi note)
+        # stesso mix della tua formula per gli score (0.5 KF + 0.5 KS)
+        boost = 1.0 + 0.5*CRAVE_KF*crave_f[:unknown_id] + 0.5*CRAVE_KS*crave_s[:unknown_id]
+        # scrivi cr_gate per sinapsi con pre-sinaptico = gusto t (puoi limitarlo ai j della sua popolazione, ma non è obbligatorio)
+        for ts in range(unknown_id):
+            sl = taste_slice(ts)
+            S.cr_gate[f"(i == {ts}) and (j >= {sl.start}) and (j < {sl.stop})"] = float(np.clip(boost[ts], 0.25, CRAVE_MAX))
 
     if len(true_ids) == 1 and true_ids[0] == unknown_id:
         # OOD/NULL � no normalization
@@ -4186,7 +4382,7 @@ print("\nEnded TEST phase successfully!")
 
 # 13. Plots
 # a) Spikes over time
-plt.figure(figsize=(10,4))
+'''plt.figure(figsize=(10,4))
 plt.plot(spike_mon.t/b.ms, spike_mon.i, '.k')
 plt.xlabel("Time (ms)")
 plt.ylabel("Neuron index")
@@ -4264,7 +4460,7 @@ plt.tight_layout()
 plt.show()
 
 # e) pos/neg EMA plot
-'''for c in range(num_tastes-1):
+for c in range(num_tastes-1):
     pos = np.array(pos_counts[c])
     neg = np.array(neg_counts[c])
     plt.figure(figsize=(5,3))
@@ -4276,7 +4472,7 @@ plt.show()
     plt.ylabel('freq')
     plt.legend(loc="upper right")
     plt.tight_layout()
-    plt.show()'''
+    plt.show()
 
 # f) Cross-talk off-diagonal weights
 W = np.zeros((num_tastes, num_tastes))
@@ -4318,4 +4514,4 @@ for idx in range(num_tastes-1):
     plt.title(f'Hedonic window for {taste_map[idx]}')
     plt.xlabel('ms')
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
