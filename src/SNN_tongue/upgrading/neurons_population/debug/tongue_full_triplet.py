@@ -408,8 +408,8 @@ def decode_by_nnls(
     if not (basic_ok or k4_ok or k5_ok):
         # Se lo spettro è "piatto/confuso" → fallback UNKNOWN
         # Usa guardie debolmente conservative: se mancano gap/pmr passali come None.
-        if (gap is not None and gap_thr is not None and gap < gap_thr) or \
-        (pmr is not None and pmr_thr is not None and pmr < pmr_thr):
+        if (gap is not None and gap_thr is not None and gap < 0.9*gap_thr) and \
+        (pmr is not None and pmr_thr is not None and pmr < 0.9*pmr_thr):
             return [unknown_id], dict(err=float(err), cover=cover, k_abs=0, k_est=k_est,
                                   thr_rel=0.0, ws=ws)
         # altrimenti scegli il top z tra i noti
@@ -783,7 +783,7 @@ rho_target = target_rate * tau_rate     # dimensionless (Hz*s)
 
 # Decoder threshold parameters
 k_sigma              = 0.5               # scaling factor for decoder threshold
-q_neg                = 0.97              # negative quantile
+q_neg                = 0.95              # negative quantile
 
 # Multi-label RL + EMA decoder
 USE_GATE_REINFORCE    = True
@@ -798,11 +798,11 @@ use_rel_gate_in_test  = True             # using relative gates for mixtures and
 rel_gate_ratio_test   = 0.13             # second > 45 % rel_gate
 mixture_thr_relax     = 0.40             # e 50% of threshold per-class
 z_rel_min             = 0.005            # z margin threshold to let enter taste in relative gate
-z_min_base            = 0.08             # prima 0.20
-z_min_mix             = 0.05             # prima 0.10
+z_min_base            = 0.05             # prima 0.20
+z_min_mix             = 0.04             # prima 0.10
 # dynamic absolute thresholds for spikes counting  
-rel_cap_abs           = 7.0             # absolute value for spikes
-dyn_abs_min_frac      = 0.18             # helper for weak co-tastes -> it needs at least 30% of positive expected
+rel_cap_abs           = 6.0             # absolute value for spikes
+dyn_abs_min_frac      = 0.14             # helper for weak co-tastes -> it needs at least 30% of positive expected
 # boosting parameters to push more weak examples
 norm_rel_ratio_test   = 0.022            # winners with z_i >= 15% normalized top
 min_norm_abs_spikes   = 2                # at least one real spike -> avoiding numerical issues
@@ -1975,9 +1975,9 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # open-set data-driven thresholds
     # (=> if during the test PMR/H/gap are inside the "negative typical part", refusing)
-    PMR_thr_auto = float(np.quantile(pmr_list, 0.98))  # soglia più bassa -> meno trigger
-    H_thr_auto   = float(np.quantile(h_list,  0.99))  # entropia deve essere davvero alta
-    gap_thr_auto = float(np.quantile(gap_list, 0.98))  # gap molto basso per trigger
+    PMR_thr_auto = float(np.quantile(pmr_list, 0.89))  # soglia più bassa -> meno trigger
+    H_thr_auto   = float(np.quantile(h_list,  0.90))  # entropia deve essere davvero alta
+    gap_thr_auto = float(np.quantile(gap_list, 0.80))  # gap molto basso per trigger
 
     # restore states after OOD
     if saved_gamma is not None:
@@ -2678,6 +2678,20 @@ for _ in range(n_repeats//2):
         va = global_gain(va, lo=0.85, hi=1.20, rng=rng)
         va = channel_dropout(va, p=rng.uniform(0.03, 0.07), rng=rng)
         pure_train.append((va, ids, lab + " (single) (aug)"))
+    
+# a4. static oversampling singles per SWEET only because currently underrepresented
+for _ in range(2):
+    for ts in [0]:
+        pure_train.append(make_mix([ts], amp=np.random.randint(220, 321)))
+
+# a5. static oversampling augmented per SWEET only because currently underrepresented
+for _ in range(2):
+    for taste_id in [0]:
+        va, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 321))
+        va = jitter_active(va,  frac=rng.uniform(0.10, 0.25), rng=rng)
+        va = global_gain(va, lo=0.85, hi=1.20, rng=rng)
+        va = channel_dropout(va, p=rng.uniform(0.03, 0.07), rng=rng)
+        pure_train.append((va, ids, lab + " (single) (aug)"))
 
 # b. Val
 pure_val = []
@@ -3069,7 +3083,7 @@ step_phase4 = 0
 # HARD MIXES DINAMICI (solo FASE 3)
 HARD_FREQ = 6  # 1 trial su 6 in fase 3 sarà un hard-mix on-the-fly
 
-# dynamic on-the-fly hard SPICY mix
+# dynamic on-the-fly hard SPICY augmented mix sampler
 def sample_hard_mix(rng):
     ia, ja, ka = SPICY_MIXES[rng.integers(0, len(SPICY_MIXES))]
     va, ids, lab = make_asymmetric_triple(
@@ -3079,7 +3093,7 @@ def sample_hard_mix(rng):
     )
     va = jitter_active(va, frac=0.12, rng=rng)
     va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
-    return va, ids, lab + " (HARD-ON-THE-FLY)"
+    return va, ids, lab + " (AUG) (HARD-ON-THE-FLY)"
 
 # Heavy-mix curriculum management
 ema_perf_heavy = 0.0
@@ -3251,7 +3265,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # progress bar + chrono + ETA
     frac   = step / TOTAL_TRAIN_STEPS
     filled = int(frac * progress_bar_len)
-    bar    = '�'*filled + '�'*(progress_bar_len - filled)
+    bar    = '█'*filled + '░'*(progress_bar_len - filled)
 
     elapsed = time.perf_counter() - sim_t0
     eta = (elapsed/frac - elapsed) if frac > 0 else 0.0
@@ -4722,6 +4736,7 @@ print("Per-class thresholds @train (�+k�, quantile, EMA):",
 dur_scale = float(test_duration / training_duration)
 thr_per_class_test = thr_per_class_train.copy()
 thr_per_class_test[:unknown_id] *= dur_scale
+thr_per_class_test[:unknown_id] *= 0.9
 
 # UNSUPERVISED LEARNING without knowing the label "a priori"
 # Prototipo "forte" = aspettativa positiva media (scalata al test window)
@@ -4739,9 +4754,9 @@ P_cop = np.diag(proto_cop[:unknown_id])
 # 4) OOD/NULL calibration sul test window
 PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=96, n_ood=192, dur=test_duration, gap=20*b.ms, thr_vec=thr_per_class_test)
 # clamp minimo delle soglie OOD
-PMR_thr = max(PMR_thr, 0.16)   # prima 0.20
-H_thr   = max(H_thr,   0.95)   # prima 0.95
-gap_thr = max(gap_thr, 0.15)   # prima 0.22
+PMR_thr = max(PMR_thr, 0.12)   # prima 0.20
+H_thr   = max(H_thr,   1.00)   # prima 0.95
+gap_thr = max(gap_thr, 0.10)   # prima 0.22
 # clipping sul gate di UNKNOWN
 #S_unk.gain_unk = float(np.clip(0.06 + 0.40*np.tanh(np.mean(ood_q)/12.0), 0.04, 0.12))
 S_unk.gain_unk = 0.0
@@ -5002,7 +5017,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # progress bar + chrono + ETA
     frac   = step / total_test
     filled = int(frac * progress_bar_len)
-    bar    = '�'*filled + '�'*(progress_bar_len - filled)
+    bar    = '█'*filled + '░'*(progress_bar_len - filled)
 
     elapsed = time.perf_counter() - test_t0
     eta = (elapsed/frac - elapsed) if frac > 0 else 0.0
@@ -5314,7 +5329,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # Se il top NON passa il controllo assoluto, NON promuovere nulla.
     # Se NON è "mixture-like", chiudi subito il trial in UNKNOWN.
-    if not top_pass_strict:
+    '''if not top_pass_strict:
         if not is_mixture_like:
             winners = [unknown_id]
             expected  = [taste_map[idxs] for idxs in true_ids]
@@ -5328,7 +5343,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             # Caso mix-like: NON accettiamo ancora alcuna classe,
             # ma lasciamo la possibilità al blocco NNLS (se attivo) di proporre una scomposizione.
             # Se NNLS non trova candidati accettabili, ricadrà in UNKNOWN più avanti.
-            pass
+            pass'''
 
     # Penalità classi calde SOLO in energia diffusa
     if is_diffuse:
@@ -5597,11 +5612,12 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     if k_est != 1 and NNLS_ACTIVE:
         nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
         too_many_active_diffuse = (
-            (k_active > 5) and
-            ((PMR < 1.03*PMR_thr) or (H > 0.95*H_thr)) and
+            (k_active >= 6) and                      # scatta solo se hai davvero tanti attivi
+            (PMR < 0.97 * PMR_thr) and               # PMR chiaramente sotto soglia
+            (H   > 1.05 * H_thr) and                 # entropia chiaramente sopra soglia
             (not may_allow_k5) and
             (nnls_k < 5)
-        )
+)
         
         if too_many_active_diffuse:
             winners = [unknown_id]
