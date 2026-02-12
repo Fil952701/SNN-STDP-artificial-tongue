@@ -448,7 +448,7 @@ def decode_by_nnls(
                       thr_rel=float(thr_rel_eff), ws=ws)
     
 # normalizzazione L1 per popolazioni di neuroni e non più solo singoli
-def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
+'''def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
                  floor=0.0, allow_upscale=True, scale_max=1.15):
     # Normalizza i pesi in ingresso per ogni neurone post-sinaptico (j),
     # con un lieve bias alla diagonale (pre=i corrispondente alla sua classe).
@@ -496,7 +496,66 @@ def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
         wcol[(icol == q)] /= diag_bias_gamma
         W[mask_col] = wcol
 
-    S.w[:] = W
+    S.w[:] = W'''
+    
+def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
+                 floor=0.0, allow_upscale=True, scale_max=1.15,
+                 w_min=0.05, w_max=0.95):
+
+    Wi = np.asarray(S.i[:], int)
+    Wj = np.asarray(S.j[:], int)
+    W  = np.asarray(S.w[:], float)
+    C_known = unknown_id
+
+    fanin = C_known
+    if target is None:
+        init_mean = float(np.mean(W)) if W.size else 0.5
+        target = float(np.clip(init_mean * fanin, 0.5*fanin*0.2, 1.5*fanin*0.8))
+
+    floor_eff = max(float(floor), float(w_min))
+
+    for jx in range(TOTAL_OUT):
+        mask_col = (Wj == jx)
+        if not np.any(mask_col):
+            continue
+
+        wcol = W[mask_col].copy()
+        icol = Wi[mask_col]
+
+        # floor (coerente con W_MIN)
+        wcol = np.maximum(wcol, floor_eff)
+
+        # classe della popolazione post
+        q = (jx // NEURONS_PER_TASTE)
+
+        # bias diagonale temporaneo
+        diag_mask = (icol == q)
+        wcol[diag_mask] *= float(diag_bias_gamma)
+
+        if mode == "l1":
+            sz = float(np.sum(wcol))
+            if sz > 1e-12:
+                scale = float(target) / sz
+                if not allow_upscale:
+                    scale = min(1.0, scale)
+                scale = float(np.clip(scale, 1.0/scale_max, scale_max))
+                wcol *= scale
+        else:
+            xd = wcol / max(1e-9, float(temperature))
+            xd = np.exp(xd - np.max(xd))
+            xd /= float(np.sum(xd) + 1e-9)
+            wcol = xd * float(target)
+
+        # rimuovi bias
+        wcol[diag_mask] /= float(diag_bias_gamma)
+
+        # clamp finale per colonna
+        wcol = np.clip(wcol, W_MIN, W_MAX)
+
+        W[mask_col] = wcol
+
+    # clamp globale (ridondante ma sicuro per coerenza col resto)
+    S.w[:] = np.clip(W, W_MIN, W_MAX)    
 
 # Restituisce lo slice di output per il gusto t (0..num_tastes-1) cosi evito di inserire UNKNOWN
 def taste_slice(tx):
@@ -518,11 +577,17 @@ def set_unknown_gate(pmr, gap, H, PMR_thr, gap_thr, H_thr):
     # prima: >=3 → 0.6, altrimenti 0.0
     # dopo:  >=2 → 1.0 (forte), 1 → 0.4 (blando), 0 → 0.15 (baseline anti-falso-positivo)
     #S_unk.gain_unk = 1.15 if conds >= 2 else (0.55 if conds == 1 else 0.35)
-    # DEBUG
-    S_unk.gain_unk = 0.25
+    if conds == 0:
+        S_unk.gain_unk = 0.35
+    elif conds == 1:
+        S_unk.gain_unk = 1.10   # da 0.75 → 0.95
+    elif conds == 2:
+        S_unk.gain_unk = 1.70   # da 1.20 → 1.40
+    else:
+        S_unk.gain_unk = 2.10   # da 1.50 → 1.75
     
     # se c'è craving alto ma evidenza debole -> preferisci UNKNOWN, evita “wishful thinking”
-    if (max(crave_f[:unknown_id]) > 0.80 or max(crave_s[:unknown_id]) > 0.80) and (pmr < PMR_thr or gap < gap_thr):
+    if ENABLE_DESIRE == True and ((max(crave_f[:unknown_id]) > 0.80 or max(crave_s[:unknown_id]) > 0.80) and (pmr < PMR_thr or gap < gap_thr)):
         S_unk.gain_unk = max(float(S_unk.gain_unk), 1.30)
     
 # collapse all the population to its relevant taste to reward it
@@ -632,7 +697,7 @@ print("\n- ARTIFICIAL TONGUE's SNN with Triplet STDP and STP (Tsodyks-Markram), 
 
 # 2. Define tastes
 # Redundant POPULATION neurons mode (set >1 to enable)
-NEURONS_PER_TASTE = 5  # 1 = only one neuron for each taste; >1 = different neuron populations for each taste
+NEURONS_PER_TASTE = 7  # 1 = only one neuron for each taste; >1 = different neuron populations for each taste
 TOTAL_OUT = num_tastes * NEURONS_PER_TASTE
 
 taste_labels = ["SWEET", "BITTER", "SALTY", "SOUR", "UMAMI",
@@ -710,7 +775,7 @@ g_step_inh_local     = 1.2 * b.nS       # lateral inhibition strength
 # because it will break all the mixes otherwise
 tau_gdi              = 80 * b.ms        # global pool temporal window
 k_e2g_ff             = 0.0025           # feed-forward contribute (Poisson input spikes) -> GDI
-k_e2g_fb             = 0.0010           # feedback contribute (output neuron spikes) -> GDI
+k_e2g_fb             = 0.0010           # feed-back contribute (neuron output spikes) -> GDI
 gamma_gdi_0          = 0.10             # scaled reward for (dimensionless)
 gdi_reset_each_trial = True             # managing carry-over thorugh trials
 
@@ -757,6 +822,7 @@ k_ex_ACH             = 0.20             # exictement gain with ACh
 ach_plasticity_gain  = 0.40             # ACh -> reward effect on -> w
 k_noise_ACH          = 0.25             # ACh noise environment reduction
 # GABA -> global inhibition/stability
+GABA_CAP             = 1.0
 tau_GABA             = 800 * b.ms       # decay for GABA
 k_inh_GABA           = 0.45             # WTA scaling with GABA
 gaba_pulse_stabilize = 0.8              # burst when activity is too much
@@ -817,38 +883,36 @@ meta_lambda           = 0.05             # EMA velocity
 gwin_ema        = np.zeros(unknown_id)   # historical for every class
 
 # Off-diag hyperparameters
-beta                  = 0.03            # learning rate for negative reward
+beta                  = 0.03             # learning rate for negative reward
 beta_offdiag          = 0.06 * beta      # off-diag parameter
 USE_OFFDIAG_DOPAMINE  = True             # quick toggle to activate/deactivate reward for off-diagonals
 USE_FP_DIFFUSE_PENALTY = True
 OFFDIAG_DECAY         = 0.90              # fattore di decadimento graduale
 OFFDIAG_W_FLOOR       = 1e-3              # pavimento > 0 per non andare mai a 0 secco
 beta_offdiag_map      = np.ones(unknown_id)
-'''beta_offdiag_map[0]   = 2.40             # SWEET
-beta_offdiag_map[1]   = 1.60             # BITTER 
-beta_offdiag_map[2]   = 2.40             # SALTY
-beta_offdiag_map[3]   = 1.60             # SOUR
-beta_offdiag_map[4]   = 2.20             # UMAMI 
-beta_offdiag_map[5]   = 2.20             # FATTY
-beta_offdiag_map[6]   = 2.00             # SPIC
-'''
-beta_offdiag_map = {ts: 1.2 for ts in TASTE_NAMES} 
+#beta_offdiag_map      = {ts: 1.5 for ts in TASTE_NAMES}
+beta_offdiag_map[0]   = 1.5               # SWEET
+beta_offdiag_map[1]   = 1.5               # BITTER
+beta_offdiag_map[2]   = 1.5               # SALTY
+beta_offdiag_map[3]   = 1.5               # SOUR
+beta_offdiag_map[4]   = 1.5               # UMAMI
+beta_offdiag_map[5]   = 1.5               # FATTY
+beta_offdiag_map[6]   = 1.5               # SPICY
 
 # Normalization per-column (synaptic scaling in input)
 USE_COL_NORM          = True             # on the normalization
 col_norm_mode         = "l1"             # "l1" (sum=target) or "softmax" -> synaptic scaling that mantains input scale per post neuron to avoid unfair competition
-col_norm_every        = 401               # execute norm every N trial
+col_norm_every        = 151 # prima 401   # execute norm every N trial
 col_norm_temp         = 1.0              # temperature softmax (if mode="softmax")
 col_norm_target       = None             # if None, calculating the target at the beginning of the trial
 diag_bias_gamma       = 1.25            # or 1.45; >1.0 = light bias to the diagonal weight before normalization
 col_floor             = 0.005             # floor (0 or light epsilon) before norm
-col_allow_upscale     = True            # light up-scaling
-col_upscale_slack     = 0.95             # if L1 < 90% target � boost
+col_allow_upscale     = False            # light up-scaling
+col_upscale_slack     = 0.90             # if L1 < 90% target � boost
 col_scale_max         = 1.05            # max factor per step
 # col_norm conditions function
 NORM_WARMUP           = 250
 COLNORM_PHASE         = (NORM_WARMUP + 1) % col_norm_every
-#COLNORM_PHASE         = None
 SAFE_GAP              = 2                # salta col norm per 2 trial dopo l’homeostasi plastica
 DECAY_GAP             = 1                # salta col norm per il trial del decay e per quello subito dopo
 GLOBAL_MIN_GAP        = 2                # almeno 15 trial di distanza
@@ -907,12 +971,13 @@ water_idxs           = [2, 6]           # SALTY, SPICY
 # 3-timescale Eligibility Trace (fast, slow, very_slow)
 USE_MULTI_ELIG       = True
 USE_DYNAMIC_ALPHA    = True
+DELTA_CAP            = 0.02
 tau                  = 30 * b.ms        # STDP time constant
 Te_fast              = 50 * b.ms        # componente veloce (entro-trial, vicino al reward)
 Te_slow              = 400 * b.ms       # componente lenta (ponticello verso il reward ritardato)
 Te_vslow             = 1500 * b.ms      # componente molto lenta di consolidamento a lungo termine
-ETA_FAST             = 0.7
-ETA_SLOW             = 0.25
+ETA_FAST             = 0.5
+ETA_SLOW             = 0.35
 ETA_VSLOW            = 0.05
 # Triplet STDP parameters
 A2p                  = 0.0060
@@ -950,7 +1015,7 @@ stp_u0_stable        = 0.20             # just in case that you don't want to us
 stp_uinc             = 0.02             # increasing per-spike (facilitation)
 stp_tau_rec          = 180 * b.ms       # recovery (STD)
 stp_tau_facil        = 450 * b.ms       # facilitation decay (STF)
-stp_r_ref            = 140.0            # reference Hz to calibrate gain for STP
+stp_r_ref            = 200.0            # reference Hz to calibrate gain for STP
 stp_warmup_trials    = 150              # important initial warmup to avoid DA suppression in the beginning
 # Warmup steps calculation for STP variables stabilization during test phase
 WARM_STP             = True             # toggle to set STP warmup ON/OFF during test phase
@@ -961,7 +1026,7 @@ HOMEOSTASIS_ON          = True          # toggle generale
 HOMEOSTASIS_TARGET_RATE = 30.0          # Hz per neurone di output (set-point desiderato)
 HOMEOSTASIS_ALPHA       = 0.01          # EMA lenta sui firing rate (≈ costante di tempo ~100 trial)
 HOMEOSTASIS_BETA        = 0.05          # morbidezza scaling (0 -> no scaling, 1 -> scaling pieno)
-HOMEOSTASIS_EVERY       = 151           # applica lo scaling ogni N trial
+HOMEOSTASIS_EVERY       = 307           # prima 151 -> applica lo scaling ogni N trial
 HOMEOSTASIS_SCALE_MIN   = 0.97          # fattore minimo per step (evita cambiamenti violenti)
 HOMEOSTASIS_SCALE_MAX   = 1.03          # fattore massimo per step
 HOMEOSTASIS_PHASE       = 7             # avoiding other intervents coincidences
@@ -991,16 +1056,20 @@ EPI_FREQ                = EPI_EVERY     # alias esplicito: ogni quanti step prov
 # Dynamic OVERSAMPLING -> TRAIN ONLY
 USE_DYNAMIC_OVERSAMPLING = True        # switch to TRUE to apply it
 CLASS_BOOST = np.ones(unknown_id, dtype=float)
-CLASS_BOOST[6]       = 1.10             # SPICY leggermente sopra perché è già molto presente
-BOOST_LAM            = 0.10             # EMA speed
+#CLASS_BOOST[6]       = 1.10             # SPICY leggermente sopra perché è già molto presente
+#CLASS_BOOST[0]       = 1.10             # SWEET
+BOOST_LAM            = 0.01             # EMA speed
 BOOST_GAIN           = 0.40             # quanto “spinge” il need
 BOOST_CAP            = (0.90, 1.15)     # clamp per gusto (min,max)
 BOOST_APPLY_GUARD_STEPS = fp_gate_warmup_steps  # non applicare boost nei primissimi step (EMA ancora grezze)
 
 # Biological per-class attention bias -> TRAIN ONLY (no oversampling)
 USE_ATTENTIONAL_BIAS = True             # toggle to set attentional bias ON/OFF
-ATTN_BIAS_GAIN_MV    = 0.42             # mV di bias max circa per unità "need_norm-1"
-ATTN_BIAS_CAP_MV     = 6.0              # cap di sicurezza per gusto
+ATTN_BIAS_GAIN_MV    = 0.4              # mV di bias max circa per unità "need_norm-1"
+ATTN_BIAS_CAP_MV     = 2.0              # cap di sicurezza per gusto
+ATTN_BIAS_FLOOR_MV   = -2.0             # pavimento soglia base per non scendere sotto
+DEBITO_CAP           = 0.20             # 30% sopra la media globale
+alpha_atten          = 0.01             # coefficiente di bias tonico molto lento
 HAS_STRONG_FP_PULSE  = True
 
 # Bio-plausible early-stopping (DA gating + best snapshot)
@@ -1018,15 +1087,19 @@ USE_PLASTICITY_DECAY = False            # toggle ON/OFF plasticity decay
 USE_SLOW_CONSOLIDATION = True           # toggle to set slow consolidation ON/OFF 
 USE_EARLY_STOP       = False            # Test 1: niente early stopping
 EARLY_STOP_MIN_FRAC  = 0.7              # usa early stop solo dopo il 70% dei trial
-PATIENCE_LIMIT       = 200              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
-ETA_CONSOL           = 0.05             # slow capture rate (0..1) toward current fast weights
+PATIENCE_LIMIT       = 300              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
+ETA_CONSOL           = 0.01             # slow capture rate (0..1) toward current fast weights
 DA_THR_CONSOL        = 0.35             # require enough DA to consolidate into w_slow
 BETA_MIX_TEST        = 0.10             # how much fast to keep when mixing slow→test (0..1)
 USE_SOFT_PULL        = True             # softly drift toward best-state when stagnating
-RHO_PULL             = 0.25             # 0..1, per-trial pull strength
+#RHO_PULL             = 0.08             # 0..1, per-trial pull strength
 PLASTICITY_DECAY     = 0.95             # multiplicative decay on S.stdp_on when stagnating
 MAX_PLASTICITY_DECAYS= 1                # maximum number of decays allowed
 W_EMA                = 12               # window size for EMA calculation
+SOFT_PULL_DROP_EPS       = 0.02                            # devi essere davvero sotto il best_ema
+SOFT_PULL_COOLDOWN_STEPS = 40                              # max 1 pull ogni 40 trial
+RHO_PULL_EARLY           = 0.02                            # non 0.25
+RHO_PULL_MAX             = 0.05
 # storico corto per stimare il rumore dell'EMA
 ema_hist             = deque(maxlen=32) # storicizzo le ultime 32 performance
 ema_perf_sd          = 0.0              # aggiornata ad ogni trial
@@ -1052,9 +1125,12 @@ DECAY_PATIENCE_STEPS = 200              # finestra lunga senza miglioramenti
 DECAY_EPS            = 0.08             # quanto deve ESSERE PEGGIO di best_ema_perf
 STDP_ON_MIN          = 0.65             # clamp minimo per stdp_on / PLAST_GLOBAL
 STDP_ON_DECAY_FACTOR = 0.9              # riduzione quando faccio un decay globale
-JACC_THR             = 0.25              # minima soglia Jaccard per blind
+JACC_THR             = 0.25             # minima soglia Jaccard per blind
 # GDI toggle for activation/deactivation
 USE_GDI              = True             # True => use GDI; False => use rate normalization
+# on/off GABA neuromod during reward
+GABA_ON              = True
+GABA_STABILIZE_ON    = True
 # Best-checkpoint snapshot weights
 BEST_CHECKPOINT      = True
 # logging accuracy
@@ -1062,10 +1138,40 @@ BEST_CHECKPOINT      = True
 ema_acc_short        = 0.0
 ema_acc_long         = 0.0
 
+# Partial reinforcement DA between Jacc 0.0 < r < 0.67
+# La MINI-REINFORCEMENT serve solo se voglio che, 
+# anche quando jacc è sotto soglia, 
+# ci sia un mini-periodo “fisiologico” in cui la rete 
+# gira con DA/da_gate aperto e quindi:
+USE_PARTIAL_REINFORCE = True
+PARTIAL_JACC_MAX     = 0.67
+PARTIAL_GATE_SCALE   = 0.05     # 0.05..0.20
+PARTIAL_DUR_SCALE    = 0.10     # 0.10..0.40
+
+# full DA reward on Jacc r >= 0.67
+USE_FULL_REINFORCE   = True
+
+# Simple-way neuromodulation gains
+USE_SIMPLE_NEUROMOD  = False            # toggle neuromodulators + simple gains ON/OFF
+# gains per ogni neuromodulatore
+simple_da_gain_pos   = 0.3  # con GABA attivo prima 0.5 -> provare anche 0.4              # quanto DA (fasica+tonica) amplifica il reward positivo
+simple_da_gain_neg   = 0.2  # con GABA attivo prima 0.75 -> provare anche 0.6             # quanto DA attenua le punizioni
+simple_ach_gain      = 0.2              # ACh aumenta la plasticità positiva
+simple_ne_gain       = 0.2              # NE/HI -> arousal / salienza
+simple_hi_gain       = 0.1              # HI -> novità / esplorazione
+
+simple_ht_gain_pos   = 0.1 # con GABA attivo prima 0.75 -> provare anche 0.6             # 5-HT smorza rewards troppo grossi
+simple_ht_gain_neg   = 0.1 # con GABA attivo prima 0.75 -> provare anche 0.6             # e rafforza le punizioni
+simple_gaba_gain_neg = 0.2              # GABA smorza plasticità in generale
+
+simple_hun_gain      = 0.2              # fame -> spinge ad imparare di più
+simple_sat_gain      = 0.05             # tra 0.1 e 0.05  # sazietà -> riduce reward
+simple_h2o_gain      = 0.1              # sete -> plasticità per gusti "acquosi" (se vuoi usarlo globale, resta neutro)
+
 # iperparametri per la EMA dell'accuracy (indipendenti da ema_perf)
-ACC_ALPHA_SHORT      = 0.20   # reattiva (pochi trial di memoria)
-ACC_ALPHA_LONG       = 0.02   # lenta (andamento globale)
-ACCURACY_ON          = True   # toggle on/off
+ACC_ALPHA_SHORT      = 0.20             # reattiva (pochi trial di memoria)
+ACC_ALPHA_LONG       = 0.02             # lenta (andamento globale)
+ACCURACY_ON          = True             # toggle on/off
 ACC_BUCKETS = {
     "single":   {"ema_short": 0.0, "ema_long": 0.0, "count": 0},
     "pair":     {"ema_short": 0.0, "ema_long": 0.0, "count": 0},
@@ -1261,24 +1367,24 @@ connectivity_mode    = "dense"          # "dense" -> fully-connected | "diagonal
 if TRAINING_PROFILE == "stable_core":
     # Core bio: STDP, STP, 3-timescale elig, GDI, neuromodulatori, craving, curriculum, ecc.
     # Spengo solo i moduli "meta" più aggressivi / strutturali.
-    # Niente oversampling dinamico (già False, ma lo forziamo)
+    # Niente oversampling dinamico se ho attentional bias e viceversa
     USE_DYNAMIC_OVERSAMPLING = False
     # Niente plasticità fuori diagonale basata su dopamine complicata
     USE_OFFDIAG_DOPAMINE = False
-    # Niente soft-pull verso best snapshot
-    USE_SOFT_PULL = False
+    # Soft-pull verso best snapshot
+    USE_SOFT_PULL = True
+    # Consolidamento lento tipo "w_slow" per consolidare lentamente i pesi verso best snapshot
+    USE_SLOW_CONSOLIDATION = True
     # Niente plasticity decay globale
     USE_PLASTICITY_DECAY = False
     # Niente early stopping sofisticato (lasciamo finire tutti gli step)
-    USE_EARLY_STOP = False
+    USE_EARLY_STOP = True
     # Spengo la homeostasi di firing-rate globale (Turrigiano-like)
     HOMEOSTASIS_ON =  True
     # attentional bias
-    USE_ATTENTIONAL_BIAS = False
+    USE_ATTENTIONAL_BIAS = True
     # Lascio l'epigenetica già spenta (EPI_ON è già False), ma la ribadisco:
     EPI_ON = False
-    # Spengo il consolidamento lento tipo "w_slow"
-    USE_SLOW_CONSOLIDATION = False
     # Togliamo l’hedonic DA gating (usa solo DA “standard” legato al reward)
     USE_HEDONIC_DA = False
     # col norm
@@ -1286,7 +1392,7 @@ if TRAINING_PROFILE == "stable_core":
     # SPICY aversion
     USE_SPICY_AVERSION = False
     # metaplasticità 
-    USE_META = True
+    USE_META = False
     # learning rate dinamico
     USE_DYNAMIC_ALPHA = False
     # GDI
@@ -1302,7 +1408,7 @@ if TRAINING_PROFILE == "stable_core":
     # intrisic homeostasis
     INTRINSIC_HOMEO = True
     # DA plastic reinforcement
-    PLAST_GLOBAL = 3.0
+    PLAST_GLOBAL = 1.0
     # LTD strutturale OFF
     USE_LTD_OFFDIAG = True
     # FP DIFFUSE
@@ -1318,11 +1424,33 @@ if TRAINING_PROFILE == "stable_core":
     # best checkpoint
     BEST_CHECKPOINT = True
     # Triplet STDP parameters
-    A2p =  0.0055 * PLAST_GLOBAL  # pair LTP => prima 0.0065, poi 0.0070
+    '''A2p =  0.0055 * PLAST_GLOBAL  # pair LTP => prima 0.0065, poi 0.0070
     A3p =  0.0065 * PLAST_GLOBAL  # triplet LTP => prima 0.0070, poi 0.0075
     A2m = -0.0055 * PLAST_GLOBAL  # pair LTD => prima -0.0070, poi -0.0075
-    A3m = -0.0025 * PLAST_GLOBAL  # triplet LTD
+    A3m = -0.0025 * PLAST_GLOBAL  # triplet LTD'''
+    A2p =  0.0055  # pair LTP => prima 0.0065, poi 0.0070
+    A3p =  0.0065  # triplet LTP => prima 0.0070, poi 0.0075
+    A2m = -0.0055  # pair LTD => prima -0.0070, poi -0.0075
+    A3m = -0.0025  # triplet LTD
     alpha_lr = 0.08 # global LR
+    # simple neuromod gains
+    USE_SIMPLE_NEUROMOD  = True   # toggle neuromodulators + simple gains ON/OFF
+    # on/off GABA neuromod during reward
+    GABA_ON = False
+    GABA_STABILIZE_ON = True
+    # partial DA reward on Jacc 0 < r < 0.67
+    USE_PARTIAL_REINFORCE = True
+    # full DA reward on Jacc r >= 0.67
+    USE_FULL_REINFORCE = True
+
+# clipping bounds
+W_MIN, W_MAX = 0.05, 0.95
+w_rng = (W_MAX - W_MIN)
+
+# calcolo quantile e media elig traces
+def stats_elig(x):
+    ax = np.abs(np.asarray(x, float))
+    return ax.mean(), np.quantile(ax, 0.95)
 
 # Test stimulus manager to stop/start test stimulus
 def stop_test_stimulus():
@@ -1333,7 +1461,7 @@ def set_plasticity_scale(scale: float):
     prev = float(np.mean(S.stdp_on[:])) if hasattr(S, 'stdp_on') else float(globals().get('PLAST_GLOBAL', 1.0))
     floor = float(globals().get('PLAST_GLOBAL_FLOOR', 0.0))
     s = float(np.clip(scale, floor, 1.0))
-    # Hysteresis/floor (evita flap su micro variazioni)
+    # Hysteresis/floor (immette base per evitare flap su micro variazioni)
     EPS = 1e-3
     if abs(s - prev) < EPS:
         return prev, prev
@@ -1348,7 +1476,7 @@ def set_plasticity_scale(scale: float):
     if hasattr(S, 'elig'):
         cool = 0.5 + 0.5*s
         if s < prev:            # stai riducendo (plateau/instabilità)
-            cool *= 0.9         # raffredda un filo di più
+            cool *= 0.9         # raffredda un filo di più la plasticità per fare pull towards plasticity
         S.elig_fast[:]  *= cool
         S.elig_slow[:]  *= cool
         S.elig_vslow[:] *= cool
@@ -1358,18 +1486,45 @@ def set_plasticity_scale(scale: float):
         print(f"[Plasticity Scale] {prev:.3f} → {s:.3f} (cool={cool:.3f})")
     return prev, s
 
-def soft_pull_toward_best(best_sd, rho: float = 0.25):
-    """
-    Drift morbido dei pesi correnti verso il best snapshot (bio-plausibile “consolidation pull”).
-    """
+# serve per effettuare un piccolo pull da parte della plasticità verso lo stato migliore registrato durante il training
+# è fondamentale che avvenga in maniera soft per evitare cambi bruschi di plasticità
+def soft_pull_toward_best(best_sd, rho: float = 0.03, pull_theta: bool = False, damp_elig: bool = True):
+    
     if best_sd is None:
         return
-    # soft blend solo sui pesi sinaptici veloci + theta
-    if best_sd.get('w') is not None:
-        S.w[:] = (1.0 - rho) * S.w[:] + rho * best_sd['w']
-    if hasattr(taste_neurons, 'theta'):
-        taste_neurons.theta[:] = (1.0 - 0.5*rho) * taste_neurons.theta[:] + (0.5*rho) * best_sd['theta']
 
+    # 1) pull dei pesi (fast weights)
+    if best_sd.get('w') is not None:
+        bw = best_sd.get('w')
+
+        if USE_SLOW_CONSOLIDATION:
+            # if there is slow_consolidation we don't want to touch the online learning
+            #w_slow *= (1.0 - rho)
+            #w_slow += rho * bw
+            w_slow[:] = (1.0 - rho) * w_slow + rho * bw
+            if w_slow is None:
+                return
+            if bw is None or len(bw) != len(w_slow):
+                return
+        else:
+            if bw is None:
+                return
+            S.w[:] = (1.0 - rho) * S.w[:] + rho * bw
+            S.w[:] = np.clip(S.w[:], W_MIN, W_MAX)
+
+
+    # 2) theta: OFF di default (è spesso il killer)
+    if pull_theta and hasattr(taste_neurons, 'theta') and best_sd.get('theta') is not None:
+        rho_t = 0.10 * rho  # molto più piccolo dei pesi
+        taste_neurons.theta[:] = (1.0 - rho_t) * taste_neurons.theta[:] + rho_t * best_sd['theta']
+
+    # 3) se NON resetto più le elig a fine trial: almeno smorzo quando faccio "teletrasporto" dei pesi
+    if damp_elig:
+        damp = max(0.0, 1.0 - 2.0*rho)  # es: rho=0.03 -> damp=0.94
+        S.elig_fast[:]  *= damp
+        S.elig_slow[:]  *= damp
+        S.elig_vslow[:] *= damp
+        
 # helper to define states fallback for hedonic window during DA reinforcement
 def state_hed_fallback_vec(mod, base=hed_fallback):
     H = float(mod.HUN[0])
@@ -1464,7 +1619,7 @@ def blind_spots(
         err  = cls_errors[tid]
         if seen < min_seen_cls:
             continue
-        err_rate = err / seen if seen > 0 else 0.0
+        err_rate = err / seen if seen > 0 else 0.0 # avoiding division by 0
         stats_cls.append((err_rate, seen, err, tid))
     
     # ordina per error-rate decrescente => si parte vedendo la più problematica
@@ -1475,7 +1630,7 @@ def blind_spots(
             print(f"  - {taste_map[tid]:<8} | seen={seen:4d} | err={err:4d} | err_rate={err_rate:.3f}")
 
     # --- COUPLE CLASSES ---
-    print("\n--- Blind couple classes: ---")
+    print("\nBlind couple classes:")
     num_eff = pair_seen.shape[0]
     stats_pairs = []
     for ia in range(num_eff):
@@ -1494,12 +1649,12 @@ def blind_spots(
             print(f"  - ({taste_map[ia]} + {taste_map[ja]}) | seen={seen:4d} | | err={err:4d} |  | err_rate={err_rate:.3f}")
 
     # --- COMBO CLASSES ---
-    print("\n--- Blind (>= 3 tastes) combo classes:")
+    print("\nBlind (>= 3 tastes) combo classes:")
     stats_combo = []
     for key, seen, in combo_seen.items():
         if seen < min_seen_combo:
             continue
-        if len(key) < 3:
+        if len(key) < 3: # se non ha almeno 3 gusti andiamo avanti
             continue
         err  = combo_errors.get(key, 0)
         err_rate = err / seen if seen > 0 else 0.0
@@ -1809,7 +1964,7 @@ def restore_state_without(sd):
 # col norm utilities management
 # 1. 0..1: quanto 'forte' è il soft-pull di curriculum.
 def arm_soft_pull(strength: float):
-    
+    # clip del soft pull
     global soft_pull_strength
     soft_pull_strength = float(np.clip(strength, 0.0, 1.0))
 
@@ -1847,7 +2002,8 @@ def run_col_norm(step) -> bool:
         return False
     
     if step <= NORM_WARMUP:
-        if verbose_rewards: print(f"\n[COL-NORM] skip: warmup ({step} <= {NORM_WARMUP})")
+        if verbose_rewards: 
+            print(f"\n[COL-NORM] skip: norm warmup ({step} <= {NORM_WARMUP})")
         return False
     
     phase = (step % col_norm_every)
@@ -1987,7 +2143,7 @@ def ood_calibration(n_null=16, n_ood=32, dur=200*b.ms, gap=0*b.ms, thr_vec=None)
 
     # 0.997 per-class quantile on negatives OOD/NULL
     ood_q = np.array([
-        (np.quantile(tmp_spikes[idx], 0.9995) if len(tmp_spikes[idx]) else 0.0)
+        (np.quantile(tmp_spikes[idx], 0.998) if len(tmp_spikes[idx]) else 0.0)
         for idx in range(num_tastes-1)
     ], dtype=float)
 
@@ -2078,9 +2234,12 @@ k_sens_spice = profile['k_sens_spice_hub']
 taste_neurons = b.NeuronGroup(
     TOTAL_OUT, # by this way, i can use both methods: population mode and single neuron
     model='''
+        # ---- gLIF Neuron membrane equations ----
         dv/dt = (gL*(EL - v) + ge*(Ee - v) + gi*(Ei - v))/C : volt (unless refractory)
         dge/dt = -ge/taue : siemens
         dgi/dt = -gi/taui : siemens
+        
+        # ---- Intrinsic Homeostasis ----
         ds/dt = -s/tau_rate : 1
         dtheta/dt = homeo_on * (s - rho_target)/tau_theta * mV : volt
         dwfast/dt = -wfast/70/ms : volt
@@ -2088,8 +2247,8 @@ taste_neurons = b.NeuronGroup(
         homeo_on : 1
 
         # ---- GDI (pool linked + centering/saturation) ----
-        gdi : 1 (linked)                 # global pool value
-        gdi_center : 1                   # pool baseline
+        gdi        : 1 (linked)          # global pool value
+        gdi_center : 1                   # pool starting baseline
         gdi_half   : 1                   # half-saturation
         pos_gdi = 0.5*((gdi - gdi_center) + abs(gdi - gdi_center)) : 1
         gdi_eff = pos_gdi / (1.0 + pos_gdi/gdi_half) : 1
@@ -2097,21 +2256,21 @@ taste_neurons = b.NeuronGroup(
         # ----- Hedonic window for every different taste -----
         dtaste_drive/dt = -taste_drive/tau_drive_win : 1
 
-        # High threshold of the Hedonic window
+        # ----- High threshold of the Hedonic window -----
         dav_over/dt = (-av_over + 0.5*((taste_drive - thr_hi) + abs(taste_drive - thr_hi)))/tau_av_win : 1
         # Low threshold of the Hedonic window
         dav_under/dt = (-av_under + 0.5*((thr_lo - taste_drive) + abs(thr_lo - taste_drive)))/tau_av_win : 1
 
-        # Over time adapting HIGH
+        # ----- Over time adapting HIGH -----
         dthr_hi/dt = (-(thr_hi - thr0_hi)
                       + k_hab_hi*av_over*(1 + eta_da_win*da_gate)
                       - k_sens_hi*av_over*(1 - da_gate)) / tau_thr_win : 1
-        # Over time adapting LOW
+        # ----- Over time adapting LOW -----
         dthr_lo/dt = (-(thr_lo - thr0_lo)
                       + k_hab_lo*av_under
                       - k_sens_lo*av_over) / tau_thr_win : 1
         
-        # Stateless parameters for the Hedonic window
+        # ----- Stateless parameters for the Hedonic window -----
         thr0_hi   : 1
         thr0_lo   : 1
         k_hab_hi  : 1
@@ -2175,11 +2334,12 @@ state_mon = b.StateMonitor(taste_neurons, 'v', record=True, clock=mon_clock) # m
 pg = b.PoissonGroup(num_tastes, rates=np.zeros(num_tastes)*b.Hz)
 
 # 2) Neutral noise (no plasticity) -> background Poisson (sorrounding ambient)
-baseline_hz = 0.5  # 0.5-1 Hz
+baseline_hz = 0.5  # 0.5-1 Hz noise as baseline
 pg_noise = b.PoissonGroup(num_tastes, rates=baseline_hz*np.ones(num_tastes)*b.Hz)
 
 # Global Division Inhibition GDI neuron integrator => only one 
-gdi_pool = b.NeuronGroup(1, 'dx/dt = -x/tau_gdi : 1',
+gdi_pool = b.NeuronGroup(1, 
+                         'dx/dt = -x/tau_gdi : 1',
                          method='euler',
                          namespace={'tau_gdi': tau_gdi})
 gdi_pool.x = 0.0
@@ -2187,16 +2347,20 @@ gdi_pool.x = 0.0
 # linking GDI value to the output neurons
 taste_neurons.gdi = b.linked_var(gdi_pool, 'x')
 
-# GDI Synapses definition (Feedforward + Feedback) to increment GDI pool value on spikes from both input and output neurons 
-# funzionalità: ad ogni spike in ingresso o in uscita, incrementa il valore di GDI di una quantità fissa
+# GDI Synapses definition (Feedforward + Feedback) to 
+# increment GDI pool value on spikes from both input and output neurons 
+# funzionalità: ad ogni spike in ingresso o in uscita, 
+# incrementa il valore di GDI di una quantità fissa per bilanciarne sempre gli effetti
 # Feedforward: input Poisson -> to GDI
-S_ff_gdi = b.Synapses(pg, gdi_pool, 
+S_ff_gdi = b.Synapses(pg, 
+                      gdi_pool, 
                       on_pre='x_post += k_e2g_ff', 
                       namespace={'k_e2g_ff': k_e2g_ff})
 S_ff_gdi.connect('i != unknown_id')
 
 # Feedback: output neurons -> to GDI
-S_fb_gdi = b.Synapses(taste_neurons, gdi_pool, 
+S_fb_gdi = b.Synapses(taste_neurons, 
+                      gdi_pool, 
                       on_pre='x_post += k_e2g_fb', 
                       namespace={'k_e2g_fb': k_e2g_fb})
 S_fb_gdi.connect('i != unknown_id')
@@ -2216,8 +2380,9 @@ gdi_mon = b.StateMonitor(gdi_pool, 'x', record=[0], clock=mon_clock)
 #     (positivo -> LTP; negativo -> LTD)
 S = b.Synapses(
     pg, taste_neurons,
-    model='''
-        w            : 1
+    model=
+    '''
+        w            : 1                 # synaptic weight
         cr_gate      : 1                 # gate per-sinapsi (>=0) -> 1.0 = neutro, >1 potenzia, <1 smorza
         x_stp        : 1                 # risorsa disponibile (0..1)
         u            : 1                 # utilizzo corrente (0..1)
@@ -2236,7 +2401,7 @@ S = b.Synapses(
         dy/dt     = -y/tau_y_plus         : 1 (event-driven)   # post (veloce, LTP)
         dybar/dt  = -ybar/tau_ybar_plus   : 1 (event-driven)   # Triplet post (lenta)
 
-        # 3-timescale eligibility traces
+        # 3-timescale eligibility traces (enough for this task)
         delig_fast/dt  = -elig_fast/Te_fast   : 1 (clock-driven)
         delig_slow/dt  = -elig_slow/Te_slow   : 1 (clock-driven)
         delig_vslow/dt = -elig_vslow/Te_vslow : 1 (clock-driven)
@@ -2345,6 +2510,8 @@ else:
             sl = taste_slice(tx)
             S.connect(i=tx, j=np.arange(sl.start, sl.stop))
     else:  # "dense" popolazionale: p -> slice(q) per tutti i q
+        # vengono pre-calcolati una sola volta grazie a *taste_slice perchè sono sempre gli stessi e non variano
+        # per accedere ad ogni neurone presente in ogni popolazione distinta serve l'unpacking * della tupla
         all_posts = {q: np.arange(*taste_slice(q).indices(TOTAL_OUT)) for q in range(num_tastes)}
         for ps in range(num_tastes):
             if ps == unknown_id:
@@ -2360,7 +2527,7 @@ if NEURONS_PER_TASTE == 1 and connectivity_mode == "dense":
     S.w['i==j'] = '0.35 + 0.25*rand()'  # 0.30 0.50 value
     S.w['i!=j'] = '0.01 + 0.03*rand()'  # 0.02 0.06 value
 else:
-    S.w = '0.2 + 0.8*rand()'
+    S.w = f'{W_MIN} + ({W_MAX - W_MIN})*rand()'
     
 # Weak non-plastic uniform drive -> UNKNOWN (rifiuto guidato dall'energia diffusa)
 #S_unk = b.Synapses(pg, taste_neurons, on_pre='ge_post += 0.30*nS')  # small but on all tastes
@@ -2400,7 +2567,7 @@ else:
     S.ex_scale_stp[:] = 1.0
     S.ex_scale[:] = 1.0
 
-    # ← aggiungi questo:
+    # dummy regular update to keep Brian2 happy:
     S.run_regularly('''
         x_stp = 1.0
         u     = 1.0
@@ -2468,7 +2635,7 @@ if TRAINING_PROFILE == "stable_core":
     g_step_inh_local = 0.8 * b.nS
     inhibitory_S.inh_scale = 0.22   # WTA più morbido
     # STP un po' meno cattivo (oppure OFF nella primissima fase di debug)
-    stp_r_ref = 200.0     # più reference → meno STD effettiva
+    #stp_r_ref = 200.0     # più reference → meno STD effettiva -> NECESSARIO CAMBIARE TALE VALORE PRIMA DI CALCOLARE GUADAGNO STP altrimenti si annulla
 
 inhibitory_S.g_step_inh = g_step_inh_local
 
@@ -2571,16 +2738,16 @@ mod.H2O = 0.2
 net = b.Network(
     taste_neurons,
     pg,
-    pg_noise, # imput neurons noise introduced
+    pg_noise,       # imput neurons noise introduced
     S,
     S_noise,
-    S_drive, # Hedonic window synapses
+    S_drive,        # Hedonic window synapses
     inhibitory_S,
     spike_mon,
     state_mon,
-    mod, # neuromodulator neurons installed into the net
+    mod,            # neuromodulator neurons installed into the net
     S_spice_sensor, # to monitor dynamic SPICY
-    gdi_pool,    # GDI management
+    gdi_pool,       # GDI management
     S_ff_gdi,
     S_fb_gdi
 )
@@ -2625,7 +2792,7 @@ pairs = [(ia, ja) for ia in range(unknown_id) for ja in range(ia+1, unknown_id)]
 triples = []
 for ia in range(unknown_id):
     for ja in range(ia+1, unknown_id):
-        for k in range(ja+1, unknown_id):
+        for k in range(ja+1, unknown_id): # ia+1 and ja+1 don't allow same co-tastes in mixes
             triples.append((ia, ja, k))
 rng.shuffle(pairs)
 rng.shuffle(triples)
@@ -2663,34 +2830,6 @@ for _ in range(n_repeats):
         va = jitter_active(va,  frac=rng.uniform(0.06, 0.22), rng=rng)
         va = global_gain(va, lo=0.82, hi=1.25, rng=rng)
         va = channel_dropout(va, p=rng.uniform(0.02, 0.06), rng=rng)
-        pure_train.append((va, ids, lab + " (single) (aug)"))
-
-# a2. static oversampling single train SWEET/SOUR/FATTY
-for _ in range(n_repeats//2):
-    for ts in [0,3,5]:
-        pure_train.append(make_mix([ts], amp=np.random.randint(220, 321)))
-
-# a3. static oversampling single train AUGMENTED SWEET/SOUR/FATTY
-for _ in range(n_repeats//2):
-    for taste_id in [0,3,5]:
-        va, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 321))
-        va = jitter_active(va,  frac=rng.uniform(0.10, 0.25), rng=rng)
-        va = global_gain(va, lo=0.85, hi=1.20, rng=rng)
-        va = channel_dropout(va, p=rng.uniform(0.03, 0.07), rng=rng)
-        pure_train.append((va, ids, lab + " (single) (aug)"))
-    
-# a4. static oversampling singles per SWEET only because currently underrepresented
-for _ in range(2):
-    for ts in [0]:
-        pure_train.append(make_mix([ts], amp=np.random.randint(220, 321)))
-
-# a5. static oversampling augmented per SWEET only because currently underrepresented
-for _ in range(2):
-    for taste_id in [0]:
-        va, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 321))
-        va = jitter_active(va,  frac=rng.uniform(0.10, 0.25), rng=rng)
-        va = global_gain(va, lo=0.85, hi=1.20, rng=rng)
-        va = channel_dropout(va, p=rng.uniform(0.03, 0.07), rng=rng)
         pure_train.append((va, ids, lab + " (single) (aug)"))
 
 # b. Val
@@ -2827,7 +2966,10 @@ def is_single(stimulus):
     return count_unique(stimulus) == 1
 
 def is_hard(stimulus):
-    return count_unique(stimulus) >= 3
+    return count_unique(stimulus) >= 4
+
+def is_triple(stimulus):
+    return count_unique(stimulus) == 3
 
 # costruzione liste in maniera incrementale
 # 0. Warmup
@@ -2838,11 +2980,15 @@ train_1 = pure_train.copy() # niente gusti warmup nel curriculum di train
 easy_pairs = [stimls for stimls in mixture_train
               if is_pair(stimls) and not is_hard(stimls)]
 train_2 = train_1 + easy_pairs
-# 3. hard mixes + couples + singles
+# 3. easy pairs, singles and triples
+triple_pairs = [stimls for stimls in mixture_train
+                if is_triple(stimls) and not is_hard(stimls)]
+train_3 = train_2 + triple_pairs
+# 4. all together
 hard_mix = [stimls for stimls in mixture_train
             if is_hard(stimls)]
-train_3 = pure_train * 1 + easy_pairs + hard_mix # i pure rimangono sempre anche nella fase 3
-# 4. final consolidation + refining
+train_4 = train_3 + hard_mix # i pure rimangono sempre anche nella fase 3
+# 5. final consolidation + refining
 singles = [stimls for stimls in (pure_train + mixture_train) 
            if is_single(stimls)]
 couples = [stimls for stimls in mixture_train
@@ -2853,22 +2999,27 @@ harden = [stimls for stimls in mixture_train
 s_early = random.sample(singles, int(0.2 * len(singles))) # 20% singoli
 c_early = random.sample(couples, int(0.3 * len(couples))) # 30% coppie
 h_early = random.sample(harden, int(0.5 * len(harden))) # 50% mix complessi
-early_4 = s_early + c_early + h_early
-rng.shuffle(early_4)
+early_5 = s_early + c_early + h_early
+rng.shuffle(early_5)
 # b. Late
 s_late = random.sample(singles, int(0.45 * len(singles))) # 20% singoli
 c_late = random.sample(couples, int(0.45 * len(couples))) # 30% coppie
 h_late = random.sample(harden, int(0.1 * len(harden))) # 50% mix complessi
-late_4 = s_late + c_late + h_late
-rng.shuffle(late_4)
+late_5 = s_late + c_late + h_late
+rng.shuffle(late_5)
 
-train_4 = early_4 + late_4
+train_5 = early_5 + late_5
+
+# 5. Final cooldown
+train_6 = pure_train.copy()
 
 # shuffle interno per ogni fase
 rng.shuffle(train_warmup)
 rng.shuffle(train_1)
 rng.shuffle(train_2)
 rng.shuffle(train_3)
+rng.shuffle(train_4)
+rng.shuffle(train_6)
 
 # VAL: coppie e triple NON viste in train (no augment)
 # pairs
@@ -2952,34 +3103,42 @@ if USE_GATE_SIMPLE:
     PHASE0_EPOCHS = 1.5   # quante volte ripetere il warmup
     PHASE1_EPOCHS = 10.0  # quante volte voglio passare su train_1
     PHASE2_EPOCHS = 3.0   # quante volte su train_2 prima di sbloccare la 3
-    PHASE3_EPOCHS = 0.5   # quante volte su train_3 (poi eventualmente early-stopping)
-    PHASE4_EPOCHS = 1.0   # quante volte sul consolidamento finale
+    PHASE3_EPOCHS = 1.0   # quante volte su train_3 (poi eventualmente early-stopping)
+    PHASE4_EPOCHS = 0.5   # quante volte su train_4
+    PHASE5_EPOCHS = 0.5   # quante volte sul consolidamento finale
+    PHASE6_EPOCHS = 0.5   # defaticamento finale
 if USE_GATE_REINFORCE:
     PHASE0_EPOCHS = 1.5   # quante volte ripetere il warmup
     PHASE1_EPOCHS = 10.0  # quante volte voglio passare su train_1
     PHASE2_EPOCHS = 2.5   # quante volte su train_2 prima di sbloccare la 3
-    PHASE3_EPOCHS = 0.5   # quante volte su train_3 (poi eventualmente early-stopping)
-    PHASE4_EPOCHS = 1.0   # quante volte sul consolidamento finale
-
+    PHASE3_EPOCHS = 1.0   # quante volte su train_3 (poi eventualmente early-stopping)
+    PHASE4_EPOCHS = 0.5   # quante volte su train_4
+    PHASE5_EPOCHS = 0.5   # quante volte sul consolidamento finale
+    PHASE6_EPOCHS = 0.5   # defaticamento finale
+    
 # phase steps
 phase0_max_steps = int(PHASE0_EPOCHS * len(train_warmup))
 phase1_max_steps = int(PHASE1_EPOCHS * len(train_1))
 phase2_max_steps = int(PHASE2_EPOCHS * len(train_2))
 phase3_max_steps = int(PHASE3_EPOCHS * len(train_3))
 phase4_max_steps = int(PHASE4_EPOCHS * len(train_4))
+phase5_max_steps = int(PHASE5_EPOCHS * len(train_5))
+phase6_max_steps = int(PHASE6_EPOCHS * len(train_6))
 
 # Train sets composition logs
 print("\nTRAINING SET:")
 print(f"Phase0 trials (warmup): {phase0_max_steps}")
 print(f"Phase1 trials (singles): {phase1_max_steps}")
 print(f"Phase2 trials (+couples): {phase2_max_steps}")
-print(f"Phase3 trials (full):    {phase3_max_steps}")
-print(f"Phase4 trials (refining):   {phase4_max_steps}")
+print(f"Phase3 trials (+triples): {phase3_max_steps}")
+print(f"Phase4 trials (full):    {phase4_max_steps}")
+print(f"Phase5 trials (refining):   {phase5_max_steps}")
+print(f"Phase6 trials (cooldown):   {phase6_max_steps}")
 
 # steps totali (prima dell'early stopping)
-TOTAL_TRAIN_STEPS = phase0_max_steps + phase1_max_steps + phase2_max_steps + phase3_max_steps + phase4_max_steps
+TOTAL_TRAIN_STEPS = phase0_max_steps + phase1_max_steps + phase2_max_steps + phase3_max_steps + phase4_max_steps + phase5_max_steps + phase6_max_steps
 print(f"\n[CURRICULUM] → TOTAL_TRAIN_STEPS = {TOTAL_TRAIN_STEPS}")
-   
+
 # 2. Val
 val_stimuli   += pure_val + mixture_val
 rng.shuffle(val_stimuli)
@@ -3019,13 +3178,19 @@ S.y[:] = 0; S.ybar[:] = 0
 S.elig_fast[:]  = 0.0
 S.elig_slow[:]  = 0.0
 S.elig_vslow[:] = 0.0
+# inizializzo attentional bias
+prev_winners = []
+theta_bias_next = None
+
 w_prev = None
 ema_cop_m1 = np.zeros(num_tastes-1)  # E[x] quando la classe è presente in mix (co-presenza)
 ema_cop_m2 = np.zeros(num_tastes-1)  # E[x^2]
 # reset GDI
 taste_neurons.v[:] = EL
 sim_t0 = time.perf_counter()
+last_soft_pull_step = None
 step = 0
+SOFT_PULL_WARMUP_STEPS   = int(0.35 * TOTAL_TRAIN_STEPS)   # non prima del 35%
 
 # little procedure that helps to calculate SNN's blind state on classes
 # seen classes
@@ -3073,15 +3238,17 @@ elig_cooldown     = 0
 print("Running short burn-in...\n")
 net.run(200*b.ms)
 CURRICULUM_MODE = True
-curr_phase = 0
+curr_phase  = 0
 # contatori per fase (per indicizzare le liste)
 step_phase0 = 0
 step_phase1 = 0
 step_phase2 = 0
 step_phase3 = 0
 step_phase4 = 0
+step_phase5 = 0
+step_phase6 = 0
 # HARD MIXES DINAMICI (solo FASE 3)
-HARD_FREQ = 6  # 1 trial su 6 in fase 3 sarà un hard-mix on-the-fly
+HARD_FREQ   = 6  # 1 trial su 6 in fase 3 sarà un hard-mix on-the-fly
 
 # dynamic on-the-fly hard SPICY augmented mix sampler
 def sample_hard_mix(rng):
@@ -3103,6 +3270,10 @@ alpha_heavy_lr = 0.04
 alpha_heavy_short = 0.05
 heavy_cooldown = 0
 
+# salvo i valori iniziali dei learning rate prima del loop
+tmp_alpha = float(alpha_lr)
+TMP_PLAST = float(PLAST_GLOBAL)
+
 # TRAINING MAIN LOOP
 for step in range(1, TOTAL_TRAIN_STEPS + 1):
     fp_structural_done = False
@@ -3119,10 +3290,18 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             print("\n[CURRICULUM] → FASE 2 (singoli + coppie)\n")
         if curr_phase == 2 and step_phase2 == phase2_max_steps:
             curr_phase = 3
-            print("\n[CURRICULUM] → FASE 3 (mix heavy + HARD_MIXES)\n")
+            print("\n[CURRICULUM] → FASE 3 (singoli + coppie + triple)\n")
         if curr_phase == 3 and step_phase3 == phase3_max_steps:
             curr_phase = 4
-            print("\n[CURRICULUM] → FASE 4 (refining)\n")
+            print("\n[CURRICULUM] → FASE 4 (mix heavy + HARD_MIXES)\n")
+        if curr_phase == 4 and step_phase4 == phase4_max_steps:
+            curr_phase = 5
+            print("\n[CURRICULUM] → FASE 5 (refining)\n")
+        if curr_phase == 5 and step_phase5 == phase5_max_steps:
+            curr_phase = 6
+            print("\n[CURRICULUM] → FASE 6 (cooldown)\n")
+        if curr_phase == 6 and step_phase6 == phase6_max_steps:
+            print("\n[CURRICULUM] → FINISH (training ended)\n")
 
     # scegli la lista di training e l'indice locale
     if curr_phase == 0:
@@ -3141,10 +3320,18 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         train_list = train_3
         idx_local  = step_phase3 % len(train_3)
         step_phase3 += 1
-    else:
+    elif curr_phase == 4:
         train_list = train_4
         idx_local  = step_phase4 % len(train_4)
         step_phase4 += 1
+    elif curr_phase == 5:
+        train_list = train_5
+        idx_local = step_phase5 % len(train_5)
+        step_phase5 += 1
+    elif curr_phase == 6:
+        train_list = train_6
+        idx_local = step_phase6 % len(train_6)
+        step_phase6 += 1
 
     # sample base dalla lista di fase
     input_rates, true_ids, label = train_list[idx_local]
@@ -3154,14 +3341,27 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # se vediamo spicy incrementiamo il contatore
     if spicy_id in true_ids:
         spicy_seen += 1
+    
+    # resetto i learning rate ad ogni nuova iterazione perché in questo modo
+    # vengono gestiti dalla fase corrente a seconda di come devono essere settati
+    alpha_lr = tmp_alpha
+    PLAST_GLOBAL = TMP_PLAST
 
     # OVERSAMPLING DINAMICO HARD_MIXES: solo in fase 3, 4, 1 trial su HARD_FREQ
-    if ((curr_phase == 3) and (step_phase3 % HARD_FREQ == 0)) or ((curr_phase == 4) and (step_phase4 % HARD_FREQ == 0)):
+    if ((curr_phase == 4) and (step_phase4 % HARD_FREQ == 0)) or ((curr_phase == 5) and (step_phase5 % HARD_FREQ == 0)):
         input_rates, true_ids, label = sample_hard_mix(rng)
     
     # fase in cui iniziano i rinforzi
     PLASTIC_PHASE = (curr_phase >= 1 and TRAINING_PHASE)
     
+    if (curr_phase == 3 and PLASTIC_PHASE):
+        PLAST_GLOBAL = PLAST_GLOBAL * 0.7
+        alpha_lr = alpha_lr * 0.7
+    
+    if (curr_phase == 6 and PLASTIC_PHASE):
+        PLAST_GLOBAL = PLAST_GLOBAL * 0.5
+        alpha_lr = alpha_lr * 0.5
+        
     # STDP off during warmup   
     S.stdp_on[:] = 1.0 if PLASTIC_PHASE else 0.0
 
@@ -3299,14 +3499,28 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     HI_now = float(mod.HI[0])
     ACH_now = float(mod.ACH[0])
     GABA_now = float(mod.GABA[0])
+    HUN_now = float(mod.HUN[0])
+    SAT_now = float(mod.SAT[0])
+    H2O_now = float(mod.H2O[0])
 
+    # clip to biological ranges
+    DA_now   = np.clip(DA_now,   0.0, 1.0)
+    HT_now   = np.clip(HT_now,   0.0, 1.0)
+    NE_now   = np.clip(NE_now,   0.0, 1.0)
+    HI_now   = np.clip(HI_now,   0.0, 1.0)
+    ACH_now  = np.clip(ACH_now,  0.0, 1.0)
+    GABA_now = np.clip(GABA_now, 0.0, 1.0)
+    HUN_now  = np.clip(HUN_now,  0.0, 1.0)
+    SAT_now  = np.clip(SAT_now,  0.0, 1.0)
+    H2O_now  = np.clip(H2O_now,  0.0, 1.0)
+    
     # just the effectives
     masked = np.zeros_like(input_rates)
     masked[true_ids] = input_rates[true_ids]
     # Per trial OOD/NEAR-OOD: usa l'intero vettore (UNKNOWN resta già a 0)
     # OVERSAMPLING dinamico ai canali ATTIVI (TRAIN only)
     masked_boosted = masked.copy()
-    if USE_DYNAMIC_OVERSAMPLING:   # currently "False"
+    if USE_DYNAMIC_OVERSAMPLING and PLASTIC_PHASE:   # currently "False"
         act = (masked_boosted[:unknown_id] > 0)
 
         if step > BOOST_APPLY_GUARD_STEPS and np.any(act):
@@ -3320,37 +3534,21 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         else:
             masked_boosted = masked  # nei primissimi step non boostare
 
-    # MORE BIOLOGICAL OVERSAMPLING -> Meta-plasticity Homeostatic/Attention population-level aware
-    # (5-HT/HI neuromodulators modulate the attentional state gated) with attentional gain control
+    # (5-HT/HI neuromodulators modulate the attentional state gated) with attentional bias gain control
     # state gating guidato da 5-HT/HI (bias globale già presente)
     # Neuromodulator-gated population-level intrinsic homeostasis metaplasticity controller
     base_bias_mv = (k_theta_HT * HT_now + k_theta_HI * HI_now)
 
-    # homeostatic attentional bias per class (only training)
-    if USE_ATTENTIONAL_BIAS:   # currently "True"
-        # usa il vettore CLASS_BOOST come "need" (EMA già aggiornato nel loop precedente)
-        need_vec = CLASS_BOOST[:unknown_id].copy()
-        # centra rispetto alla media per evitare drift globale
-        need_vec /= float(np.mean(need_vec) + 1e-9)
-        # quanto ogni classe è "in debito" ( >1 => più bisogno)
-        debito = np.maximum(0.0, need_vec - 1.0)
-
-        # normalizza per stabilità (opzionale, mantiene range in [0,1])
-        if debito.max() > 0:
-            debito = debito / debito.max()
-
-        # applica un piccolo abbassamento soglia sui neuroni di quel gusto
-        for ta in range(unknown_id):
-            sl = taste_slice(ta)
-            increment = ATTN_BIAS_GAIN_MV * debito[ta]
-            increment = min(increment, ATTN_BIAS_CAP_MV)
-            bias_ta = base_bias_mv - increment
-            taste_neurons.theta_bias[sl] = bias_ta * b.mV
-    else:
+    if theta_bias_next is None:
         taste_neurons.theta_bias[:] = base_bias_mv * b.mV
+    else:
+        taste_neurons.theta_bias[:] = theta_bias_next
+        
+    # attentional bias viene abilitato dopo aver calcolato i winners per decidere chi boostare
+    # i bias invece vanno applicati PRIMA del punto 1)
 
     # craving abilitation during training
-    if ENABLE_DESIRE:
+    if ENABLE_DESIRE and PLASTIC_PHASE:
         # soft gain clamp
         S.cr_gate[:] = np.clip(S.cr_gate[:], 0.5, CRAVE_MAX)  # 0.5–1.5 nel tuo setup
         # fattore per gusto (solo classi note)
@@ -3391,8 +3589,11 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
 
     # inhibition with 5-HT/GABA/HI -> whereas WTA more aggressive when 5-HT is higher, because aversion and fear must to influence the behiaviour during the train over and over
     _inh = (1.0 + k_inh_HT * HT_now + k_inh_NE * NE_now + k_inh_HI * HI_now + k_inh_GABA * GABA_now)
-    inhibitory_S.inh_scale = max(0.3, _inh) # clamp to avoid errors
-
+    if USE_SIMPLE_NEUROMOD:
+        _inh += 0.2 * GABA_now
+    #inhibitory_S.inh_scale = max(0.3, _inh) # clamp to avoid errors
+    inhibitory_S.inh_scale = float(np.clip(_inh, 0.7, 1.5))
+    
     # environment noise reduction with ACh, NE and HI, HT (clamp e0.05 Hz)
     ne_noise_scale = max(0.05, 1.0 - k_noise_NE * NE_now)
     hi_noise_scale = (1.0 + k_noise_HI * HI_now)
@@ -3453,6 +3654,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         and not fp_structural_done
     ):
         j_all = np.asarray(S.j[:], int)
+
         for q in range(unknown_id):
             if q in true_ids: # non punisco mai le classi vere
                 continue
@@ -3480,14 +3682,14 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         ETA_VSLOW * S.elig_vslow[idx]
                     )
                     delta_e = r_off * elig_eff * (S.cr_gate[idx] if ENABLE_DESIRE else 1.0)
-                    S.w[idx] = np.clip(S.w[idx] + delta_e, 0.0, 1.0)
+                    S.w[idx] = np.clip(S.w[idx] + delta_e, W_MIN, W_MAX)
                     
                     # consumi le tracce sulle sinapsi coinvolte
                     S.elig_fast[idx]  = 0.0
                     S.elig_slow[idx]  = 0.0
                     S.elig_vslow[idx] = 0.0
                     
-        # piccolo boost GABA per stabilit�
+        # piccolo boost GABA per stabilità
         mod.GABA[:] += 0.3 * gaba_pulse_stabilize
         fp_structural_done = True
 
@@ -3516,14 +3718,38 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     #thr_now = float(taste_neurons.thr_spice[spicy_id])
     if drv_now > thr_now:
         mod.HT[:] += 0.25   # manage the aversion
+        
+    # define TP and FP gates
+    # spostarli a seconda di dove utilizzo la variabile
+    tp_gate = np.zeros(num_tastes-1, dtype=float)
+    fp_gate = np.zeros(num_tastes-1, dtype=float)
+    
+    # to manage GABA during trial if there are too many spikes -> stabilizing net (RESCALED)
+    # Conta "attiva" una classe solo se ha spike > soglia bio (non basta 1 spike)
+    # GABA stabilizer (RESCALED)
+    if GABA_STABILIZE_ON:
+        dc_u = np.asarray(dc_pop[:unknown_id], dtype=float)
+        tp_u = np.asarray(tp_gate[:unknown_id], dtype=float)
 
-    # to manage GABA during trial if there are too many spikes -> stabilizing the net
-    #total_spikes  = float(np.sum(diff_counts[:unknown_id]))
-    #active_neurs  = int(np.sum(diff_counts[:unknown_id] > 0))
-    total_spikes  = float(np.sum(dc_pop[:unknown_id]))
-    active_neurs  = int(np.sum(dc_pop[:unknown_id] > 0))
-    if (active_neurs > gaba_active_neurons) or (total_spikes > gaba_total_spikes):
-        mod.GABA[:] += gaba_pulse_stabilize
+        # conta "attiva" una classe solo se supera una soglia non-banale
+        thr_vector  = np.maximum(2.0, 0.1 * tp_u)
+        active_neurs = int(np.sum(dc_u >= thr_vector))
+
+        # soglia totale spike scala con NEURONS_PER_TASTE e (opzionale) con #label vere
+        k_labels = max(1, len(true_ids))   # opzionale ma consigliato nel multi-label
+        spike_thr = float(gaba_total_spikes) * max(1, NEURONS_PER_TASTE) * k_labels
+
+        total_spikes = float(np.sum(dc_u))
+
+        if (active_neurs > gaba_active_neurons) or (total_spikes > spike_thr):
+            overs_spk = max(0.0, total_spikes / (spike_thr + 1e-9) - 1.0)
+            overs_act = max(0.0, active_neurs / (gaba_active_neurons + 1e-9) - 1.0)
+            overs = max(overs_spk, overs_act)
+
+            mod.GABA[:] += gaba_pulse_stabilize * min(1.0, overs)
+
+        # clamp di sicurezza (scegli tu il cap: 1.0, 1.5, 2.0)
+        mod.GABA[:] = np.clip(mod.GABA[:], 0.0, GABA_CAP)
 
     # collect all positive and negative counts
     for idx in range(num_tastes-1):
@@ -3532,6 +3758,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             pos_counts[idx].append(int(dc_pop[idx]))
         else:
             neg_counts[idx].append(int(dc_pop[idx]))
+            
     # updating EMA decoder parameters during online training
     for idx in range(num_tastes-1):
         # population support
@@ -3547,6 +3774,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         w_all = np.asarray(S.w[:], float)
         i_all = np.asarray(S.i[:], int)
         j_all = np.asarray(S.j[:], int)
+
         mask_off = (i_all != j_all) & (j_all != unknown_id) & (i_all != unknown_id)
         # off-diagonal pruning SOFT
         gamma_decay_off = 0.7   # 0.7–0.8 ok
@@ -3565,7 +3793,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             w_all[mask_off] = w_off
 
         # qui il clip non ti ammazza più nulla perché hai il floor sugli off-diag
-        S.w[:] = np.clip(w_all, 0.0, 1.0)
+        S.w[:] = np.clip(w_all, W_MIN, W_MAX)
         fp_structural_done = True
 
     if dc_pop.max() <= 0:
@@ -3574,9 +3802,13 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         mod.NE[:] *= 0.98
         mod.HI[:] *= 0.98
         net.run(pause_duration)
+        
+        # resetto traccia veloce
+        # e diluisco le lente
         S.elig_fast[:]  = 0.0
-        S.elig_slow[:]  = 0.0
-        S.elig_vslow[:] = 0.0
+        S.elig_slow[:]  *= 0.3
+        S.elig_vslow[:] *= 0.7
+        
         continue
 
     ############### DECODER + WINNER SELECTION + REINFORCEMENT #############
@@ -3651,10 +3883,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     if is_mix_like:
         thr_ratio_cur *= 0.85   # decoder più permissivo nei mix
     rel = thr_ratio_cur * mx
-    
-    # define TP and FP gates
-    tp_gate = np.zeros(num_tastes-1, dtype=float)
-    fp_gate = np.zeros(num_tastes-1, dtype=float)
+
 
     # weight arrays
     i_all = np.asarray(S.i[:], int)
@@ -3761,8 +3990,38 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         else:
             winners = []  # vero UNKNOWN
 
+    # ATTENTIONAL BIAS PHASIC AND TONIC -> MORE BIOLOGICAL OVERSAMPLING -> Meta-plasticity Homeostatic/Attention population-level aware
+    theta_bias_next = np.ones(len(taste_neurons.theta_bias), dtype=float) * base_bias_mv
+
+    if USE_ATTENTIONAL_BIAS and PLASTIC_PHASE:
+        need_vec = CLASS_BOOST[:unknown_id].copy()
+        need_vec /= float(np.mean(need_vec) + 1e-9)
+        debito = np.clip(need_vec - 1.0, 0.0, DEBITO_CAP) / max(DEBITO_CAP, 1e-9)
+
+        for ta in true_ids:
+            if ta >= unknown_id:
+                continue
+
+            # se uno ha già vinto non lo boosto
+            if ta in winners:
+                continue
+
+            sl = taste_slice(ta)
+            inc = ATTN_BIAS_GAIN_MV * float(debito[ta])
+            inc = min(inc, ATTN_BIAS_CAP_MV)
+
+            if GABA_now > 0.8:
+                inc *= 0.0
+
+            bias_ta = base_bias_mv - inc
+            bias_ta = max(bias_ta, ATTN_BIAS_FLOOR_MV)
+            theta_bias_next[sl] = bias_ta
+
+    # assegnazione del bias per il prossimo trial
+    theta_bias_next = theta_bias_next * b.mV
+
     # SPICY aversion management (if SPICY is present among true or winner ids)
-    if USE_SPICY_AVERSION:
+    if USE_SPICY_AVERSION and PLASTIC_PHASE:
         is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
 
         # nuovo gate: niente avversione troppo presto / senza esperienza su SPICY
@@ -3829,7 +4088,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     dbg = [(taste_map[idx], int(scores[idx])) for idx in order[::-1]]
 
     # if there is hedonic window dopaminergic reinforcement => DA is modulated by the hedonic window itself keeping states in mind
-    if USE_HEDONIC_DA:
+    if USE_HEDONIC_DA and PLASTIC_PHASE:
         av_out = np.array(taste_neurons.av_over[:unknown_id]) + np.array(taste_neurons.av_under[:unknown_id])
         g_win = 1.0 / (1.0 + hed_gate_k * np.maximum(av_out, 0.0))  # 0..1
         hed_fb_vec = state_hed_fallback_vec(mod, base=hed_fallback) # fallback for every different state
@@ -3975,9 +4234,10 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # aggiorna storico e stima della varianza della curva EMA
     ema_hist.append(float(ema_perf))
     if len(ema_hist) >= 8:
-        _arr = np.asarray(ema_hist, float)
-        mu   = float(_arr.mean())
-        ema_perf_sd = float(np.sqrt(np.mean(((_arr - mu) ** 2))))
+        arrs = np.asarray(ema_hist, float)
+        mu   = float(arrs.mean())
+        # standard deviation of ema_perf
+        ema_perf_sd = float(np.sqrt(np.mean(((arrs - mu) ** 2))))
     else:
         ema_perf_sd = 0.0
         
@@ -3996,8 +4256,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     MIN_STEPS_BEFORE_STOP = max(200, int(0.15 * TOTAL_TRAIN_STEPS)) # step dinamici da considerare ad ogni trial
 
     # 1) δR gating baseline-relative
-    baseline_perf = float(ema_perf)  # EMA globale della performance
-    deltaR = float(jacc_proxy - baseline_perf)
+    baseline_perf = float(ema_perf)  # EMA globale della performance 
+    deltaR = float(jacc_proxy - baseline_perf) # differenza tra performance istantanea e baseline EMA globale della performance
         
     # soglia di "vero cambiamento" già calcolata sopra
     # IMPROVE_EPS = max(0.002, 0.25 * ema_perf_sd)
@@ -4006,7 +4266,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         
     if abs(deltaR) < IMPROVE_EPS:
         # niente consolidamento: trial troppo simile alla media recente
-        perf_gate_local = 0.0
+        perf_gate_local = 1.0
     else:
         DA_scale = 1.0 + da_gain * deltaR
         # clip per sicurezza
@@ -4015,7 +4275,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # 4) 3-factors training reinforcement multi-label learning dopamine rewards for the winner neurons
     # A4: DIAGONAL: reward TP, punish big FP
     
-    # SIMPLE WAY
+    # a. SIMPLE WAY
     if PLASTIC_PHASE and USE_GATE_SIMPLE and not USE_GATE_REINFORCE:
 
         # reward positivo solo se il pattern è classificato correttamente
@@ -4025,16 +4285,36 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         r_neg_strong = -0.25 * alpha_lr   # FP forte
         r_neg_soft   = -0.10 * alpha_lr   # FP "di misura"
         
+        # bias e stati lenti globali (ACh, NE, HI, HT, SAT, HUN, H2O)
+        # non andiamo più a moltiplicare il rinforzo, ma andiamo direttamente a modificare il fattore di PLAST_GAIN per non essere troppo invasivi
+        plast_mod = 1.0
+        if USE_SIMPLE_NEUROMOD:
+            # ACh / NE / HI aumentano un po' la plasticità globale
+            plast_mod *= (1.0 + 0.05 * ACH_now + 0.05 * NE_now + 0.1 * HI_now)
+            # fame/sete spingono ad imparare
+            plast_mod *= (1.0 + 0.05 * HUN_now + 0.02 * H2O_now)
+            # serotonina + sazietà smorzano la plasticità
+            ht_eff = max(0.0, min(HT_now, 0.3))  # clamp
+            sat_eff = max(0.0, min(SAT_now, 0.2))
+            
+            denom = 1.0 + 0.1 * ht_eff + simple_sat_gain * sat_eff
+            denom = max(denom, 1e-3)
+            plast_mod /= denom
+
+            # clamp per sicurezza per non sforare
+            plast_mod = float(np.clip(plast_mod, 0.8, 1.2))
+        
         # tastes indexing
         for idx in range(num_tastes-1):
             idx_list = diag_indices_for_taste(idx)
             if idx_list.size == 0:
                 continue
-
+            
             # diamo reward SOLO alla popolazione del gusto vero,
             # uguale per tutti i gusti (niente preferenze SWEET, ecc.)
             r = 0.0
             if curr_phase > 0:
+                 # semplice gestione del reward senza neuromodulatori
                 spikes_i = float(dc_pop[idx])
                 score_i  = float(scores[idx])
                 is_true  = (idx in true_idx)
@@ -4058,9 +4338,53 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     # e) punizione soft se è winner ma sotto fp_gate (FP "di misura")
                     elif is_winner:
                         r = r_neg_soft
+                        
+            # SIMPLE WAY + NEUROMODULATORS
+            if curr_phase > 0 and USE_SIMPLE_NEUROMOD and r != 0.0:
+                da_scale = 1.0
+                
+                ht_eff = max(0.0, min(HT_now, 0.5))
+                if r > 0.0:
+                    # DA potenzia reward positivi
+                    da_scale *= (1.0 + simple_da_gain_pos * DA_now)
 
+                    # 5-HT_pos: smorza un po' i reward troppo grossi
+                    # (0.3 è un fattore di sicurezza per non farla esplodere)
+                    ht_scale_pos = 1.0 / (1.0 + 0.3 * simple_ht_gain_pos * ht_eff)
+                    da_scale *= ht_scale_pos
+                else:
+                    # DA attenua le punizioni (componenti positive di DA)
+                    da_scale /= (1.0 + simple_da_gain_neg * max(0.0, DA_now))
+
+                    # 5-HT_neg: rende le punizioni un po' più istruttive
+                    ht_scale_neg = 1.0 + 0.2 * simple_ht_gain_neg * ht_eff
+                    da_scale *= ht_scale_neg
+                    
+                # clamp stretto per stabilità
+                da_scale = float(np.clip(da_scale, 0.8, 1.2))
+                r *= da_scale
+            
+            # using GABA to manage how strong the damper is
+            # evaluating whether there is need to keep it or not
+            if curr_phase > 0 and GABA_ON and USE_SIMPLE_NEUROMOD and r != 0.0:
+                # assumo GABA_now in [0, 1]
+                gaba_eff = max(0.0, min(GABA_now, 0.7))
+
+                # gamma_gaba controlla quanto forte è il freno
+                gamma_gaba = 0.6
+                gaba_scale = 1.0 / (1.0 + gamma_gaba * gaba_eff)
+                # -> se GABA_now = 0.7  => gaba_scale ≈ 1 / (1 + 0.42) ≈ 0.70
+                # effective scaling
+                plast_mod *= gaba_scale
+                    
             # niente craving, niente hedonic, niente meta → r_final semplice ma con δR gating
-            r_final = PLAST_GLOBAL * perf_gate_local * r
+            # se i neuromodulatori non entrano in gioco plast_mod rimane a 1.0 e non cambia nulla
+            # gate per calcolare correttamente lo smorzamento
+            gate = perf_gate_local if (r > 0.0) else max(0.5, perf_gate_local)
+
+            # rinforzo effettivo
+            r_final = PLAST_GLOBAL * plast_mod * gate * r
+            #r_final = PLAST_GLOBAL * plast_mod * perf_gate_local * r
 
             if verbose_rewards and step % 50 == 0:
                 print(f"\n[DEBUG R_STABLE] step={step} "
@@ -4073,14 +4397,36 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     ETA_SLOW  * S.elig_slow[idx_list] +
                     ETA_VSLOW * S.elig_vslow[idx_list]
                 )
-                if np.any(elig_eff):
-                    delta_vec = r_final * elig_eff
-                    S.w[idx_list] = np.clip(S.w[idx_list] + delta_vec, 0.0, 1.0)
+                # weight-dependent updates
+                #if np.any(elig_eff):
+                if np.max(np.abs(elig_eff)) >= 1e-9:
+
+                    w_curr = S.w[idx_list]
+                    raw_delta = r_final * elig_eff  # può essere + o -
+
+                    # bound factor: 
+                    #   se raw_delta>0 (LTP)  => scala con (w_max - w)
+                    #   se raw_delta<0 (LTD)  => scala con (w - w_min)
+                    bound = np.where(
+                    raw_delta >= 0.0,
+                        (W_MAX - w_curr) / w_rng,
+                        (w_curr - W_MIN) / w_rng
+                    )
+
+                    # sicurezza numerica
+                    bound = np.clip(bound, W_MIN, W_MAX)
+
+                    delta_vec = raw_delta * bound
+                    delta_vec = np.clip(delta_vec, -DELTA_CAP, +DELTA_CAP)
+
+                    S.w[idx_list] = np.clip(w_curr + delta_vec, W_MIN, W_MAX)
+                    #delta_vec = np.clip(r_final * elig_eff, -DELTA_CAP, +DELTA_CAP)
+                    #S.w[idx_list] = np.clip(S.w[idx_list] + delta_vec, 0.0, 1.0)
                     S.elig_fast[idx_list]  = 0.0
                     S.elig_slow[idx_list]  = 0.0
                     S.elig_vslow[idx_list] = 0.0
 
-    # COMPLEX WAY
+    # b. COMPLEX WAY
     elif PLASTIC_PHASE and USE_GATE_REINFORCE and not USE_GATE_SIMPLE:
         for idx in range(num_tastes-1):
             idx_list = diag_indices_for_taste(idx)  # indici sinapsi verso la popolazione "idx"
@@ -4146,8 +4492,30 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     ETA_VSLOW * S.elig_vslow[idx_list]
                 )
                 if abs(r_final) * np.max(elig_eff) >= 1e-6:
-                    delta_vec = r_final * (elig_eff * gain_crav)
-                    S.w[idx_list] = np.clip(S.w[idx_list] + delta_vec, 0.0, 1.0)
+                    # weight-dependent updates
+                
+
+                    w_curr = S.w[idx_list]
+                    raw_delta = r_final * elig_eff  # può essere + o -
+
+                    # bound factor: 
+                    #   se raw_delta>0 (LTP)  => scala con (w_max - w)
+                    #   se raw_delta<0 (LTD)  => scala con (w - w_min)
+                    bound = np.where(
+                    raw_delta >= 0.0,
+                        (W_MAX - w_curr) / w_rng,
+                        (w_curr - W_MIN) / w_rng
+                    )
+
+                    # sicurezza numerica
+                    bound = np.clip(bound, W_MIN, W_MAX)
+
+                    delta_vec = raw_delta * bound
+                    delta_vec = np.clip(delta_vec, -DELTA_CAP, +DELTA_CAP)
+
+                    #delta_vec = r_final * (elig_eff * gain_crav)
+                    #delta_vec = np.clip(r_final * elig_eff, -DELTA_CAP, +DELTA_CAP)
+                    S.w[idx_list] = np.clip(w_curr + delta_vec, W_MIN, W_MAX)
                     S.elig_fast[idx_list]  = 0.0
                     S.elig_slow[idx_list]  = 0.0
                     S.elig_vslow[idx_list] = 0.0
@@ -4159,7 +4527,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             for q in range(num_tastes-1):
                 if q == p:
                     continue
-
+                
                 # (E): se q è VERO ma "debole", penalità morbida p->q
                 # "debole" = sotto metà della propria soglia di classe (scala già test-time)
                 if q in true_ids:
@@ -4180,6 +4548,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                             r_off_soft *= meta_scale(p)
                             
                         # GATE δR
+                        #r_off_soft *= gate_neg
                         r_off_soft *= perf_gate_local
 
                         # symmetry with population support
@@ -4195,7 +4564,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                             )
                             delta_soft = r_off_soft * elig_eff
                             if delta_soft != 0.0:
-                                S.w[si] = float(np.clip(S.w[si] + delta_soft, 0, 1))
+                                S.w[si] = float(np.clip(S.w[si] + delta_soft, W_MIN, W_MAX))
                             S.elig_fast[si]  = 0.0
                             S.elig_slow[si]  = 0.0
                             S.elig_vslow[si] = 0.0
@@ -4209,7 +4578,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                             )
                             delta_sym = 0.5 * r_off_soft * elig_eff
                             if delta_sym != 0.0:
-                                S.w[sj] = float(np.clip(S.w[sj] + delta_sym, 0, 1))
+                                S.w[sj] = float(np.clip(S.w[sj] + delta_sym, W_MIN, W_MAX))
                                 S.elig_fast[sj]  = 0.0
                                 S.elig_slow[sj]  = 0.0
                                 S.elig_vslow[sj] = 0.0
@@ -4244,8 +4613,12 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     if USE_META:
                         r_off *= meta_scale(p)
                     
+                    # calcolo gate negativo 
+                    gate_neg = max(0.5, perf_gate_local)
+                    
                     # GATE δR
-                    r_off *= perf_gate_local
+                    r_off *= gate_neg
+                    #r_off *= perf_gate_local
                     
                     # population support
                     idx_list = diag_indices_for_taste(p, q)
@@ -4261,7 +4634,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         delta = r_off * elig_eff
                         if delta != 0.0:
                             old_w = float(S.w[si])
-                            S.w[si] = float(np.clip(S.w[si] + delta, 0, 1))
+                            S.w[si] = float(np.clip(S.w[si] + delta, W_MIN, W_MAX))
                             if verbose_rewards and step % 10 == 0:
                                 print(f"  offdiag[cls] - {taste_map[p]}->{taste_map[q]} | "
                                     f"spk_q={float(dc_pop[q]):.1f} fp_q={fp_gate[q]:.1f} sev={severity_q:.2f} hed={hed_mult_p:.2f} "
@@ -4282,7 +4655,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         )
                         delta_sym = 0.5 * r_off * elig_eff
                         if delta_sym != 0.0:
-                            S.w[sj] = float(np.clip(S.w[sj] + delta_sym, 0, 1))
+                            S.w[sj] = float(np.clip(S.w[sj] + delta_sym, W_MIN, W_MAX))
                         S.elig_fast[sj]  = 0.0
                         S.elig_slow[sj]  = 0.0
                         S.elig_vslow[sj] = 0.0
@@ -4311,10 +4684,10 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                             if L1 > 1e-12:
                                 if L1 > target:
                                     scale = target / L1
-                                    col = np.clip(col * scale, 0.0, 1.0)
+                                    col = np.clip(col * scale, W_MIN, W_MAX)
                                 elif col_allow_upscale and (L1 < col_upscale_slack * target):
                                     scale = min(col_scale_max, (target / L1))
-                                    col = np.clip(col * scale, 0.0, 1.0)
+                                    col = np.clip(col * scale, W_MIN, W_MAX)
 
                                 # anti-crosstalk: lieve leak sugli off-diagonali (corretto: usa idx_col)
                                 pre_idx = i_all[idx_col]
@@ -4327,6 +4700,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
 
                             w_all[idx_col] = col
                             S.w[:] = w_all
+                            # clip
+                            S.w[:] = np.clip(w_all, W_MIN, W_MAX)
                             
                     # operazione strutturale fatta      
                     fp_structural_done = True
@@ -4337,6 +4712,10 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         ef = np.asarray(S.elig_fast[:])
         es = np.asarray(S.elig_slow[:])
         ev = np.asarray(S.elig_vslow[:])
+        # media e quantile
+        meligF,peligF = stats_elig(S.elig_fast[:])
+        meligS,peligS = stats_elig(S.elig_slow[:])
+        meligV,peligV = stats_elig(S.elig_vslow[:])
         if w_prev is None:
             delta_mean = 0.0
             delta_max  = 0.0
@@ -4354,6 +4733,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                 f"max_slow={np.max(np.abs(es)):.6f} "
                 f"max_vslow={np.max(np.abs(ev)):.6f}"
             )
+            print(f"\n[DEBUG ELIG MEAN/QUANTILE] step={step} fast",meligF,peligF,"| slow",meligS,peligS,"| vslow",meligV,peligV, "\n")
         # pesi dello snapshot precedente
         w_prev = w_arr.copy()
         
@@ -4367,7 +4747,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         mod.DA_f[:] += da_pulse_reward * jacc
         clamp_DA_f(mod)
         mod.DA_t[:] += da_tonic_tail * jacc
-    elif jacc > 0.0:
+    elif jacc > 0.0 and jacc < 0.67:
         mod.DA_f[:] += 0.4 * da_pulse_reward * jacc # partial reward
         clamp_DA_f(mod)
         mod.HI[:] += 0.5 * hi_pulse_miss
@@ -4377,20 +4757,52 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # tonic bias internal state (HUN/H2O)
     mod.DA_t[:] += k_hun_tonic * float(mod.HUN[0]) + k_h2o_tonic * float(mod.H2O[0])
 
-    # if the prevision is good => reward to every taste in the trial
-    if PLASTIC_PHASE and jacc >= 0.67:
+    # MINI-REINFORCEMENT (partial jacc) -> diamo un piccolo boost ai veri positivi nell'intervallo tra 0.0 e 0.67 senza andare a collidere con A4
+    if PLASTIC_PHASE and USE_PARTIAL_REINFORCE and (0.0 < jacc < PARTIAL_JACC_MAX):
+        tp_ids = list(T & P)  # rinforza solo i TP già presi
+        if tp_ids:
+            # intensità proporzionale a quanto sei vicino alla soglia
+            fac = float(jacc / PARTIAL_JACC_MAX)  # 0..1
+            dur_piccolo = PARTIAL_DUR_SCALE * reinforce_dur
+
+            for tid in tp_ids:
+                if tid != unknown_id:
+                    taste_neurons.da_gate[taste_slice(tid)] = float(PARTIAL_GATE_SCALE * fac * g_win[tid])
+
+            # Metti STDP/elig OFF solo durante il mini-reinforce (così aggiorni solo stati neuronali tipo threshold/attenzione, ma non crei nuove elig)
+            #saved_stdp = float(np.mean(np.asarray(S.stdp_on[:])))  # o S.stdp_on[0]
+            #S.stdp_on[:] = 0.0
+            net.run(dur_piccolo)
+            #S.stdp_on[:] = saved_stdp
+
+            for tid in tp_ids:
+                if tid != unknown_id:
+                    taste_neurons.da_gate[taste_slice(tid)] = 0.0
+
+    # if the prevision is good => reward to every true taste in the trial
+    if PLASTIC_PHASE and USE_FULL_REINFORCE and jacc >= 0.67:
         for tid in true_ids:
             if tid != unknown_id:
                 taste_neurons.da_gate[taste_slice(tid)] = float(g_win[tid])
                 #taste_neurons.da_gate[tid] = float(g_win[tid])  # 0..1 reinforcement applied on the hedonic window base
+        
+        # Metti STDP/elig OFF solo durante il full-reinforce (così aggiorni solo stati neuronali tipo threshold/attenzione, ma non crei nuove elig)
+        #saved_stdp = float(np.mean(np.asarray(S.stdp_on[:])))  # o S.stdp_on[0]
+        #S.stdp_on[:] = 0.0
         net.run(reinforce_dur)
+        #S.stdp_on[:] = saved_stdp
+        
         for tid in true_ids:
             if tid != unknown_id:
                 taste_neurons.da_gate[taste_slice(tid)] = 0.0
+                
         # Slow consolidation (DA-gated, bio-like)
         DA_eff = float(mod.DA_f[0] + k_tonic_DA * mod.DA_t[0])
         if USE_SLOW_CONSOLIDATION and (DA_eff >= DA_THR_CONSOL):
-        # capture a fraction of the current (fast) weights into the slow store
+            # capture a fraction of the current (fast) weights into the slow store
+            # serve per non resettare di colpo i pesi allo stato precedente ma effettuare
+            # un consolidamento lento di essi verso lo stato migliore raggiunto 
+            S.w[:] = np.clip(S.w[:], W_MIN, W_MAX)
             w_slow += ETA_CONSOL * (S.w[:] - w_slow)
 
     # clamp among thresholds for stability
@@ -4406,7 +4818,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         best_state = snapshot_state()    # snapshot completo (pesate + stati)
         if w_slow is not None:
             w_slow_best = w_slow.copy()  # se usi consolidamento lento
-
+        # clipping    
+        best_state['w'] = np.clip(best_state['w'], W_MIN, W_MAX)
         patience = 0
         decays_done = 0   # nuovo ciclo “explore”: azzero i decay conteggiati
 
@@ -4422,10 +4835,23 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         patience += 1
         
         # 3a) soft-pull verso il best durante plateau prolungato (bio consolidamento)
-        if PLASTIC_PHASE and USE_SOFT_PULL and patience >= max(W_EMA, PLATEAU_WINDOW) and best_state is not None:
-            soft_pull_toward_best(best_state, rho=RHO_PULL)
-            elig_cooldown = max(elig_cooldown, 2)
-            arm_soft_pull(1.0)
+        if PLASTIC_PHASE and USE_SOFT_PULL and best_state is not None:
+            do_softpull = (
+                step >= SOFT_PULL_WARMUP_STEPS and
+                patience >= PLATEAU_WINDOW and
+                ema_perf_long < (best_ema_perf - SOFT_PULL_DROP_EPS) and
+                (last_soft_pull_step is None or (step - last_soft_pull_step) >= SOFT_PULL_COOLDOWN_STEPS)
+            )
+            if do_softpull:
+                # rho cresce leggermente con la "gravità" del plateau, ma resta piccolo
+                sev = float(np.clip((best_ema_perf - ema_perf_long) / 0.10, 0.0, 1.0))  # 0..1
+                rho = RHO_PULL_EARLY + (RHO_PULL_MAX - RHO_PULL_EARLY) * sev
+
+                soft_pull_toward_best(best_state, rho=rho, pull_theta=False, damp_elig=True)
+                
+                last_soft_pull_step = step
+                elig_cooldown = max(elig_cooldown, 2)
+                arm_soft_pull(1.0)
         else:
             pass
             
@@ -4459,6 +4885,9 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         f"— stopping training.")
                     if BEST_CHECKPOINT: # restore best snapshot come già fai ora
                         restore_state(best_state)
+                        break
+                    else:
+                        # se non c'è best snapshot interrompo e non ripristino nulla
                         break
                 else:
                     # se non hai ancora usato tutti i decays, non fermare il training:
@@ -4496,6 +4925,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         j_all = np.asarray(S.j[:], int)
         w_all = np.asarray(S.w[:], float)     
         # LTD mirata sulle colonne “calde” che NON sono nel target
+        
         for q in range(unknown_id):
             if q in true_ids:
                 continue
@@ -4507,7 +4937,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     continue
 
                 # SOLO OFF-DIAGONAL dentro la colonna q
-                mask_off_col = mask_col & (i_all != j_all)
+                #mask_off_col = mask_col & (i_all != j_all)
+                mask_off_col = mask_col & (i_all != q)
                 if not np.any(mask_off_col):
                     continue
 
@@ -4524,7 +4955,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
 
                 w_all[mask_off_col] = w_off
 
-        S.w[:] = np.clip(w_all, 0.0, 1.0)
+        S.w[:] = np.clip(w_all, W_MIN, W_MAX)
         fp_structural_done = True
 
     # safe clip on theta for homeostasis
@@ -4597,12 +5028,14 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         # L1 per-colonna (solo classi note)
         L1_before = []
         for q in range(unknown_id):
-            L1_before.append(float(np.sum(w_before[j_all == q])))
+            sl = taste_slice(q)
+            mask = (j_all >= sl.start) & (j_all < sl.stop)
+            L1_before.append(float(np.sum(w_before[mask])))
         
         # L1 col_norm
         col_norm_pop(target=col_norm_target, mode=col_norm_mode, temperature=col_norm_temp,
                  diag_bias_gamma=diag_bias_gamma, floor=col_floor,
-                 allow_upscale=col_allow_upscale, scale_max=col_scale_max)
+                 allow_upscale=col_allow_upscale, scale_max=col_scale_max, w_min=W_MIN, w_max=W_MAX)
         last_colnorm_step = step
         did_action = True
         
@@ -4634,11 +5067,12 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     
     # 3. plastic homeostasis
     elif can_homeo:
+        # edge per il bound
         # esecuzione plastic homeostasis
         w_all, scale_per_syn, epi_lock = homeo_cache
         free_mask = ~epi_lock
         w_all[free_mask] *= scale_per_syn[free_mask]
-        S.w[:] = np.clip(w_all, 0.0, 1.0)
+        S.w[:] = np.clip(w_all, W_MIN, W_MAX)
         last_homeo_step = step
         did_action = True
         if verbose_rewards:
@@ -4657,11 +5091,28 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # To monitor the effect of oversampling (dynamic or static), log for taste
     log_population_stats(diff_counts, step=step, label="POST-REWARD:") 
     print("\n") 
-    # 5) eligibility trace decay among trials
+    
+    # little pause and reset
     net.run(pause_duration)
+    
+    # elig reset at the end of the trial
+    # la fast è sicuramente consumata quindi la resetto per convenienza, le altre le faccio decadere
     S.elig_fast[:]  = 0.0
-    S.elig_slow[:]  = 0.0
-    S.elig_vslow[:] = 0.0
+    #S.elig_slow[:]  = 0.0
+    #S.elig_vslow[:] = 0.0
+    
+    # le elig slow me le porto dietro nei trial successivi ma smorzate
+    # 1. slow
+    '''SLOW_BASE  = 0.2
+    SLOW_MAX   = 0.6
+    SLOW_DAMP = SLOW_BASE + (SLOW_MAX - SLOW_BASE) * float(jacc)  # jacc in [0,1]
+    S.elig_slow[:] *= SLOW_DAMP
+    # 2. vslow
+    VSLOW_BASE = 0.5
+    VSLOW_MAX  = 0.9
+    VSLOW_DAMP = VSLOW_BASE + (VSLOW_MAX - VSLOW_BASE) * float(jacc)  # jacc in [0,1]
+    S.elig_vslow[:] *= VSLOW_DAMP'''
+    
     # flags reset
     elig_cooldown = max(0, elig_cooldown-1)
     just_soft_pulled = (elig_cooldown > 0)
@@ -4673,15 +5124,16 @@ if BEST_CHECKPOINT and PLASTIC_PHASE and best_state is not None:
     # 3a) blend fast weights toward best weights
     RHO_FINAL = 0.60  # 0..1, how much you lean to best fast weights
     S.w[:] = (1.0 - RHO_FINAL) * S.w[:] + RHO_FINAL * best_state['w']
-
+    S.w[:] = np.clip(S.w[:], W_MIN, W_MAX)
     # 3b) mix in the slow consolidated trace for stability in test
     if USE_SLOW_CONSOLIDATION and (w_slow_best is not None):
         S.w[:] = (1.0 - BETA_MIX_TEST) * w_slow_best + BETA_MIX_TEST * S.w[:]
-    
+        S.w[:] = np.clip(S.w[:], W_MIN, W_MAX)
     # 3c) restore NON-weight state from the best snapshot (thresholds, modulators, traces, etc.)
     tmp_w = S.w[:].copy()
     restore_state_without(best_state)   # restores the rest of the state without overwrite w
     S.w[:] = tmp_w              # re-apply our blended weights
+    S.w[:] = np.clip(S.w[:], W_MIN, W_MAX)
     # final print logs
     print(f"\n[BEST-CHECKPOINT] Restored bio-mixed state (ema_perf={best_score:.3f} @ step {best_step}).")
 else:
@@ -4754,17 +5206,25 @@ P_cop = np.diag(proto_cop[:unknown_id])
 # 4) OOD/NULL calibration sul test window
 PMR_thr, H_thr, gap_thr, ood_q = ood_calibration(n_null=96, n_ood=192, dur=test_duration, gap=20*b.ms, thr_vec=thr_per_class_test)
 # clamp minimo delle soglie OOD
-PMR_thr = max(PMR_thr, 0.12)   # prima 0.20
-H_thr   = max(H_thr,   1.00)   # prima 0.95
-gap_thr = max(gap_thr, 0.10)   # prima 0.22
+PMR_thr = max(PMR_thr, 0.26)   # prima 0.20
+H_thr   = min(H_thr,   1.60)   # prima 0.95
+gap_thr = max(gap_thr, 0.32)   # prima 0.22
 # clipping sul gate di UNKNOWN
 #S_unk.gain_unk = float(np.clip(0.06 + 0.40*np.tanh(np.mean(ood_q)/12.0), 0.04, 0.12))
-S_unk.gain_unk = 0.0
+S_unk.gain_unk = 0.06
 # Overshoot OOD rispetto alla soglia corrente del TEST window
 overshoot = np.maximum(0.0, ood_q - thr_per_class_test[:unknown_id])
 # smorza overshoot con radice e riduci i gain
 overshoot = np.sqrt(overshoot)
-heat_gain = np.array([0.01, 0.015, 0.00, 0.015, 0.015, 0.00, 0.00]) # per-class heat gain vector
+heat_gain = np.array([
+    0.010,  # SWEET  - leggero, resta simile
+    0.015,  # BITTER - come prima
+    0.014,  # SALTY  - NUOVO: alza la soglia se in OOD SALTY spara troppo
+    0.015,  # SOUR   - come prima
+    0.015,  # UMAMI  - come prima
+    0.020,  # FATTY  - NUOVO: ancora più penalizzato (shortcut principale)
+    0.016,  # SPICY  - un piccolo heat anche qui
+])
 margin = heat_gain * overshoot
 # cap to boost
 pos_cap = 0.85 * np.maximum(ema_pos_m1 * dur_scale, 1.0)
@@ -4964,7 +5424,7 @@ cop_expect_test = np.maximum(ema_cop_m1 * float(test_duration / training_duratio
 
 min_spikes_for_known_base = 4 # soglia minima assoluta per gusti noti nella fase di test
 # usa anche l'aspettativa positiva stimata:
-min_spikes_for_known_test = max(2, int(np.floor(0.02 * np.max(pos_expect_test[:unknown_id]))))
+min_spikes_for_known_test = max(min_spikes_for_known_base, int(np.floor(0.02 * np.max(pos_expect_test[:unknown_id]))))
 print(f"[Decoder] dur_scale={dur_scale:.2f} -> min_spikes_for_known_test={min_spikes_for_known_test}")
 print("Scaled per-class thresholds:",
       {taste_map[idxs]: int(thr_per_class_test[idxs]) for idxs in range(num_tastes-1)})
@@ -5161,7 +5621,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     z   = scores[:unknown_id] / np.maximum(pos_expect_test, 1.0)
 
     # EARLY REJECT: niente attività nota → UNKNOWN e chiudi il trial subito
-    global_min_E = max(3.0, 0.6 * float(min_spikes_for_known_test))   # 3 o ~60% del minimo per classe
+    global_min_E = max(4.0, 0.8 * float(min_spikes_for_known_test))   # 3 o ~60% del minimo per classe
     if E_local < global_min_E:
         winners = [unknown_id]
         # debug minimale coerente coi tuoi log
@@ -5248,7 +5708,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         H   > H_thr,
         gap < gap_dyn,
     ]
-    is_diffuse = sum(bool(x) for x in flags) >= 2
+    is_diffuse = sum(bool(xa) for xa in flags) >= 2
 
     # Politica unica inibizione per trial
     inh = float(inhibitory_S.inh_scale[0]) if hasattr(inhibitory_S, 'inh_scale') else 0.45  
@@ -5265,9 +5725,6 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         gap_thr=gap_thr,        
         H_thr=H_thr            
     )
-    # z_min_guards verrà definito più sotto in base a mix/diffuse; qui solo soft gate:
-    if z[top_idx] >= 0.90:
-        S_unk.gain_unk = 0.0
 
     # Blend dinamico P_pos/P_cop
     lam_blend = float(np.clip(np.interp(PMR, [0.30, 0.55], [0.0, 1.0]) *
@@ -5329,7 +5786,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # Se il top NON passa il controllo assoluto, NON promuovere nulla.
     # Se NON è "mixture-like", chiudi subito il trial in UNKNOWN.
-    '''if not top_pass_strict:
+    if not top_pass_strict:
         if not is_mixture_like:
             winners = [unknown_id]
             expected  = [taste_map[idxs] for idxs in true_ids]
@@ -5343,7 +5800,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             # Caso mix-like: NON accettiamo ancora alcuna classe,
             # ma lasciamo la possibilità al blocco NNLS (se attivo) di proporre una scomposizione.
             # Se NNLS non trova candidati accettabili, ricadrà in UNKNOWN più avanti.
-            pass'''
+            pass
 
     # Penalità classi calde SOLO in energia diffusa
     if is_diffuse:
@@ -5352,6 +5809,13 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         thr_eff[:unknown_id] *= (1.0 + 0.45 * heat)
         if top_idx == fatty_id and (z[fatty_id] < 1.45 or PMR < 0.66):
             winners = [unknown_id]
+        if top_idx == spicy_id and (PMR < 0.60 or H > H_thr*0.95):
+            winners = [unknown_id]
+        if top_idx in (salty_id, sour_id):
+            # Se il picco è poco netto e l'entropia è alta, è sospetto OOD
+            if (PMR < 1.05 * PMR_thr) or (H > 0.95 * H_thr):
+                winners = [unknown_id]
+                # early return come per gli altri veto
 
     # k_cap dinamico
     HHI   = float((p_local**2).sum()) if E_local > 0 else 1.0
@@ -5374,19 +5838,49 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         z_top1 = float(z[top_idx])
 
         # soglia z un po' più alta rispetto a z_min_base (0.12–0.15)
-        z_min_single = 0.14
+        z_min_single = 0.15
+        # eventuali guardie extra su separazione / PMR per sicurezza
+        sep_ok  = (gap >= 0.55 * gap_thr)
+        pmr_ok  = (PMR >= 0.90 * PMR_thr)
 
         # soglia assoluta per i singoli: usa thr_eff ma non più bassa di ~80% del thr di training
-        thr_single = float(max(thr_eff[top_idx], 0.8 * thr_per_class_test[top_idx]))
-
-        # eventuali guardie extra su separazione / PMR per sicurezza
-        sep_ok  = (gap >= 0.70 * gap_thr)
-        pmr_ok  = (PMR >= 0.95 * PMR_thr)
-
-        if (scores[top_idx] >= thr_single) and (z_top1 >= z_min_single) and (sep_ok or pmr_ok):
+        if top_idx == spicy_id:
+            thr_single = float(max(
+                1.02 * thr_eff[top_idx],
+                0.92 * thr_per_class_test[top_idx],
+                z_min_single * pos_expect_test[top_idx]
+            ))
+            use_sep_ok = sep_ok and pmr_ok
+        elif top_idx in (umami_id, fatty_id):
+            thr_single = max(
+                0.84 * thr_eff[top_idx],
+                0.76 * thr_per_class_test[top_idx],
+                z_min_single * pos_expect_test[top_idx]
+            )
+        elif top_idx == sweet_id:
+            thr_single = max(
+                0.86 * thr_eff[top_idx],
+                0.78 * thr_per_class_test[top_idx],
+                z_min_single * pos_expect_test[top_idx]
+            )
+        # ulteriore rilassamento se il top non è SPICY per prova
+        else:
+            thr_single = max(
+                0.88 * thr_eff[top_idx],
+                0.78 * thr_per_class_test[top_idx],
+                z_min_single * pos_expect_test[top_idx]  # opzionale: guardia in z-assoluto
+            )
+            use_sep_ok = sep_ok and pmr_ok
+        # to relax a bit the first one winner in case it is pure but it is confused as noise
+        totally_clean = (scores[top_idx] >= 1.00 * thr_single) and (z_top1 >= 1.2 * z_min_single)
+        
+        if totally_clean:
             winners = [top_idx]
         else:
-            winners = [unknown_id]
+            if (scores[top_idx] >= thr_single) and (z_top1 >= z_min_single) and use_sep_ok:
+                winners = [top_idx]
+            else:
+                winners = [unknown_id]
 
         # chiudiamo qui il trial (come negli altri early-return)
         expected  = [taste_map[idxs] for idxs in true_ids]
@@ -5529,7 +6023,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                     P_pos=P_pos, P_cop=P_cop,
                     z_scores=z[:unknown_id],
                     frac_thr=0.10,
-                    z_min_guard=max(0.05, z_min_mix), # z_min_mix ~ 0.05–0.12
+                    z_min_guard=max(0.06, z_min_mix), # z_min_mix ~ 0.05–0.12
                     allow_k4=True,
                     allow_k5=(True and may_allow_k5),
                     gap=gap, gap_thr=gap_thr,
@@ -5556,25 +6050,41 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                     nnls_iters=250, 
                     nnls_lr=None, 
                     l1_cap=1.05
-            )  
+            )
+            
             if cand_nnls:
                 w_nnls = info_nnls.get("w", None)
                 if w_nnls is not None:
                     cand_nnls = sorted(cand_nnls, key=lambda isa: (scores[isa], w_nnls[isa]), reverse=True)
                 else:
                     cand_nnls = sorted(cand_nnls, key=lambda isa: scores[isa], reverse=True)
-                k_cap_eff = min(k_cap, 5 if may_allow_k5 else 4)
-                winners = cand_nnls[:k_cap_eff]
-                did_unsup_relabel = True
-                unsup_labels = [taste_map[isa] for isa in winners]
-                unsup_log = dict(
-                    stage="nnls",
-                    err=float(info_nnls["err"]),
-                    cover=float(info_nnls["cover"]),
-                    k_abs=int(info_nnls["k_abs"]),
-                    k_est=int(info_nnls["k_est"]),
-                    thr_rel=float(info_nnls["thr_rel"])
-                )
+                
+                filtered = []  
+                for idx in cand_nnls:
+                    if idx in (salty_id, sour_id):
+                        # chiedi un po' più energia e z per considerarli "veri"
+                        if (scores[idx] >= 1.1 * abs_floor_eff[idx]) and (z[idx] >= max(0.20, z_rel_min)):
+                            filtered.append(idx)
+                    else:
+                        filtered.append(idx)
+                # se il filtro ha svuotato tutto, consideriamo l'NNLS "no-effect"
+                if not filtered:
+                    if verbose_rewards:
+                        print("\nNNLS: NO-EFFECT (filtered out SALTY/SOUR)")
+                else:
+                    cand_nnls = filtered
+                    k_cap_eff = min(k_cap, 5 if may_allow_k5 else 4)
+                    winners = cand_nnls[:k_cap_eff]
+                    did_unsup_relabel = True
+                    unsup_labels = [taste_map[isa] for isa in winners]
+                    unsup_log = dict(
+                        stage="nnls",
+                        err=float(info_nnls["err"]),
+                        cover=float(info_nnls["cover"]),
+                        k_abs=int(info_nnls["k_abs"]),
+                        k_est=int(info_nnls["k_est"]),
+                        thr_rel=float(info_nnls["thr_rel"])
+                    )
                 # stampa compatta “EFFECTIVE”
                 if verbose_rewards:
                     mode = "LITE" if use_lite else "STRICT"
@@ -5594,8 +6104,8 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # E) Reject early per scene povere
     if (len(winners) == 0) and is_diffuse and \
-    (scores[top_idx] < max(min_spikes_for_known_test, 0.5*thr_eff[top_idx])) and \
-    (E_local < 0.35 * np.maximum(1.0, pos_expect_test.sum())):
+    (scores[top_idx] < max(min_spikes_for_known_test, 0.6*thr_eff[top_idx])) and \
+    (E_local < 0.45 * np.maximum(1.0, pos_expect_test.sum())):
         winners = [unknown_id]
 
     # F) Fallback finale (niente argsort, niente tie-bias)
@@ -5611,15 +6121,37 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     # H) Veto rapido NNLS su tanti attivi diffusi
     if k_est != 1 and NNLS_ACTIVE:
         nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
-        too_many_active_diffuse = (
-            (k_active >= 6) and                      # scatta solo se hai davvero tanti attivi
-            (PMR < 0.97 * PMR_thr) and               # PMR chiaramente sotto soglia
-            (H   > 1.05 * H_thr) and                 # entropia chiaramente sopra soglia
-            (not may_allow_k5) and
-            (nnls_k < 5)
-)
         
-        if too_many_active_diffuse:
+        too_many_active_diffuse = (
+            (k_active >= 6) and               # scatta solo se hai davvero tanti attivi
+            (PMR < PMR_thr) and               # PMR chiaramente sotto soglia
+            (H   > H_thr) and                 # entropia chiaramente sopra soglia
+            (not may_allow_k5) 
+            and (nnls_k < 5)
+        )
+        
+        # Veto più aggressivo per pattern chiaramente OOD:
+        # - almeno 3 classi attive
+        # - picco poco pronunciato (PMR molto sotto la soglia calibrata)
+        # - entropia alta (distribuzione "piatta")
+        # - gap piccolo (nessun gusto domina davvero)
+        strict_ood_mixture = (
+            (k_active >= 3) and
+            (PMR < PMR_thr) and
+            (H   > H_thr) and
+            (gap < gap_thr) and
+            (E_local < 0.8 * min_spikes_for_known_test)
+        )
+        
+        # veto specifico SALTY/SOUR in pattern diffusi
+        salty_sour_diffuse = (
+            is_diffuse and
+            (top_idx in (salty_id, sour_id)) and
+            ((PMR < 1.05 * PMR_thr) or (H > 0.95 * H_thr))
+        )
+    
+        # scatta il veto se uno dei due è attivo
+        if too_many_active_diffuse or strict_ood_mixture:
             winners = [unknown_id]
             expected  = [taste_map[idxs] for idxs in true_ids]
             predicted = [taste_map[wx] for wx in winners]
@@ -5628,8 +6160,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
             results.append((label, expected, predicted, hit, ""))
             net.run(recovery_between_trials)
             continue
-
-
+        
     # SPICY during test
     # solo stato, niente plastica
     is_spicy_present = (spicy_id in true_ids) or (spicy_id in winners)
@@ -6010,7 +6541,7 @@ print("\nEnded TEST phase successfully!")
 
 # 13. Plots
 # a) Spikes over time
-'''plt.figure(figsize=(10,4))
+plt.figure(figsize=(10,4))
 plt.plot(spike_mon.t/b.ms, spike_mon.i, '.k')
 plt.xlabel("Time (ms)")
 plt.ylabel("Neuron index")
@@ -6142,4 +6673,4 @@ for idx in range(num_tastes-1):
     plt.title(f'Hedonic window for {taste_map[idx]}')
     plt.xlabel('ms')
     plt.tight_layout()
-    plt.show()'''
+    plt.show()
