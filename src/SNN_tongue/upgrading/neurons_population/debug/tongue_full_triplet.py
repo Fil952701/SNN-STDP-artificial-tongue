@@ -1019,8 +1019,8 @@ EPI_FREQ                = EPI_EVERY     # alias esplicito: ogni quanti step prov
 # Dynamic OVERSAMPLING -> TRAIN ONLY
 USE_DYNAMIC_OVERSAMPLING = True        # switch to TRUE to apply it
 CLASS_BOOST = np.ones(unknown_id, dtype=float)
-BOOST_LAM            = 0.01             # EMA speed
-BOOST_GAIN           = 0.40             # quanto “spinge” il need
+BOOST_LAM            = 0.02             # EMA speed
+BOOST_GAIN           = 0.35             # prima 0.40 -> quanto “spinge” il need
 BOOST_CAP            = (0.90, 1.15)     # clamp per gusto (min,max)
 BOOST_APPLY_GUARD_STEPS = fp_gate_warmup_steps  # non applicare boost nei primissimi step (EMA ancora grezze)
 
@@ -1039,7 +1039,7 @@ MISS_LAM = 0.02   # 0.01–0.05
 MISSSEV_W = 0.7   # peso severità (0.5–1.0 tipico)
 NEED_CAP = 1.5
 WARMUP_BIAS = 250 # step da skippare prima di usare Attentional Bias
-MISS_BG_LAM = 0.003 # coefficiente per gestire i miss_ema e i misssev_ema
+MISS_BG_LAM = 0.005 # coefficiente per gestire i miss_ema e i misssev_ema
 
 # Bio-plausible early-stopping (DA gating + best snapshot)
 ema_perf             = 0.0              # EMA della performance
@@ -1368,13 +1368,13 @@ if TRAINING_PROFILE == "stable_core":
     # Plasticità fuori diagonale basata su dopamine complicata
     USE_OFFDIAG_DOPAMINE = False
     # Soft-pull verso best snapshot
-    USE_SOFT_PULL = False
+    USE_SOFT_PULL = True
     # Consolidamento lento tipo "w_slow" per consolidare lentamente i pesi verso best snapshot
     USE_SLOW_CONSOLIDATION = True
     # plasticity decay globale
     USE_PLASTICITY_DECAY = True
     # Niente early stopping sofisticato (lasciamo finire tutti gli step)
-    USE_EARLY_STOP = False
+    USE_EARLY_STOP = True
     # Spengo la homeostasi di firing-rate globale (Turrigiano-like)
     HOMEOSTASIS_ON =  True
     # attentional bias
@@ -1419,7 +1419,7 @@ if TRAINING_PROFILE == "stable_core":
     BASE_RATE_PER_CLASS = 500
     NORMALIZE_TEST_RATES = False
     # best checkpoint
-    BEST_CHECKPOINT = False
+    BEST_CHECKPOINT = True
     # Triplet STDP parameters
     A2p =  0.0055  # pair LTP => prima 0.0065, poi 0.0070
     A3p =  0.0065  # triplet LTP => prima 0.0070, poi 0.0075
@@ -4072,7 +4072,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         else:
             # se c'è bisogno reale, modello il vettore di conseguenza
             need_norm = need / (m + 1e-9)
-            delta = np.clip(need_norm - 0.95, 0.0, 10.0) # solo sopra-media altrimenti siamo sempre al cap fisso 
+            delta = np.clip(need_norm - 1.05, 0.0, 10.0) # prima 0.95 invece di 1.05 -> solo sopra-media altrimenti siamo sempre al cap fisso 
             # componente tonica lenta del bias che entra sempre
             tonic = alpha_atten * need
             target = 1.0 + BOOST_GAIN * delta + tonic
@@ -4128,7 +4128,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             theta_bias_next[sl] = bias_ta
             
             # tupla da stampare per il debug
-            applied.append((ta, float(debito[ta]), float(inc), float(dc_pop[ta]), float(tp_gate[ta])))
+            applied.append((int(ta), float(debito[ta]), float(inc), float(dc_pop[ta]), float(tp_gate[ta])))
 
         if verbose_rewards and applied:
             print(f"\n[BIO-ATTENTIONAL BIAS] → {applied}"
