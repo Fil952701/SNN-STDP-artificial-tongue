@@ -2,6 +2,7 @@
 # that continuously learns to recognize multiple tastes.
 
 import brian2 as b
+import json
 b.prefs.codegen.target = 'numpy'
 #b.prefs.codegen.target = 'cpp_standalone'
 #b.set_device('cpp_standalone', build_on_run=False)
@@ -446,58 +447,8 @@ def decode_by_nnls(
     return cand, dict(err=float(err), cover=cover,
                       k_abs=int(len(cand)), k_est=k_est,
                       thr_rel=float(thr_rel_eff), ws=ws)
-    
-# normalizzazione L1 per popolazioni di neuroni e non più solo singoli
-'''def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
-                 floor=0.0, allow_upscale=True, scale_max=1.15):
-    # Normalizza i pesi in ingresso per ogni neurone post-sinaptico (j),
-    # con un lieve bias alla diagonale (pre=i corrispondente alla sua classe).
-    Wi = np.asarray(S.i[:], int)
-    Wj = np.asarray(S.j[:], int)
-    W  = S.w[:]
-    C_known = unknown_id
 
-    # target L1 per colonna: se non dato, usa media iniziale * fanin_known
-    fanin = C_known
-    if target is None:
-        init_mean = float(np.mean(W)) if W.size else 0.5
-        target = float(np.clip(init_mean*fanin, 0.5*fanin*0.2, 1.5*fanin*0.8))
-
-    for jx in range(TOTAL_OUT):
-        mask_col = (Wj == jx)
-        if not np.any(mask_col): 
-            continue
-        wcol = W[mask_col].copy()
-        icol = Wi[mask_col]
-
-        # floor
-        if floor > 0:
-            wcol = np.maximum(wcol, floor)
-
-        # bias diagonale: se il neurone j appartiene alla pop di classe q → boosta i==q
-        q = (jx // NEURONS_PER_TASTE)  # classe della pop di j
-        wcol[(icol == q)] *= diag_bias_gamma
-
-        if mode == "l1":
-            sz = np.sum(wcol)
-            if sz > 0:
-                scale = target / sz
-                if not allow_upscale:
-                    scale = min(1.0, scale)
-                scale = np.clip(scale, 1.0/scale_max, scale_max)
-                wcol *= scale
-        else:  # softmax
-            xd = wcol / max(1e-9, temperature)
-            xd = np.exp(xd - np.max(xd))
-            xd /= np.sum(xd) + 1e-9
-            wcol = xd * target
-
-        # rimuovi il bias prima di scrivere
-        wcol[(icol == q)] /= diag_bias_gamma
-        W[mask_col] = wcol
-
-    S.w[:] = W'''
-    
+# L1 col-normalization function for neurons populations   
 def col_norm_pop(target=None, mode="l1", temperature=1.0, diag_bias_gamma=1.20,
                  floor=0.0, allow_upscale=True, scale_max=1.15,
                  w_min=0.05, w_max=0.95):
@@ -642,6 +593,13 @@ def diag_indices_for_taste(p, q=None):
         # off-diagonal p→pop(q): i=p, j ∈ slice(q)
         slq = taste_slice(q)
         return np.where((i_all == p) & (j_all >= slq.start) & (j_all < slq.stop))[0]
+    
+# funzione per smorzare a breve le eligibility traces dopo la col norm altrimenti arriva l'update troppo aggressivo
+def post_colnorm_elig_damp(S, fast_zero=True, slow_mul=0.5, vslow_mul=0.8):
+    if fast_zero:
+        S.elig_fast[:] = 0.0
+    S.elig_slow[:]  = np.asarray(S.elig_slow[:],  float) * float(slow_mul)
+    S.elig_vslow[:] = np.asarray(S.elig_vslow[:], float) * float(vslow_mul)
 
 # Somma a scores un contributo 'diff_extra' che può essere (C,), (K,C), (C,K) o (K*C,).
 # Comprimi su K (media) se necessario
@@ -734,7 +692,8 @@ def extract_id(taste_map: dict, taste: str) -> int:
         if v.upper() == taste.upper():
             return k
     raise ValueError(f"Taste {taste} not found in taste_map\n")
-    
+
+# id per ogni gusto differente di modo tale da poterli utilizzare
 sweet_id = extract_id(taste_map, "SWEET")
 bitter_id = extract_id(taste_map, "BITTER")
 salty_id = extract_id(taste_map, "SALTY")
@@ -792,7 +751,7 @@ k_inh_HT             = 0.4              # WTA scaling per 5-HT unit
 USE_SPICY_AVERSION   = True
 da_pulse_reward      = 1.0              # burst DA if classification is correct -> reward
 ht_pulse_aversion    = 1.0              # burst 5-HT when imminent event is aversive
-ht_pulse_fp          = 0.35              # burst 5-HT extra if there are a lot of strong FP
+ht_pulse_fp          = 0.30              # burst 5-HT extra if there are a lot of strong FP
 p_aversion_base      = 0.01             # probabilità base di evento avversivo quando SPICY è presente => mettere 0.02 per spegnere o quasi
 p_aversion_slope     = 0.04             # quanto la probabilità cresce con l'intensità relativa => mettere 0.05 per spegnere o quasi
 p_aversion_cap       = 0.60             # massimo assoluto (clamp)
@@ -889,12 +848,13 @@ USE_OFFDIAG_DOPAMINE  = True             # quick toggle to activate/deactivate r
 USE_FP_DIFFUSE_PENALTY = True
 OFFDIAG_DECAY         = 0.90              # fattore di decadimento graduale
 OFFDIAG_W_FLOOR       = 1e-3              # pavimento > 0 per non andare mai a 0 secco
+UNDERSHOOT_MIN        = 10                # gestione dell'undershoot nella punizione
 beta_offdiag_map      = np.ones(unknown_id)
 #beta_offdiag_map      = {ts: 1.5 for ts in TASTE_NAMES}
 beta_offdiag_map[0]   = 1.5               # SWEET
 beta_offdiag_map[1]   = 1.5               # BITTER
-beta_offdiag_map[2]   = 1.5               # SALTY
-beta_offdiag_map[3]   = 1.5               # SOUR
+beta_offdiag_map[2]   = 1.8               # SALTY
+beta_offdiag_map[3]   = 1.8               # SOUR
 beta_offdiag_map[4]   = 1.5               # UMAMI
 beta_offdiag_map[5]   = 1.5               # FATTY
 beta_offdiag_map[6]   = 1.5               # SPICY
@@ -915,13 +875,16 @@ NORM_WARMUP           = 250
 COLNORM_PHASE         = (NORM_WARMUP + 1) % col_norm_every
 SAFE_GAP              = 2                # salta col norm per 2 trial dopo l’homeostasi plastica
 DECAY_GAP             = 1                # salta col norm per il trial del decay e per quello subito dopo
-GLOBAL_MIN_GAP        = 2                # almeno 15 trial di distanza
+GLOBAL_MIN_GAP        = 6                # almeno 15 trial di distanza
 SOFT_PULL_STRONG_THR  = 0.7
 soft_pull_strength    = 0.0              # 0=nessun veto, 1=veto forte
+COOLDOWN_AFTER_COLNORM = 40              # trial
+COOLDOWN_DA_SCALE     = 0.5              # reward/dopamina dimezzata
+COOLDOWN_PLAST_SCALE  = 0.6              # plasticità ridotta
 
 # SPICY dynamic tolerance / aversion dynamics
-spicy_id              = 6                # spicy taste is the sixth one
-fatty_id              = 5                # fatty taste is the fifth one
+#spicy_id              = 6                # spicy taste is the sixth one
+#fatty_id              = 5                # fatty taste is the fifth one
 thr0_spice_var        = 0.36             # baseline aversive threshold -> driven unit
 tau_thr_spice         = 30 * b.second    # adapting threshold -> slow
 tau_sd_spice          = 80 * b.ms        # spicy intensity integration
@@ -1056,8 +1019,6 @@ EPI_FREQ                = EPI_EVERY     # alias esplicito: ogni quanti step prov
 # Dynamic OVERSAMPLING -> TRAIN ONLY
 USE_DYNAMIC_OVERSAMPLING = True        # switch to TRUE to apply it
 CLASS_BOOST = np.ones(unknown_id, dtype=float)
-#CLASS_BOOST[6]       = 1.10             # SPICY leggermente sopra perché è già molto presente
-#CLASS_BOOST[0]       = 1.10             # SWEET
 BOOST_LAM            = 0.01             # EMA speed
 BOOST_GAIN           = 0.40             # quanto “spinge” il need
 BOOST_CAP            = (0.90, 1.15)     # clamp per gusto (min,max)
@@ -1065,12 +1026,20 @@ BOOST_APPLY_GUARD_STEPS = fp_gate_warmup_steps  # non applicare boost nei primis
 
 # Biological per-class attention bias -> TRAIN ONLY (no oversampling)
 USE_ATTENTIONAL_BIAS = True             # toggle to set attentional bias ON/OFF
-ATTN_BIAS_GAIN_MV    = 0.4              # mV di bias max circa per unità "need_norm-1"
+ATTN_BIAS_GAIN_MV    = 0.5              # mV di bias max circa per unità "need_norm-1"
 ATTN_BIAS_CAP_MV     = 2.0              # cap di sicurezza per gusto
 ATTN_BIAS_FLOOR_MV   = -2.0             # pavimento soglia base per non scendere sotto
-DEBITO_CAP           = 0.20             # 30% sopra la media globale
+DEBITO_CAP           = 0.25             # 30% sopra la media globale
 alpha_atten          = 0.01             # coefficiente di bias tonico molto lento
 HAS_STRONG_FP_PULSE  = True
+# Miss and need cap management
+miss_ema = np.zeros(unknown_id, dtype=float)      # freq miss quando vera
+misssev_ema = np.zeros(unknown_id, dtype=float)   # severità miss quando vera
+MISS_LAM = 0.02   # 0.01–0.05
+MISSSEV_W = 0.7   # peso severità (0.5–1.0 tipico)
+NEED_CAP = 1.5
+WARMUP_BIAS = 250 # step da skippare prima di usare Attentional Bias
+MISS_BG_LAM = 0.003 # coefficiente per gestire i miss_ema e i misssev_ema
 
 # Bio-plausible early-stopping (DA gating + best snapshot)
 ema_perf             = 0.0              # EMA della performance
@@ -1087,18 +1056,18 @@ USE_PLASTICITY_DECAY = False            # toggle ON/OFF plasticity decay
 USE_SLOW_CONSOLIDATION = True           # toggle to set slow consolidation ON/OFF 
 USE_EARLY_STOP       = False            # Test 1: niente early stopping
 EARLY_STOP_MIN_FRAC  = 0.7              # usa early stop solo dopo il 70% dei trial
-PATIENCE_LIMIT       = 300              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
+PATIENCE_LIMIT       = 500              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
 ETA_CONSOL           = 0.01             # slow capture rate (0..1) toward current fast weights
 DA_THR_CONSOL        = 0.35             # require enough DA to consolidate into w_slow
 BETA_MIX_TEST        = 0.10             # how much fast to keep when mixing slow→test (0..1)
 USE_SOFT_PULL        = True             # softly drift toward best-state when stagnating
-#RHO_PULL             = 0.08             # 0..1, per-trial pull strength
-PLASTICITY_DECAY     = 0.95             # multiplicative decay on S.stdp_on when stagnating
+#RHO_PULL             = 0.08            # 0..1, per-trial pull strength
+PLASTICITY_DECAY     = 0.90             # multiplicative decay on S.stdp_on when stagnating
 MAX_PLASTICITY_DECAYS= 1                # maximum number of decays allowed
 W_EMA                = 12               # window size for EMA calculation
-SOFT_PULL_DROP_EPS       = 0.02                            # devi essere davvero sotto il best_ema
-SOFT_PULL_COOLDOWN_STEPS = 40                              # max 1 pull ogni 40 trial
-RHO_PULL_EARLY           = 0.02                            # non 0.25
+SOFT_PULL_DROP_EPS       = 0.02         # devi essere davvero sotto il best_ema
+SOFT_PULL_COOLDOWN_STEPS = 40           # max 1 pull ogni 40 trial
+RHO_PULL_EARLY           = 0.02         # non 0.25
 RHO_PULL_MAX             = 0.05
 # storico corto per stimare il rumore dell'EMA
 ema_hist             = deque(maxlen=32) # storicizzo le ultime 32 performance
@@ -1126,6 +1095,9 @@ DECAY_EPS            = 0.08             # quanto deve ESSERE PEGGIO di best_ema_
 STDP_ON_MIN          = 0.65             # clamp minimo per stdp_on / PLAST_GLOBAL
 STDP_ON_DECAY_FACTOR = 0.9              # riduzione quando faccio un decay globale
 JACC_THR             = 0.25             # minima soglia Jaccard per blind
+LOG_BAD_TRIALS       = True
+HARD_WTA_SINGLE      = True
+NEG_GATE_FLOOR       = 0.08
 # GDI toggle for activation/deactivation
 USE_GDI              = True             # True => use GDI; False => use rate normalization
 # on/off GABA neuromod during reward
@@ -1137,6 +1109,15 @@ BEST_CHECKPOINT      = True
 # EMA per l'accuracy su trial a gusto singolo (solo per debug)
 ema_acc_short        = 0.0
 ema_acc_long         = 0.0
+
+# LTD and FP off diag parameters
+FP_PULSE_WARMUP = max(300, NORM_WARMUP + col_norm_every)
+FP_PULSE_COOLDOWN = 30  # 15–40
+
+LTD_WARMUP_FRAC = 0.50
+LTD_COOLDOWN    = 60   # consigliato: 40–120 se è “strutturale”
+MINI_FREEZE_LTD = 8    # 5–15
+OVER_LTD_MIN    = 1.08
 
 # Partial reinforcement DA between Jacc 0.0 < r < 0.67
 # La MINI-REINFORCEMENT serve solo se voglio che, 
@@ -1253,6 +1234,19 @@ CR_MIN_CONF          = 0.65
 # memoria mix con LRU
 CR_MIX_CACHE         = 128
 
+# HELPER FOR LOGGING
+def top2_with_gap(scores, valid_ids):
+    # valid_ids: lista di indici considerati (es: senza UNKNOWN)
+    arr = [(i, float(scores[i])) for i in valid_ids]
+    arr.sort(key=lambda x: x[1], reverse=True)
+    (i1, s1) = arr[0]
+    (i2, s2) = arr[1] if len(arr) > 1 else (-1, float("-inf"))
+    return i1, s1, i2, s2, (s1 - s2)
+
+def append_jsonl(path, obj):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
 # HELPERS FOR CRAVING
 # 1. Clamp
 def clamp(xc, lo=0.0, hi=CRAVE_MAX):
@@ -1332,6 +1326,8 @@ def update_desire(
         try:
             # fast DA
             gain = meta_scale(top_idx)  # 0.3..1.65
+            if verbose_rewards:
+                print(f"\n[METAPLASTICITY] → gain={gain:.4f} at trial {step}")                
             mod.DA_f = float(np.clip(mod.DA_f + CR_SAT_BONUS * float(conf_score) * gain, 0.0, 1.0))
             try:
                 mod.DA_f = float(max(0.35, min(1.0, mod.DA_f)))  # non sotto 0.35
@@ -1369,22 +1365,22 @@ if TRAINING_PROFILE == "stable_core":
     # Spengo solo i moduli "meta" più aggressivi / strutturali.
     # Niente oversampling dinamico se ho attentional bias e viceversa
     USE_DYNAMIC_OVERSAMPLING = False
-    # Niente plasticità fuori diagonale basata su dopamine complicata
+    # Plasticità fuori diagonale basata su dopamine complicata
     USE_OFFDIAG_DOPAMINE = False
     # Soft-pull verso best snapshot
-    USE_SOFT_PULL = True
+    USE_SOFT_PULL = False
     # Consolidamento lento tipo "w_slow" per consolidare lentamente i pesi verso best snapshot
     USE_SLOW_CONSOLIDATION = True
-    # Niente plasticity decay globale
-    USE_PLASTICITY_DECAY = False
+    # plasticity decay globale
+    USE_PLASTICITY_DECAY = True
     # Niente early stopping sofisticato (lasciamo finire tutti gli step)
-    USE_EARLY_STOP = True
+    USE_EARLY_STOP = False
     # Spengo la homeostasi di firing-rate globale (Turrigiano-like)
     HOMEOSTASIS_ON =  True
     # attentional bias
     USE_ATTENTIONAL_BIAS = True
     # Lascio l'epigenetica già spenta (EPI_ON è già False), ma la ribadisco:
-    EPI_ON = False
+    EPI_ON = True
     # Togliamo l’hedonic DA gating (usa solo DA “standard” legato al reward)
     USE_HEDONIC_DA = False
     # col norm
@@ -1409,11 +1405,12 @@ if TRAINING_PROFILE == "stable_core":
     INTRINSIC_HOMEO = True
     # DA plastic reinforcement
     PLAST_GLOBAL = 1.0
-    # LTD strutturale OFF
+    # LTD strutturale off-diag
     USE_LTD_OFFDIAG = True
     # FP DIFFUSE
     USE_FP_DIFFUSE_PENALTY = False
-    HAS_STRONG_FP_PULSE  = False
+    # increase 5-HT, NE, HI to the next trial if strong FP verified
+    HAS_STRONG_FP_PULSE  = True
     # Soft pruning
     SOFT_PRUNING = False
     # NNLS
@@ -1422,12 +1419,8 @@ if TRAINING_PROFILE == "stable_core":
     BASE_RATE_PER_CLASS = 500
     NORMALIZE_TEST_RATES = False
     # best checkpoint
-    BEST_CHECKPOINT = True
+    BEST_CHECKPOINT = False
     # Triplet STDP parameters
-    '''A2p =  0.0055 * PLAST_GLOBAL  # pair LTP => prima 0.0065, poi 0.0070
-    A3p =  0.0065 * PLAST_GLOBAL  # triplet LTP => prima 0.0070, poi 0.0075
-    A2m = -0.0055 * PLAST_GLOBAL  # pair LTD => prima -0.0070, poi -0.0075
-    A3m = -0.0025 * PLAST_GLOBAL  # triplet LTD'''
     A2p =  0.0055  # pair LTP => prima 0.0065, poi 0.0070
     A3p =  0.0065  # triplet LTP => prima 0.0070, poi 0.0075
     A2m = -0.0055  # pair LTD => prima -0.0070, poi -0.0075
@@ -1436,16 +1429,12 @@ if TRAINING_PROFILE == "stable_core":
     # simple neuromod gains
     USE_SIMPLE_NEUROMOD  = True   # toggle neuromodulators + simple gains ON/OFF
     # on/off GABA neuromod during reward
-    GABA_ON = False
+    GABA_ON = True
     GABA_STABILIZE_ON = True
     # partial DA reward on Jacc 0 < r < 0.67
     USE_PARTIAL_REINFORCE = True
     # full DA reward on Jacc r >= 0.67
     USE_FULL_REINFORCE = True
-
-# clipping bounds
-W_MIN, W_MAX = 0.05, 0.95
-w_rng = (W_MAX - W_MIN)
 
 # calcolo quantile e media elig traces
 def stats_elig(x):
@@ -2190,11 +2179,21 @@ def epi_update(step: int) -> bool:
         return False
     
     # no epigenetics too soon => dynamic scanning of the right period
-    if step < 0.20 * TOTAL_TRAIN_STEPS:
+    # late training event
+    if step < 0.60 * TOTAL_TRAIN_STEPS:
         return False
     
     # non aligned temporal slot
     if step % EPI_FREQ != 0:
+        return False
+    
+    if step <= freeze_until:
+        return False
+    
+    if best_ema_step < 0:
+        return False
+    
+    if fp_structural_done:
         return False
     
     # enough history achieved
@@ -2522,6 +2521,9 @@ else:
                 S.connect(i=ps, j=all_posts[q])
 
 # init weights
+# clipping bounds
+W_MIN, W_MAX = 0.05, 0.95
+w_rng = (W_MAX - W_MIN)
 if NEURONS_PER_TASTE == 1 and connectivity_mode == "dense":
     # initial advantage for true connections, minimal cross-talk
     S.w['i==j'] = '0.35 + 0.25*rand()'  # 0.30 0.50 value
@@ -2822,6 +2824,26 @@ for taste_id in range(unknown_id):
     for _ in range(n_repeats * max(1, DAF_PURE)):
         vs, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 301))
         pure_train.append((vs, ids, lab + " (single)"))
+    
+# a0. single train pure static oversampling for FATTY and SOUR
+for _ in range(n_repeats):
+    for taste_id in range(unknown_id):
+        if taste_id in (fatty_id, sour_id) and np.random.rand() < 0.35:
+            vs, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 301))
+            pure_train.append((vs, ids, lab + " (single) (oversampling)"))
+            
+for _ in range(n_repeats//2):
+    for taste_id in range(unknown_id):
+        if taste_id in (fatty_id, salty_id) and np.random.rand() < 0.35:
+            vs, ids, lab = noisy_mix([taste_id], amp=np.random.randint(220, 301))
+            pure_train.append((vs, ids, lab + " (single) (noisy)"))
+
+# a0.1 single train pure noisy static oversampling for FATTY and SOUR
+for _ in range(n_repeats):
+    for taste_id in range(unknown_id):
+        if taste_id in (fatty_id, sour_id) and np.random.rand() < 0.35:
+            vs, ids, lab = augment_mix([taste_id], amp=np.random.randint(220, 301))
+            pure_train.append((vs, ids, lab + " (single) (aug)"))
 
 # a1. single train augmented more biologically plausible
 for _ in range(n_repeats):
@@ -2915,6 +2937,13 @@ extra_mixes_q = [
     [1,4,6,3], [1,5,6,4,2], [2,5,6,1], [0,1,6,3,5], [0,2,4,3], [3,4,5,6], [0,1,5,2], [0,1,6,5,3], [1,6,2,4],
     [1,2,3,4], [3,6,1,2], [1,2,4,5,6], [0,1,2,4,6], [0,2,3,4,5,1], [0,3,5,6], [2,3,4,5,1,6]
 ]
+
+REPEAT_BY_K = {4: 1, 5: 6, 6: 8}  # esempio: porta 5-gusti a ~6x
+for mix in extra_mixes_q:
+    reps = REPEAT_BY_K.get(len(mix), 1)
+    for _ in range(n_repeats * reps):
+        mixture_train.append(make_mix(mix, amp=rng.integers(200, 260)))
+
 for _ in range(n_repeats):  # repeat a bit but not too much or training will be too long
     for mix in extra_mixes_q:
         mixture_train.append(noisy_mix(mix, amp=rng.integers(200, 260)))
@@ -3178,6 +3207,7 @@ S.y[:] = 0; S.ybar[:] = 0
 S.elig_fast[:]  = 0.0
 S.elig_slow[:]  = 0.0
 S.elig_vslow[:] = 0.0
+
 # inizializzo attentional bias
 prev_winners = []
 theta_bias_next = None
@@ -3232,6 +3262,7 @@ last_decay_step   = None
 just_soft_pulled  = False
 complex_mix_counter = 0
 elig_cooldown     = 0
+cooldown_left     = 0
 
 # CURRICULUM DATASET CONTROLLER
 # noise mini-burn before curriculum
@@ -3270,13 +3301,19 @@ alpha_heavy_lr = 0.04
 alpha_heavy_short = 0.05
 heavy_cooldown = 0
 
+# LTD and FP counters
+last_fp_pulse_step: int | None = None
+last_ltd_step: int | None = None
+
 # salvo i valori iniziali dei learning rate prima del loop
 tmp_alpha = float(alpha_lr)
 TMP_PLAST = float(PLAST_GLOBAL)
 
 # TRAINING MAIN LOOP
 for step in range(1, TOTAL_TRAIN_STEPS + 1):
+    
     fp_structural_done = False
+    
     # avanza di fase in modo DATA-DRIVEN (in base ai passi per fase)
     if CURRICULUM_MODE:
         if curr_phase == 0 and step_phase0 == 0:
@@ -3301,6 +3338,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             curr_phase = 6
             print("\n[CURRICULUM] → FASE 6 (cooldown)\n")
         if curr_phase == 6 and step_phase6 == phase6_max_steps:
+            curr_phase = 6
             print("\n[CURRICULUM] → FINISH (training ended)\n")
 
     # scegli la lista di training e l'indice locale
@@ -3342,6 +3380,17 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     if spicy_id in true_ids:
         spicy_seen += 1
     
+    # clipping bounds gradually changing for steps
+    if step > 0.20 * TOTAL_TRAIN_STEPS and step <= 0.35 * TOTAL_TRAIN_STEPS:
+        W_MIN, W_MAX = 0.02, 0.95
+    elif step > 0.35 * TOTAL_TRAIN_STEPS and step <= 0.45 * TOTAL_TRAIN_STEPS:
+        W_MIN, W_MAX = 0.01, 0.95
+    elif step > 0.45 * TOTAL_TRAIN_STEPS:
+        W_MIN, W_MAX = 0.005, 0.95
+    
+    # ricalcolato sempre in base alla fase in cui si è
+    w_rng = (W_MAX - W_MIN)
+
     # resetto i learning rate ad ogni nuova iterazione perché in questo modo
     # vengono gestiti dalla fase corrente a seconda di come devono essere settati
     alpha_lr = tmp_alpha
@@ -3652,6 +3701,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         and is_diffuse_train 
         and USE_FP_DIFFUSE_PENALTY 
         and not fp_structural_done
+        and not USE_LTD_OFFDIAG
+        and not USE_OFFDIAG_DOPAMINE
     ):
         j_all = np.asarray(S.j[:], int)
 
@@ -3669,7 +3720,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                 #severity = float(diff_counts[q]) / (fp_gate_train + 1e-9)
                 severity = float(dc_pop[q]) / (fp_gate_train + 1e-9)
                 r_off = - beta_offdiag * (1.0 + ht_gain * float(mod.HT[0])) * min(2.0, severity)
-                r_off *= perf_gate_local
+                r_off *= max(perf_gate_local, NEG_GATE_FLOOR)
                 r_off *= PLAST_GLOBAL * 0.5
                 # penalizza TUTTE le sinapsi (riduce l'attrattore spuriamente -> caldo)
                 #idx = np.where(np.asarray(S.j[:], int) == q)[0]
@@ -3868,6 +3919,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                 f"\nema_short={bs['ema_short']:.3f}"
                 f"\nema_long={bs['ema_long']:.3f}"
             )
+        
     
     # mix-like metrics analysis
     E_scores = float(np.sum(scores[:unknown_id]))
@@ -3911,30 +3963,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         # effective gates TP and FP
         tp_gate[idx] = tp_gate_i
         fp_gate[idx] = fp_gate_i
-
-    # bisogno per classe: TP sotto soglia sui veri; FP sopra soglia sui falsi
-    need = np.zeros(unknown_id, dtype=float)
-    for ta in range(unknown_id):
-        if ta in true_ids:
-            # se la classe vera è sotto soglia, ha bisogno di attenzione
-            need[ta] = max(0.0, float(tp_gate[ta]) - float(dc_pop[ta]))
-        else:
-            # se la classe falsa è SOTTO il gate FP, ha spazio per essere un po' più eccitabile;
-            # MA se è SOPRA il gate FP (fa molti falsi positivi) ⇒ need = 0 (nessun boost)
-            need[ta] = max(0.0, float(fp_gate[ta]) - float(scores[ta]))
         
-    # normalizza il need per stabilità
-    m = float(np.mean(need) + 1e-9)
-    need_norm = need / m
-
-    # aggiorna il vettore boost (EMA) e clampa
-    CLASS_BOOST[:] = (1.0 - BOOST_LAM) * CLASS_BOOST + BOOST_LAM * (1.0 + BOOST_GAIN * need_norm)
-    CLASS_BOOST[:] = np.clip(CLASS_BOOST, BOOST_CAP[0], BOOST_CAP[1])
-    if step % 100 == 0 and verbose_rewards:
-        print("\nCLASS_BOOST:", CLASS_BOOST[:unknown_id])
-        print("\ntheta_bias SWEET:", float(taste_neurons.theta_bias[taste_slice(sweet_id)][0]/b.mV))
-        print("\ntheta_bias BITTER:", float(taste_neurons.theta_bias[taste_slice(bitter_id)][0]/b.mV))
-    
     # selecting all the spiking winning neurons >= threshold_ratio
     sorted_idx = np.argsort(scores)[::-1]
     top = scores[sorted_idx[0]]
@@ -3983,39 +4012,132 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             winners = cleaned 
         
     # fallback totale se non si trova altri vincitori
-    if not winners:
-        top_idx = int(np.argmax(scores[:unknown_id]))
-        if scores[top_idx] >= max(0.35 * mx, 0.6 * min_spikes_for_known):
-            winners = [top_idx]
+    is_single_label = (len(true_ids) == 1) and ("(single)" in label) and (not is_mix_like)
+    if HARD_WTA_SINGLE and is_single_label:
+        best = int(np.argmax(scores[:unknown_id]))  # solo gusti reali -> nei gusti singoli non devono vincere piu gusti contemporaneamente
+        if scores[best] >= min_spikes_for_known:
+            winners = [best]
         else:
-            winners = []  # vero UNKNOWN
-
-    # ATTENTIONAL BIAS PHASIC AND TONIC -> MORE BIOLOGICAL OVERSAMPLING -> Meta-plasticity Homeostatic/Attention population-level aware
-    theta_bias_next = np.ones(len(taste_neurons.theta_bias), dtype=float) * base_bias_mv
-
-    if USE_ATTENTIONAL_BIAS and PLASTIC_PHASE:
-        need_vec = CLASS_BOOST[:unknown_id].copy()
-        need_vec /= float(np.mean(need_vec) + 1e-9)
-        debito = np.clip(need_vec - 1.0, 0.0, DEBITO_CAP) / max(DEBITO_CAP, 1e-9)
-
+            winners = []
+    
+    # ATTENTIONAL BIAS PHASIC AND TONIC -> MORE BIOLOGICAL OVERSAMPLING
+    # 1) aggiorna EMA miss / miss severity per i gusti veri del trial (miss=0 o 1 SEMPRE)
+    need = np.zeros(unknown_id, dtype=float)
+    applied = []
+    if not USE_ATTENTIONAL_BIAS or (not PLASTIC_PHASE) or (step < WARMUP_BIAS) or ("NULL" in label) or ("OOD" in label):
+        # more bio: fai rilassare lentamente il boost verso 1.0 anche quando AB è OFF
+        CLASS_BOOST[:unknown_id] = (1.0 - BOOST_LAM) * CLASS_BOOST[:unknown_id] + BOOST_LAM * 1.0
+    else:
         for ta in true_ids:
             if ta >= unknown_id:
                 continue
 
-            # se uno ha già vinto non lo boosto
+            # miss deve poter essere 0 o 1 a seconda che sia vincitore o meno
+            close = (float(dc_pop[ta]) >= 0.90 * float(tp_gate[ta])) and (float(dc_pop[ta]) >= min_spikes_for_known)
+            miss = 0.0 if (ta in winners or close) else 1.0
+            #miss = 0.0 if (ta in winners) else 1.0
+
+            # deficit e severity anche quando dc_pop=0 (anzi, è il caso peggiore)
+            tp = float(tp_gate[ta])
+            dp = float(dc_pop[ta])
+            deficit = max(0.0, tp - dp)
+            sev = deficit / (tp + 1e-9) if tp > 0 else 0.0
+            # smorzatura di severity se dc_pop in questione è quasi vicino alla vittoria
+            # in questo modo evito di biasare troppo classi quasi vincenti
+            if dp > 0.8*tp:
+                sev *= (tp - dp) / (0.2*tp + 1e-9) 
+
+            miss_ema[ta] = (1.0 - MISS_LAM) * miss_ema[ta] + MISS_LAM * miss
+            misssev_ema[ta] = (1.0 - MISS_LAM) * misssev_ema[ta] + MISS_LAM * sev
+
+        # leak globale: “dimenticanza” lenta anche delle classi non viste
+        # per non tenere accumulata miss_ema inutilmente quando non c'è bisogno
+        # more biologically plausible
+        if PLASTIC_PHASE:
+            saw = np.zeros(unknown_id, dtype=bool)
+            id_saw = [ta for ta in true_ids if ta < unknown_id]
+            saw[id_saw] = True
+            miss_ema[~saw] *= (1.0 - MISS_BG_LAM)
+            misssev_ema[~saw] *= (1.0 - MISS_BG_LAM)
+
+        # need deriva SOLO da EMA; clamp
+        need = miss_ema + MISSSEV_W * misssev_ema
+        need = np.clip(need, 0.0, NEED_CAP)
+
+        m = float(np.mean(need[:unknown_id]))
+        
+        if m < 1e-6:
+            # se non c'è bisogno reale, reset e fai tornare il boost verso 1.0 (non verso un vettore uniforme >1)
+            CLASS_BOOST[:unknown_id] = (1.0 - BOOST_LAM) * CLASS_BOOST[:unknown_id] + BOOST_LAM * 1.0
+        else:
+            # se c'è bisogno reale, modello il vettore di conseguenza
+            need_norm = need / (m + 1e-9)
+            delta = np.clip(need_norm - 0.95, 0.0, 10.0) # solo sopra-media altrimenti siamo sempre al cap fisso 
+            # componente tonica lenta del bias che entra sempre
+            tonic = alpha_atten * need
+            target = 1.0 + BOOST_GAIN * delta + tonic
+            CLASS_BOOST[:unknown_id] = (1.0 - BOOST_LAM) * CLASS_BOOST[:unknown_id] + BOOST_LAM * target
+            CLASS_BOOST[:unknown_id] = np.clip(CLASS_BOOST[:unknown_id], 1.0, BOOST_CAP[1])
+        
+    # 2) gestione effettiva di attentional bias (applicazione SOLO ai veri target che NON hanno vinto e NON sono "close")
+    theta_bias_next = np.ones(len(taste_neurons.theta_bias), dtype=float) * base_bias_mv
+
+    # applicazione effettiva del bias
+    if USE_ATTENTIONAL_BIAS and step >= WARMUP_BIAS and PLASTIC_PHASE and ("NULL" not in label) and ("OOD" not in label):
+        need_vec = CLASS_BOOST[:unknown_id].copy()
+        need_vec /= float(np.mean(need_vec) + 1e-9)
+        debito = np.clip(need_vec - 0.95, 0.0, DEBITO_CAP) / max(DEBITO_CAP, 1e-9)
+        
+        '''# debito basato su NEED (puro) per classe, relativo alla media
+        need_vec = need[:unknown_id].copy()
+
+        m_need = float(np.mean(need_vec) + 1e-9)
+        need_normalized = need_vec / m_need                       # media ≈ 1
+        debito = np.clip(need_normalized - 0.95, 0.0, DEBITO_CAP)  # solo sopra-media
+        debito = debito / max(DEBITO_CAP, 1e-9)'''
+            
+        for ta in true_ids:
+            if ta >= unknown_id:
+                continue
+
+            # se ha già vinto, NON serve bias
             if ta in winners:
+                continue
+
+            # se è già vicino al TP gate, NON serve bias aggressivo
+            close_apply = (float(dc_pop[ta]) >= 0.90 * float(tp_gate[ta])) and (float(dc_pop[ta]) >= min_spikes_for_known)
+            if close_apply:
                 continue
 
             sl = taste_slice(ta)
             inc = ATTN_BIAS_GAIN_MV * float(debito[ta])
             inc = min(inc, ATTN_BIAS_CAP_MV)
 
-            if GABA_now > 0.8:
-                inc *= 0.0
+            # GABA smorza attentional bias gradualmente
+            gb = np.clip((GABA_now - 0.7) / 0.3, 0.0, 1.0)  # 0..1
+            inc *= (1.0 - 0.9 * gb)
+            
+            # se sono nelle triplette o maggiore
+            # Scala inc per numero di gusti nel mix
+            # cosi su mix pesanti non do la stessa botta di un single taste
+            if len(true_ids) >= 3:
+                inc *= 1.0 / max(1, len(true_ids))
 
             bias_ta = base_bias_mv - inc
             bias_ta = max(bias_ta, ATTN_BIAS_FLOOR_MV)
             theta_bias_next[sl] = bias_ta
+            
+            # tupla da stampare per il debug
+            applied.append((ta, float(debito[ta]), float(inc), float(dc_pop[ta]), float(tp_gate[ta])))
+
+        if verbose_rewards and applied:
+            print(f"\n[BIO-ATTENTIONAL BIAS] → {applied}"
+                f"\nbase={base_bias_mv:.3f}mV"
+                f"\nGABA={GABA_now:.2f}"
+                f"\nCLASS_BOOST: {CLASS_BOOST[:unknown_id]}"
+                f"\nmiss_ema: {miss_ema[:unknown_id]}"
+                f"\nmisssev_ema: {misssev_ema[:unknown_id]}\n"
+            )
 
     # assegnazione del bias per il prossimo trial
     theta_bias_next = theta_bias_next * b.mV
@@ -4116,6 +4238,44 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # 2) definizione di trial corretto / errato
     correct = bool(jacc_proxy >= JACC_THR)
     reward_signal = 1.0 if correct else -1.0
+    
+    # Gestione di logging nei bad trials per capire chi vince e come vince
+    if PLASTIC_PHASE and LOG_BAD_TRIALS and (jacc_proxy < JACC_THR):
+        # Diagnose grey-zone width vs inhibition: co-winners + tp/fp gates + top1-top2 separation
+        best2 = [int(ide) for ide in sorted_idx if int(ide) < unknown_id][:2]
+        if len(best2) == 1:
+            best2 = best2 + best2
+        elif not best2:
+            best2 = [0, 0]
+        top1_i, top2_i = best2[0], best2[1]
+        top1_s, top2_s = float(scores[top1_i]), float(scores[top2_i])
+        gap = top1_s - top2_s
+        ratio = top1_s / (top2_s + 1e-9)
+
+        w_str = ", ".join(
+            f"{taste_map[int(wa)]}:{int(scores[int(wa)])}" if int(wa) in taste_map else f"{int(wa)}:{int(scores[int(wa)])}"
+            for wa in winners
+        ) if winners else "<none>"
+
+        tp_hits = sum(int((int(wa) < unknown_id) and (scores[int(wa)] >= tp_gate[int(wa)])) for wa in winners)
+        fp_hits = sum(int((int(wa) < unknown_id) and (scores[int(wa)] >= fp_gate[int(wa)])) for wa in winners)
+
+        if verbose_rewards:
+            print(f"\n[DEBUG BAD] step={step} jacc={jacc_proxy:.3f} | {label}")
+            print(f"  winners({len(winners)}): {w_str} | tp_hits={tp_hits} fp_hits={fp_hits}")
+            print(f"  top1={taste_map[top1_i]}:{top1_s:.0f} | top2={taste_map[top2_i]}:{top2_s:.0f} | gap={gap:.0f} ratio={ratio:.2f}")
+
+        for wa in winners:
+            wi = int(wa)
+            if wi >= unknown_id and verbose_rewards:
+                print(f"   - {taste_map.get(wi,'UNKNOWN')}: score={scores[wi]:.0f}")
+            else:
+                print(
+                    f"   - {taste_map[wi]}: score={scores[wi]:.0f} "
+                    f"tp_gate={tp_gate[wi]:.0f} fp_gate={fp_gate[wi]:.0f} "
+                    f"tp_hit={int(scores[wi] >= tp_gate[wi])} fp_hit={int(scores[wi] >= fp_gate[wi])}"
+                )
+    
     # 3) aggiornamento STATISTICHE solo per esempi veri di train
     if "NULL" not in label and "OOD" not in label:
         # a) per-CLASSE: ogni gusto presente nel mix
@@ -4171,7 +4331,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     inst_perf = float(jacc_proxy)
     ema_perf = (1.0 - perf_alpha) * ema_perf + perf_alpha * inst_perf
     # dynamic alpha learning rate update during training
-    if USE_DYNAMIC_ALPHA:
+    if PLASTIC_PHASE and USE_DYNAMIC_ALPHA:
         if step < 50:
             alpha_long = 0.15
         else:
@@ -4341,8 +4501,9 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         
             # SIMPLE WAY + NEUROMODULATORS
             if curr_phase > 0 and USE_SIMPLE_NEUROMOD and r != 0.0:
-                da_scale = 1.0
-                
+                #da_scale = 1.0
+                da_scale = COOLDOWN_DA_SCALE if cooldown_left > 0 else 1.0
+
                 ht_eff = max(0.0, min(HT_now, 0.5))
                 if r > 0.0:
                     # DA potenzia reward positivi
@@ -4366,21 +4527,29 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             
             # using GABA to manage how strong the damper is
             # evaluating whether there is need to keep it or not
+            # only if r != 0.0 and, therefore, exists
             if curr_phase > 0 and GABA_ON and USE_SIMPLE_NEUROMOD and r != 0.0:
                 # assumo GABA_now in [0, 1]
                 gaba_eff = max(0.0, min(GABA_now, 0.7))
 
-                # gamma_gaba controlla quanto forte è il freno
-                gamma_gaba = 0.6
-                gaba_scale = 1.0 / (1.0 + gamma_gaba * gaba_eff)
-                # -> se GABA_now = 0.7  => gaba_scale ≈ 1 / (1 + 0.42) ≈ 0.70
-                # effective scaling
+                # gamma_* controlla quanto forte è il freno di GABA
+                gamma_pos = 0.2
+                gamma_neg = 0.1
+                
+                if r > 0:
+                    gaba_scale = math.exp(-gamma_pos * gaba_eff)
+                else:
+                    gaba_scale = math.exp(-gamma_neg * gaba_eff)
+                
+                # clipping per non abbassare troppo
+                gaba_scale = float(np.clip(gaba_scale, 0.85, 1.0))
+                # scaling di GABA
                 plast_mod *= gaba_scale
                     
             # niente craving, niente hedonic, niente meta → r_final semplice ma con δR gating
             # se i neuromodulatori non entrano in gioco plast_mod rimane a 1.0 e non cambia nulla
             # gate per calcolare correttamente lo smorzamento
-            gate = perf_gate_local if (r > 0.0) else max(0.5, perf_gate_local)
+            gate = perf_gate_local if (r > 0.0) else max(NEG_GATE_FLOOR, perf_gate_local)
 
             # rinforzo effettivo
             r_final = PLAST_GLOBAL * plast_mod * gate * r
@@ -4450,6 +4619,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                         r *= hed_mult # reward modulated by hedonic window
                     if USE_META:
                         r *= meta_scale(idx)
+                        if verbose_rewards:
+                                    print(f"\n[METAPLASTICITY] → r={r_off_soft:.4f} at trial {step}")                
                 # TP debole (micro-reward)
                 else:
                     pos_mu_i = float(ema_pos_m1[idx]); pos_mu_t = max(1.0, pos_mu_i)
@@ -4462,6 +4633,8 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                             r *= hed_mult
                         if USE_META:
                             r *= meta_scale(idx)
+                            if verbose_rewards:
+                                    print(f"\n[METAPLASTICITY] → r={r_off_soft:.4f} at trial {step}")                
             else:
                 # FP forte (dopo warmup)
                 if step > fp_gate_warmup_steps and spikes_i >= fp_gate[idx]:
@@ -4478,6 +4651,7 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                 cr_scale = crave_scale(idx)
                 
             # Gate finale: stable_core-style (perf_gate_local) * gate complesso (perf_gate)
+            gate_local = perf_gate_local if (r > 0.0) else max(perf_gate_local, NEG_GATE_FLOOR)
             r_final = perf_gate_local * perf_gate * PLAST_GLOBAL * cr_scale * r
             
             if verbose_rewards and step % 50 == 0:
@@ -4521,37 +4695,144 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                     S.elig_vslow[idx_list] = 0.0
 
     # A5: OFF-DIAGONAL: punish p->q when q is big FP with starting warmup
-    OFFDIAG_WARMUP = 250
-    if PLASTIC_PHASE and USE_OFFDIAG_DOPAMINE and step >= OFFDIAG_WARMUP and step > freeze_until:
-        for p in true_ids:
-            for q in range(num_tastes-1):
-                if q == p:
-                    continue
+    OFFDIAG_WARMUP = max(500, NORM_WARMUP + 2*col_norm_every)
+    if PLASTIC_PHASE and USE_OFFDIAG_DOPAMINE \
+        and step >= OFFDIAG_WARMUP \
+        and step > freeze_until \
+        and best_ema_step >= 0 \
+        and step > 0.45 * TOTAL_TRAIN_STEPS:
+        #and not USE_LTD_OFFDIAG:
+        
+        # non deve MAI partire se c'è stata un'altra operazione strutturale
+        candidates = [last_soft_pull_step, last_colnorm_step, last_decay_step, last_epi_step, last_homeo_step]
+        candidates = [x for x in candidates if x is not None]
+        last_struct_step = max(candidates) if candidates else -10**9
+        struct_gap = step - last_struct_step
+        
+        # step da tenere in considerazione
+        considering_gap = max(
+            2 * col_norm_every,
+            SOFT_PULL_COOLDOWN_STEPS,
+            DECAY_COOLDOWN_STEPS,
+            40  # minimo assoluto ragionevole
+        )
+        
+        # predicted label for current trial
+        pred = int(np.argmax(dc_pop[:num_tastes-1]))
+        
+        if struct_gap <= considering_gap:
+            pass
+        else:
+            for p in true_ids:
+                for q in range(num_tastes-1):
+                    if q == p:
+                        continue
                 
-                # (E): se q è VERO ma "debole", penalità morbida p->q
-                # "debole" = sotto metà della propria soglia di classe (scala già test-time)
-                if q in true_ids:
-                    #spikes_q = float(diff_counts[q])
-                    spikes_q = float(dc_pop[q])
-                    # usa la soglia positiva online
-                    weak_q = (spikes_q < 0.5 * max(min_spikes_for_known, tp_gate[q]))
-                    # quando una classe vera è debole, è il momento giusto per sgonfiare le connessioni parassite p�q che la disturbano.
-                    if weak_q:
-                        undershoot = max(0.0, 0.5*max(min_spikes_for_known, tp_gate[q]) - spikes_q)
-                        scale = 1.0 + 0.5 * (undershoot / (0.5*max(1.0, tp_gate[q])))
-                        # penalità morbida (>> più piccola della FP severa)
-                        r_off_soft = (- 0.25 * beta_offdiag
-                            * (1.0 + ht_gain * HT_now)
-                            * (1.0 + ne_gain_r * NE_now))
-                        r_off_soft *= scale
-                        if USE_META:
-                            r_off_soft *= meta_scale(p)
-                            
-                        # GATE δR
-                        #r_off_soft *= gate_neg
-                        r_off_soft *= perf_gate_local
+                    # (E): se q è VERO ma "debole", penalità morbida p->q
+                    # "debole" = sotto metà della propria soglia di classe (scala già test-time)
+                    if q in true_ids:
+                        #spikes_q = float(diff_counts[q])
+                        spikes_q = float(dc_pop[q])
+                        # usa la soglia positiva online
+                        weak_q = (spikes_q < 0.5 * max(min_spikes_for_known, tp_gate[q]))
+                        # quando una classe vera è debole, è il momento giusto per sgonfiare le connessioni parassite p->q che la disturbano.
+                        if weak_q:
+                            undershoot = max(0.0, 0.5*max(min_spikes_for_known, tp_gate[q]) - spikes_q)
+                            if undershoot < UNDERSHOOT_MIN:
+                                continue
+                            scale = 1.0 + 0.5 * (undershoot / (0.5*max(1.0, tp_gate[q])))
+                            # cap
+                            scale = min(scale, 1.6)
+                            # penalità morbida (>> più piccola della FP severa)
+                            r_off_soft = (- 0.25 * beta_offdiag
+                                * (1.0 + ht_gain * HT_now)
+                                * (1.0 + ne_gain_r * NE_now))
+                            r_off_soft *= scale
+                            if USE_META:
+                                r_off_soft *= meta_scale(p)
+                                if verbose_rewards:
+                                    print(f"\n[METAPLASTICITY] → r_off_soft={r_off_soft:.4f} at trial {step}")                
+                
+                            # GATE δR
+                            r_off_soft *= max(perf_gate_local, NEG_GATE_FLOOR)
 
-                        # symmetry with population support
+                            # symmetry with population support
+                            idx_list = diag_indices_for_taste(p, q)
+                            if idx_list.size == 0:
+                                continue
+
+                            for si in idx_list:
+                                elig_eff = (
+                                    ETA_FAST  * float(S.elig_fast[si]) +
+                                    ETA_SLOW  * float(S.elig_slow[si]) +
+                                    ETA_VSLOW * float(S.elig_vslow[si])
+                                )
+                                delta_soft = r_off_soft * elig_eff
+                                if delta_soft != 0.0:
+                                    S.w[si] = float(np.clip(S.w[si] + delta_soft, W_MIN, W_MAX))
+                                S.elig_fast[si]  = 0.0
+                                S.elig_slow[si]  = 0.0
+                                S.elig_vslow[si] = 0.0
+
+                            sj_list = diag_indices_for_taste(q, p)
+                            for sj in sj_list:
+                                elig_eff = (
+                                    ETA_FAST  * float(S.elig_fast[sj]) +
+                                    ETA_SLOW  * float(S.elig_slow[sj]) +
+                                    ETA_VSLOW * float(S.elig_vslow[sj])
+                                )
+                                delta_sym = 0.5 * r_off_soft * elig_eff
+                                if delta_sym != 0.0:
+                                    S.w[sj] = float(np.clip(S.w[sj] + delta_sym, W_MIN, W_MAX))
+                                    S.elig_fast[sj]  = 0.0
+                                    S.elig_slow[sj]  = 0.0
+                                    S.elig_vslow[sj] = 0.0
+
+                        # in ogni caso, se q è vero abbiamo finito qui
+                        continue
+                
+                    # FP severo su q: SOLO SE NON HO GIÀ FATTO INTERVENTI STRUTTURALI  
+                    if fp_structural_done:
+                        continue
+                    
+                    # punish only top offender not all of them
+                    if q != pred:
+                        continue
+                    if pred in true_ids:
+                        continue
+
+                    # caso originale FP severo su q
+                    if step > fp_gate_warmup_steps and float(dc_pop[q]) >= fp_gate[q]:
+
+                        # OFF-diagonal FP severity on q (how much the threshold is exceeded)
+                        #severity_q = float(diff_counts[q]) / float(fp_gate[q] + 1e-9)
+                        severity_q = float(dc_pop[q]) / float(fp_gate[q] + 1e-9)
+                        severity_q = float(np.clip(severity_q, 1.0, 2.0))  # 1x..2x
+
+                        # trial confidence
+                        conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
+
+                        # true class 'p' hedonic scaling
+                        if USE_HEDONIC_DA:
+                            hed_mult_p = float(hed_fb_vec[p] + (1.0 - hed_fb_vec[p]) * float(g_win[p]))
+                        else:
+                            hed_mult_p = 1.0
+
+                        # negative off-diagonal reward related to the p class and q severity
+                        r_off = - beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now)
+                        r_off *= severity_q * (0.5 + 0.5 * conf) * hed_mult_p
+                        if USE_META:
+                            r_off *= meta_scale(p)
+                            if verbose_rewards:
+                                    print(f"\n[METAPLASTICITY] → r_off={r_off:.4f} at trial {step}")                
+                    
+                        # calcolo gate negativo 
+                        gate_neg = max(0.25, perf_gate_local) * (0.5 + 0.5*conf)
+                    
+                        # GATE δR
+                        r_off *= max(gate_neg, NEG_GATE_FLOOR)
+                    
+                        # population support
                         idx_list = diag_indices_for_taste(p, q)
                         if idx_list.size == 0:
                             continue
@@ -4562,149 +4843,81 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                                 ETA_SLOW  * float(S.elig_slow[si]) +
                                 ETA_VSLOW * float(S.elig_vslow[si])
                             )
-                            delta_soft = r_off_soft * elig_eff
-                            if delta_soft != 0.0:
-                                S.w[si] = float(np.clip(S.w[si] + delta_soft, W_MIN, W_MAX))
+                            delta = r_off * elig_eff
+                            if delta != 0.0:
+                                old_w = float(S.w[si])
+                                S.w[si] = float(np.clip(S.w[si] + delta, W_MIN, W_MAX))
+                                if verbose_rewards and step % 10 == 0:
+                                    print(f"  offdiag[cls] - {taste_map[p]}->{taste_map[q]} | "
+                                    f"spk_q={float(dc_pop[q]):.1f} fp_q={fp_gate[q]:.1f} sev={severity_q:.2f} hed={hed_mult_p:.2f} "
+                                    f"w={delta:+.4f}  w:{old_w:.3f}->{float(S.w[si]):.3f}\n")
                             S.elig_fast[si]  = 0.0
                             S.elig_slow[si]  = 0.0
                             S.elig_vslow[si] = 0.0
-
+                    
+                        # light symmetrical pattern q->p with population support
                         sj_list = diag_indices_for_taste(q, p)
+                        #sj_sym = ij_to_si.get((q, p), None)
+                        #if sj_sym is not None:
                         for sj in sj_list:
                             elig_eff = (
                                 ETA_FAST  * float(S.elig_fast[sj]) +
                                 ETA_SLOW  * float(S.elig_slow[sj]) +
                                 ETA_VSLOW * float(S.elig_vslow[sj])
                             )
-                            delta_sym = 0.5 * r_off_soft * elig_eff
+                            delta_sym = 0.5 * r_off * elig_eff
                             if delta_sym != 0.0:
                                 S.w[sj] = float(np.clip(S.w[sj] + delta_sym, W_MIN, W_MAX))
-                                S.elig_fast[sj]  = 0.0
-                                S.elig_slow[sj]  = 0.0
-                                S.elig_vslow[sj] = 0.0
+                            S.elig_fast[sj]  = 0.0
+                            S.elig_slow[sj]  = 0.0
+                            S.elig_vslow[sj] = 0.0
 
-                    # in ogni caso, se q è vero abbiamo finito qui
-                    continue
-                
-                # FP severo su q: SOLO SE NON HO GIÀ FATTO INTERVENTI STRUTTURALI  
-                if fp_structural_done:
-                    continue
+                        # safety fallback -> if FP is very strong, normalization on 'q' column again
+                        if severity_q > 1.5 and USE_COL_NORM and NEURONS_PER_TASTE == 1 and connectivity_mode == "dense":
+                            w_all = np.asarray(S.w[:], dtype=float)
+                            i_all = np.asarray(S.i[:], dtype=int)
+                            j_all = np.asarray(S.j[:], dtype=int)
 
-                # caso originale FP severo su q
-                if step > fp_gate_warmup_steps and float(dc_pop[q]) >= fp_gate[q]:
+                            idx_col = np.where(j_all == q)[0]
+                            if idx_col.size:
+                                col = w_all[idx_col].copy()
 
-                    # OFF-diagonal FP severity on q (how much the threshold is exceeded)
-                    #severity_q = float(diff_counts[q]) / float(fp_gate[q] + 1e-9)
-                    severity_q = float(dc_pop[q]) / float(fp_gate[q] + 1e-9)
-                    severity_q = float(np.clip(severity_q, 1.0, 2.0))  # 1x..2x
+                                if col_floor > 0.0:
+                                    col = np.maximum(col, col_floor)
 
-                    # trial confidence
-                    conf = np.clip((top - second) / (top + 1e-9), 0.0, 1.0)
+                                # diagonal bias for normalization
+                                if diag_bias_gamma != 1.0:
+                                    dloc = np.where(i_all[idx_col] == q)[0]
+                                    if dloc.size:
+                                        col[dloc[0]] *= float(diag_bias_gamma)
 
-                    # true class 'p' hedonic scaling
-                    if USE_HEDONIC_DA:
-                        hed_mult_p = float(hed_fb_vec[p] + (1.0 - hed_fb_vec[p]) * float(g_win[p]))
-                    else:
-                        hed_mult_p = 1.0
+                                L1 = float(np.sum(col))
+                                target = col_norm_target if col_norm_target is not None else L1
+                                if L1 > 1e-12:
+                                    if L1 > target:
+                                        scale = target / L1
+                                        col = np.clip(col * scale, W_MIN, W_MAX)
+                                    elif col_allow_upscale and (L1 < col_upscale_slack * target):
+                                        scale = min(col_scale_max, (target / L1))
+                                        col = np.clip(col * scale, W_MIN, W_MAX)
 
-                    # negative off-diagonal reward related to the p class and q severity
-                    r_off = - beta_offdiag * (1.0 + ht_gain * HT_now) * (1.0 + ne_gain_r * NE_now)
-                    r_off *= severity_q * (0.5 + 0.5 * conf) * hed_mult_p
-                    if USE_META:
-                        r_off *= meta_scale(p)
-                    
-                    # calcolo gate negativo 
-                    gate_neg = max(0.5, perf_gate_local)
-                    
-                    # GATE δR
-                    r_off *= gate_neg
-                    #r_off *= perf_gate_local
-                    
-                    # population support
-                    idx_list = diag_indices_for_taste(p, q)
-                    if idx_list.size == 0:
-                        continue
+                                    # anti-crosstalk: lieve leak sugli off-diagonali (corretto: usa idx_col)
+                                    pre_idx = i_all[idx_col]
+                                    #hot = np.array([1,0,0,0,1,0,1], dtype=float)  # SWEET, UMAMI, SPICY
+                                    leak_hot = 0.96
+                                    post = q
+                                    for k_local, pre in enumerate(pre_idx):
+                                        if pre != post:
+                                            col[k_local] *= leak_hot  # 2% controlled leak
 
-                    for si in idx_list:
-                        elig_eff = (
-                            ETA_FAST  * float(S.elig_fast[si]) +
-                            ETA_SLOW  * float(S.elig_slow[si]) +
-                            ETA_VSLOW * float(S.elig_vslow[si])
-                        )
-                        delta = r_off * elig_eff
-                        if delta != 0.0:
-                            old_w = float(S.w[si])
-                            S.w[si] = float(np.clip(S.w[si] + delta, W_MIN, W_MAX))
-                            if verbose_rewards and step % 10 == 0:
-                                print(f"  offdiag[cls] - {taste_map[p]}->{taste_map[q]} | "
-                                    f"spk_q={float(dc_pop[q]):.1f} fp_q={fp_gate[q]:.1f} sev={severity_q:.2f} hed={hed_mult_p:.2f} "
-                                    f"w={delta:+.4f}  w:{old_w:.3f}->{float(S.w[si]):.3f}\n")
-                        S.elig_fast[si]  = 0.0
-                        S.elig_slow[si]  = 0.0
-                        S.elig_vslow[si] = 0.0
-                    
-                    # light symmetrical pattern q->p with population support
-                    sj_list = diag_indices_for_taste(q, p)
-                    #sj_sym = ij_to_si.get((q, p), None)
-                    #if sj_sym is not None:
-                    for sj in sj_list:
-                        elig_eff = (
-                            ETA_FAST  * float(S.elig_fast[sj]) +
-                            ETA_SLOW  * float(S.elig_slow[sj]) +
-                            ETA_VSLOW * float(S.elig_vslow[sj])
-                        )
-                        delta_sym = 0.5 * r_off * elig_eff
-                        if delta_sym != 0.0:
-                            S.w[sj] = float(np.clip(S.w[sj] + delta_sym, W_MIN, W_MAX))
-                        S.elig_fast[sj]  = 0.0
-                        S.elig_slow[sj]  = 0.0
-                        S.elig_vslow[sj] = 0.0
-
-                    # safety fallback -> if FP is very strong, normalization on 'q' column again
-                    if severity_q > 1.5 and USE_COL_NORM and NEURONS_PER_TASTE == 1 and connectivity_mode == "dense":
-                        w_all = np.asarray(S.w[:], dtype=float)
-                        i_all = np.asarray(S.i[:], dtype=int)
-                        j_all = np.asarray(S.j[:], dtype=int)
-
-                        idx_col = np.where(j_all == q)[0]
-                        if idx_col.size:
-                            col = w_all[idx_col].copy()
-
-                            if col_floor > 0.0:
-                                col = np.maximum(col, col_floor)
-
-                            # diagonal bias for normalization
-                            if diag_bias_gamma != 1.0:
-                                dloc = np.where(i_all[idx_col] == q)[0]
-                                if dloc.size:
-                                    col[dloc[0]] *= float(diag_bias_gamma)
-
-                            L1 = float(np.sum(col))
-                            target = col_norm_target if col_norm_target is not None else L1
-                            if L1 > 1e-12:
-                                if L1 > target:
-                                    scale = target / L1
-                                    col = np.clip(col * scale, W_MIN, W_MAX)
-                                elif col_allow_upscale and (L1 < col_upscale_slack * target):
-                                    scale = min(col_scale_max, (target / L1))
-                                    col = np.clip(col * scale, W_MIN, W_MAX)
-
-                                # anti-crosstalk: lieve leak sugli off-diagonali (corretto: usa idx_col)
-                                pre_idx = i_all[idx_col]
-                                #hot = np.array([1,0,0,0,1,0,1], dtype=float)  # SWEET, UMAMI, SPICY
-                                leak_hot = 0.96
-                                post = q
-                                for k_local, pre in enumerate(pre_idx):
-                                    if pre != post:
-                                        col[k_local] *= leak_hot  # 2% controlled leak
-
-                            w_all[idx_col] = col
-                            S.w[:] = w_all
-                            # clip
-                            S.w[:] = np.clip(w_all, W_MIN, W_MAX)
+                                w_all[idx_col] = col
+                                S.w[:] = w_all
+                                # clip
+                                S.w[:] = np.clip(w_all, W_MIN, W_MAX)
                             
-                    # operazione strutturale fatta      
-                    fp_structural_done = True
+                        # operazione strutturale fatta      
+                        fp_structural_done = True
+                        did_action = True
     
     # debug per 3-timescale elig
     if PLASTIC_PHASE:
@@ -4898,65 +5111,91 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
                 patience = 0
                 
     # with many strong FP, increase 5-HT -> future caution in the next trial
-    has_strong_fp = any(
-            HAS_STRONG_FP_PULSE and (idx not in true_ids) and (float(scores[idx]) >= fp_gate[idx])
-            for idx in range(num_tastes-1)
+    pred_fp = int(np.argmax(dc_pop[:unknown_id]))  # o scores
+    
+    has_strong_fp = (
+        HAS_STRONG_FP_PULSE 
+        and PLASTIC_PHASE 
+        and step > freeze_until
+        and step >= FP_PULSE_WARMUP
+        and (not correct) 
+        and (reward_signal <= 0.0)
+        and ema_perf_long < best_ema_perf - 0.03
+        and (pred_fp not in true_ids)
+        and float(scores[pred_fp]) >= fp_gate[pred_fp]
+        and (last_fp_pulse_step is None or step-last_fp_pulse_step >= FP_PULSE_COOLDOWN)
     )
+    
     if has_strong_fp:
         mod.HT[:] += ht_pulse_fp
-        mod.NE[:] += 0.5 * ne_pulse_amb # arousal on strong FP
-        mod.HI[:] += 0.3 * hi_pulse_nov
-        mod.GABA[:] += 0.3 * gaba_pulse_stabilize
-    
-    # LTD heterosinaptic plasticity to cut off false associations and allow structural sparsity
-    if (
+        mod.NE[:] += 0.3 * ne_pulse_amb # arousal on strong FP
+        mod.HI[:] += 0.2 * hi_pulse_nov
+        mod.GABA[:] += 0.2 * gaba_pulse_stabilize
+        
+        last_fp_pulse_step = step
+        
+        if verbose_rewards:
+            print(f"\n[HAS STRONG FP PULSE] → 5-HT={ht_pulse_fp:.4f} | NE={ne_pulse_amb:.4f} | HI={hi_pulse_nov:.4f} | GABA={gaba_pulse_stabilize:.4f} at trial {step}")
+
+    # --- LTD heterosynaptic plasticity off-diag (winner-only, late training) ---
+    q = pred_fp  # winner sbagliato (candidate), definito SUBITO
+    # prendo la mediana della distribuzione degli FP come soglia minima
+    # se il trial supera tale soglia -> applico LTD, altrimenti passo
+    FP_GATE_MIN = max(1e-3, 0.1 * float(np.median(fp_gate)))
+    base_ltd = (
         USE_LTD_OFFDIAG
         and PLASTIC_PHASE
-        and USE_GATE_REINFORCE
-        and (not correct)
-        and (reward_signal <= 0.0)
         and step > freeze_until
         and has_strong_fp
-        and ema_perf_long < best_ema_perf - 0.03
-        and not fp_structural_done
-    ):   
-        # weight arrays
+        and step > LTD_WARMUP_FRAC * TOTAL_TRAIN_STEPS
+        and (last_ltd_step is None or (step - last_ltd_step) >= LTD_COOLDOWN)
+        and (not fp_structural_done)
+        and (fp_gate[q] >= FP_GATE_MIN)
+    )
+
+    # condizione di "winner sbagliato" + gate superato
+    is_wrong_winner = (q not in true_ids) and (float(scores[q]) >= float(fp_gate[q]))
+
+    # calcolo over SOLO se serve
+    over = None
+    if base_ltd and is_wrong_winner:
+        over = float(scores[q]) / max(float(fp_gate[q]), 1e-6)
+
+    # trigger di attivazione -> se non passa non entra LTD
+    do_ltd = base_ltd and is_wrong_winner and (over is not None) and (over >= OVER_LTD_MIN)
+
+    if do_ltd:
         i_all = np.asarray(S.i[:], int)
         j_all = np.asarray(S.j[:], int)
-        w_all = np.asarray(S.w[:], float)     
-        # LTD mirata sulle colonne “calde” che NON sono nel target
-        
-        for q in range(unknown_id):
-            if q in true_ids:
-                continue
-            # se la classe q ha “vinto” troppo
-            if float(scores[q]) >= fp_gate[q]:
-                sl_q = taste_slice(q)
-                mask_col = (j_all >= sl_q.start) & (j_all < sl_q.stop)
-                if not np.any(mask_col):
-                    continue
+        w_all = np.asarray(S.w[:], float)
 
-                # SOLO OFF-DIAGONAL dentro la colonna q
-                #mask_off_col = mask_col & (i_all != j_all)
-                mask_off_col = mask_col & (i_all != q)
-                if not np.any(mask_off_col):
-                    continue
+        sl_q = taste_slice(q)
+        mask_col = (j_all >= sl_q.start) & (j_all < sl_q.stop)
 
-                # soft pruning off-diag: shrink moltiplicativo + floor
-                over = float(scores[q]) / max(fp_gate[q], 1e-6)
-                gamma_decay_off = np.clip(1.0 - 0.1 * (over - 1.0), 0.5, 0.9)
-                w_floor_off     = 0.005
+        if np.any(mask_col):
+            mask_off_col = mask_col & (i_all != q)
+
+            if np.any(mask_off_col):
+                gamma_decay_off = float(np.clip(1.0 - 0.1 * (over - 1.0), 0.5, 0.9))
+                w_floor_off = 0.001
 
                 w_off = w_all[mask_off_col].astype(float)
-                w_off *= gamma_decay_off * PLAST_GLOBAL
-
-                small = np.abs(w_off) < w_floor_off
-                w_off[small] = np.sign(w_off[small]) * w_floor_off
+                w_off *= gamma_decay_off
+                w_off = np.sign(w_off) * np.maximum(np.abs(w_off), w_floor_off)
 
                 w_all[mask_off_col] = w_off
+                S.w[:] = np.clip(w_all, W_MIN, W_MAX)
 
-        S.w[:] = np.clip(w_all, W_MIN, W_MAX)
-        fp_structural_done = True
+                last_ltd_step = step
+                fp_structural_done = True
+                did_action = True
+                freeze_until = max(freeze_until, step + MINI_FREEZE_LTD)
+
+                if verbose_rewards:
+                    print(
+                        f"\n[HETEROSYNAPTIC PLASTICITY → LTD OFFDIAG] → q={q} over={over:.3f} "
+                        f"gamma={gamma_decay_off:.3f} floor={w_floor_off} at trial {step}"
+                    )
 
     # safe clip on theta for homeostasis
     theta_min, theta_max = -12*b.mV, 12*b.mV
@@ -5032,18 +5271,42 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             mask = (j_all >= sl.start) & (j_all < sl.stop)
             L1_before.append(float(np.sum(w_before[mask])))
         
-        # L1 col_norm
+        # L1 col_norm effettiva
         col_norm_pop(target=col_norm_target, mode=col_norm_mode, temperature=col_norm_temp,
                  diag_bias_gamma=diag_bias_gamma, floor=col_floor,
                  allow_upscale=col_allow_upscale, scale_max=col_scale_max, w_min=W_MIN, w_max=W_MAX)
         last_colnorm_step = step
         did_action = True
         
+        # calcolo dei coefficienti di smorzamento delle elig traces
+        w_after = np.asarray(S.w[:], float)
+        L1_after = []
+        for q in range(unknown_id):
+            sl = taste_slice(q)
+            mask = (j_all >= sl.start) & (j_all < sl.stop)
+            L1_after.append(float(np.sum(w_after[mask])))
+
+        ratio_norm = (np.mean(L1_after) / (np.mean(L1_before) + 1e-9))  # 0..1 tipico
+        
+        # applicazione dei coefficienti di smorzamento
+        if ratio_norm < 0.25:          # col-norm molto forte (tipo 21->3)
+            slow_mul, vslow_mul = 0.35, 0.70
+        elif ratio_norm < 0.50:        # col-norm media
+            slow_mul, vslow_mul = 0.50, 0.80
+        else:                          # col-norm lieve
+            slow_mul, vslow_mul = 0.70, 0.90
+        
+        # applicazione del mini cooldown dopo l'intervento di L1
+        # e della smorzatura leggera delle elig traces
+        post_colnorm_elig_damp(S, fast_zero=True, slow_mul=0.5, vslow_mul=0.8)
+        cooldown_left = COOLDOWN_AFTER_COLNORM
+        set_plasticity_scale(COOLDOWN_PLAST_SCALE)
+        
         # to visualize how weights change between before and after
         if verbose_rewards:
             # come cambiano i pesi dopo la normalizzazione L1
-            w_after = np.asarray(S.w[:], float)
-            L1_after = []
+            #w_after = np.asarray(S.w[:], float)
+            #L1_after = []
             for q in range(unknown_id):
                 L1_after.append(float(np.sum(w_after[j_all == q])))
             
@@ -5084,6 +5347,14 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         if epi_update(step):
             did_action = True
     
+    # controllo per attentional bias
+    # se sono state fatte azioni strutturali
+    if did_action:
+        theta_bias_next = None   # così il prossimo trial usa base_bias_mv
+        
+    if verbose_rewards and did_action and applied:
+        print("\n[ATTENTIONAL BIAS NOTE] applied this trial but structural action happened -> bias reset for next trial")
+
     #########################################################################################
 
     # idempotency DA clamp to avoid hidden bugs inside conditional branches
@@ -5116,6 +5387,15 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # flags reset
     elig_cooldown = max(0, elig_cooldown-1)
     just_soft_pulled = (elig_cooldown > 0)
+    
+    # L1 cooldown reset
+    if cooldown_left > 0:
+        cooldown_left -= 1
+    if cooldown_left == 0:
+        set_plasticity_scale(1.0)
+
+# salvo ultimo snapshot
+last_state = snapshot_state()
 
 # best-snapshot CHECKPOINT restore states with the saved best_score until now
 # not replacing weights because it's not biological-like method, but pushing weights to become their better version saved until now
@@ -5177,9 +5457,20 @@ for c in range(unknown_id):
     thr_per_class_train[c] = min(float(thr_per_class_train[c]), float(thr_from_pos))
 
 # taglio secco iniziale -20% su tutte le classi
+# gestione dell'errore in base alla percentuale per ogni classe
 # (se vuoi sbloccare SUBITO le classi “fredde”; lascia commentato se non serve)
 for c in range(unknown_id):
-    thr_per_class_train[c] = 0.8 * float(thr_per_class_train[c])
+    #thr_per_class_train[c] = 0.8 * float(thr_per_class_train[c])
+    error_rate = cls_errors[c] / max(1, cls_seen[c])
+    
+    if error_rate > 0.16:
+        error_factor = 0.75   # più permissivo (meno FN)
+    elif error_rate > 0.12:
+        error_factor = 0.80
+    else:
+        error_factor = 0.90   # meno permissivo (evita FP inutili)
+
+    thr_per_class_train[c] *= error_factor
 
 print("Per-class thresholds @train (�+k�, quantile, EMA):",
       {taste_map[idx]: int(thr_per_class_train[idx]) for idx in range(num_tastes-1)})
