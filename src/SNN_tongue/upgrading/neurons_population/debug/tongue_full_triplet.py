@@ -1055,6 +1055,9 @@ patience             = 0                # patience counter to trigger early-stop
 USE_PLASTICITY_DECAY = False            # toggle ON/OFF plasticity decay
 USE_SLOW_CONSOLIDATION = True           # toggle to set slow consolidation ON/OFF 
 USE_EARLY_STOP       = False            # Test 1: niente early stopping
+# Early-stop coverage gate
+MIN_SEEN_FATTY       = 400   
+MIN_SEEN_SOUR        = 400
 EARLY_STOP_MIN_FRAC  = 0.7              # usa early stop solo dopo il 70% dei trial
 PATIENCE_LIMIT       = 500              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
 ETA_CONSOL           = 0.01             # slow capture rate (0..1) toward current fast weights
@@ -1066,7 +1069,7 @@ PLASTICITY_DECAY     = 0.90             # multiplicative decay on S.stdp_on when
 MAX_PLASTICITY_DECAYS= 1                # maximum number of decays allowed
 W_EMA                = 12               # window size for EMA calculation
 SOFT_PULL_DROP_EPS       = 0.02         # devi essere davvero sotto il best_ema
-SOFT_PULL_COOLDOWN_STEPS = 40           # max 1 pull ogni 40 trial
+SOFT_PULL_COOLDOWN_STEPS = 60           # max 1 pull ogni 60 trial
 RHO_PULL_EARLY           = 0.02         # non 0.25
 RHO_PULL_MAX             = 0.05
 # storico corto per stimare il rumore dell'EMA
@@ -1088,7 +1091,7 @@ last_decay_step      = -10**9
 EMA_POS_SD_COEFF     = 0.6   
 TP_FLOOR_SCALE       = 0.75  
 # Gate sui decays (su EMA lunga)
-DECAY_WARMUP_STEPS   = 500              # prima di 500 step, mai decays
+#DECAY_WARMUP_STEPS   = 500              # prima di 500 step, mai decays
 DECAY_COOLDOWN_STEPS = 100              # min distanza tra due decays
 DECAY_PATIENCE_STEPS = 200              # finestra lunga senza miglioramenti
 DECAY_EPS            = 0.08             # quanto deve ESSERE PEGGIO di best_ema_perf
@@ -2828,20 +2831,20 @@ for taste_id in range(unknown_id):
 # a0. single train pure static oversampling for FATTY and SOUR
 for _ in range(n_repeats):
     for taste_id in range(unknown_id):
-        if taste_id in (fatty_id, sour_id) and np.random.rand() < 0.35:
+        if taste_id in (sweet_id, fatty_id, sour_id) and np.random.rand() < 0.35:
             vs, ids, lab = make_mix([taste_id], amp=np.random.randint(220, 301))
             pure_train.append((vs, ids, lab + " (single) (oversampling)"))
             
-for _ in range(n_repeats//2):
+for _ in range(n_repeats):
     for taste_id in range(unknown_id):
-        if taste_id in (fatty_id, salty_id) and np.random.rand() < 0.35:
+        if taste_id in (sweet_id, fatty_id, salty_id) and np.random.rand() < 0.35:
             vs, ids, lab = noisy_mix([taste_id], amp=np.random.randint(220, 301))
             pure_train.append((vs, ids, lab + " (single) (noisy)"))
 
 # a0.1 single train pure noisy static oversampling for FATTY and SOUR
 for _ in range(n_repeats):
     for taste_id in range(unknown_id):
-        if taste_id in (fatty_id, sour_id) and np.random.rand() < 0.35:
+        if taste_id in (sweet_id, fatty_id, sour_id) and np.random.rand() < 0.35:
             vs, ids, lab = augment_mix([taste_id], amp=np.random.randint(220, 301))
             pure_train.append((vs, ids, lab + " (single) (aug)"))
 
@@ -2887,15 +2890,23 @@ for (ia, ja, ka) in trip_tr:
 for _ in range(4*n_repeats):
     mixture_train.append(augment_mix([1, 2], amp=240, rng=rng))
     mixture_train.append(augment_mix([2, 1], amp=240, rng=rng))
+    # SOUR + FATTY
+    mixture_train.append(augment_mix([3, 5], amp=240, rng=rng))
+    # SWEET + FATTY
+    mixture_train.append(augment_mix([0, 5], amp=240, rng=rng))
+    # SWEET + SOUR
+    mixture_train.append(augment_mix([0, 3], amp=240, rng=rng))
 
 # alcune triple difficili in train
 for _ in range(n_repeats):
     mixture_train.append(augment_mix([1, 2, 4], amp=220, rng=rng))
     mixture_train.append(augment_mix([2, 6, 1], amp=220, rng=rng))
+    mixture_train.append(augment_mix([3, 5, 1], amp=220, rng=rng))
+    mixture_train.append(augment_mix([0, 3, 5], amp=220, rng=rng))
 
 # coppie asimmetriche ad alto SNR in train
 for _ in range(n_repeats):
-    for (ia, ja) in [(0,4), (1,2), (3,5), (2,6)]:
+    for (ia, ja) in [(0,4), (1,2), (3,5), (2,6), (0,5), (0,3)]:
         va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(240, 321), rng=rng)
         va = jitter_active(va, frac=0.15, rng=rng)
         va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
@@ -2917,7 +2928,7 @@ for (ia,ja,ka) in trip_tr:
 
 # new random couples of noisy tastes and mixtures to stress more the net
 extra_mixes = [
-    [1,4,6], [1,5,6], [2,5,6], [0,6,3], [0,2,4], [3,4,5], [0,1,5], [0,3,2,5,6], [1,6,2],
+    [1,4,6], [1,5,6], [2,5,6], [3,5,1], [3,5,0], [0,6,3], [0,2,4], [3,4,5], [0,1,5], [0,3,2,5,6], [1,6,2],
     [2,3,4,5], [3,5,6,2], [1,3,4,6], [0,2,3,4,5]
 ]
 for _ in range(n_repeats):  # repeat a bit but not too much or training will be too long
@@ -2926,7 +2937,7 @@ for _ in range(n_repeats):  # repeat a bit but not too much or training will be 
 
 # extremely difficult couples
 for _ in range(n_repeats):
-    for (ax,bs) in [(0,4),(0,3),(2,6),(4,6)]:  # SWEET-UMAMI, SWEET-SOUR, SALTY-SPICY, UMAMI-SPICY
+    for (ax,bs) in [(0,4),(0,3),(2,6),(4,6),(3,5),(0,5)]:  # SWEET-UMAMI, SWEET-SOUR, SALTY-SPICY, UMAMI-SPICY
         va, ids, lab = make_asymmetric_pair(ax, bs, amp_hi=rng.integers(260, 321), rng=rng)
         va = jitter_active(va, frac=0.12, rng=rng)
         va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
@@ -2951,11 +2962,15 @@ for _ in range(n_repeats):  # repeat a bit but not too much or training will be 
 # adding specific difficult pairs in training set to improve learning
 for _ in range(n_repeats):
     mixture_train.append(augment_mix([0,4], amp=250, rng=rng))  # SWEET+UMAMI
+    mixture_train.append(augment_mix([5,6], amp=250, rng=rng))  # SPICY+FATTY
     mixture_train.append(augment_mix([0,3], amp=250, rng=rng))  # SWEET+SOUR
-    mixture_train.append(augment_mix([3,4], amp=240, rng=rng))  # SOUR+UMAMI
+    mixture_train.append(augment_mix([3,4], amp=250, rng=rng))  # SOUR+UMAMI
+    mixture_train.append(augment_mix([3,5], amp=250, rng=rng))  # SOUR+FATTY
+    mixture_train.append(augment_mix([4,5], amp=250, rng=rng))  # UMAMI+FATTY
+    mixture_train.append(augment_mix([0,5], amp=250, rng=rng))  # SWEET+FATTY
 
 # Coppie asimmetriche che includano sempre 2 e/o 3
-hard_pairs = [(2,3), (2,6), (3,5), (0,3), (2,4)]
+hard_pairs = [(2,3), (2,6), (3,5), (0,3), (2,4), (0,3), (0,5)]
 for _ in range(n_repeats):
     for ia, ja in hard_pairs:
         va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(260, 321), rng=rng)
@@ -2968,10 +2983,11 @@ HARD_MIX_DAF = 1 # how many variants per-combo
 SPICY_MIXES = [
     (0,5,6),  # SWEET+FATTY+SPICY
     (3,5,6),  # SOUR+FATTY+SPICY
+    (3,5,0),  # SWEET+FATTY+SOUR
     (0,4,6),  # SWEET+UMAMI+SPICY
     (1,3,6),  # BITTER+SOUR+SPICY
     (2,5,6),  # SALTY+FATTY+SPICY
-    (3,4,6)   # SOUR+UMAMI+SPICY
+    (3,4,6),  # SOUR+UMAMI+SPICY
 ]
 for _ in range(HARD_MIX_DAF * n_repeats):
     for (ia, ja, ka) in SPICY_MIXES:
@@ -3221,6 +3237,7 @@ sim_t0 = time.perf_counter()
 last_soft_pull_step = None
 step = 0
 SOFT_PULL_WARMUP_STEPS   = int(0.35 * TOTAL_TRAIN_STEPS)   # non prima del 35%
+DECAY_WARMUP_STEPS   = int(0.50 * TOTAL_TRAIN_STEPS)
 
 # little procedure that helps to calculate SNN's blind state on classes
 # seen classes
@@ -3300,6 +3317,9 @@ best_ema_perf_heavy = 0.0
 alpha_heavy_lr = 0.04
 alpha_heavy_short = 0.05
 heavy_cooldown = 0
+# counter for ensure fatty and sour vision
+seen_fatty = 0
+seen_sour  = 0
 
 # LTD and FP counters
 last_fp_pulse_step: int | None = None
@@ -3379,6 +3399,10 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     # se vediamo spicy incrementiamo il contatore
     if spicy_id in true_ids:
         spicy_seen += 1
+    if fatty_id in true_ids:
+        seen_fatty += 1
+    if sour_id in true_ids:
+        seen_sour += 1
     
     # clipping bounds gradually changing for steps
     if step > 0.20 * TOTAL_TRAIN_STEPS and step <= 0.35 * TOTAL_TRAIN_STEPS:
@@ -5092,10 +5116,12 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
         # early stopping solo dopo aver esaurito i decays (o quasi)
         if PLASTIC_PHASE and USE_EARLY_STOP and patience >= PATIENCE_LIMIT:
             if step >= EARLY_STOP_MIN_FRAC * TOTAL_TRAIN_STEPS:
-                if decays_done >= MAX_PLASTICITY_DECAYS or PLAST_GLOBAL <= STDP_ON_MIN + 1e-3:
+                coverage_ok = (seen_fatty >= MIN_SEEN_FATTY) and (seen_sour >= MIN_SEEN_SOUR)
+                if coverage_ok and (decays_done >= MAX_PLASTICITY_DECAYS or PLAST_GLOBAL <= STDP_ON_MIN + 1e-3):
                     print(f"\n[EARLY STOPPING] → No synaptic plasticity best improvement for "
                         f"{PATIENCE_LIMIT} consecutive trials (best={best_score:.4f} @ trial {best_step}) "
-                        f"— stopping training.")
+                        f"— stopping training."
+                        f"seen_fatty={seen_fatty}/{MIN_SEEN_FATTY} seen_sour={seen_sour}/{MIN_SEEN_SOUR}")
                     if BEST_CHECKPOINT: # restore best snapshot come già fai ora
                         restore_state(best_state)
                         break
@@ -6352,12 +6378,12 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
                 
                 filtered = []  
                 for idx in cand_nnls:
-                    if idx in (salty_id, sour_id):
+                    '''if idx in (salty_id, sour_id):
                         # chiedi un po' più energia e z per considerarli "veri"
-                        if (scores[idx] >= 1.1 * abs_floor_eff[idx]) and (z[idx] >= max(0.20, z_rel_min)):
+                        if (scores[idx] >= 1.02 * abs_floor_eff[idx]) and (z[idx] >= max(0.14, z_rel_min)):
                             filtered.append(idx)
-                    else:
-                        filtered.append(idx)
+                    else:'''
+                    filtered.append(idx)
                 # se il filtro ha svuotato tutto, consideriamo l'NNLS "no-effect"
                 if not filtered:
                     if verbose_rewards:
@@ -6930,10 +6956,13 @@ Si = np.array(syn.i[:])
 Sj = np.array(syn.j[:])
 Sw = np.array(syn.w[:])
 for ii, jj, ww in zip(Si, Sj, Sw):
+    if ii >= unknown_id or jj >= unknown_id:
+        # ignora sinapsi verso/da UNKNOWN o neuroni extra
+        continue
     W[int(ii), int(jj)] = float(ww)
 
 plt.figure(figsize=(6,5))
-plt.imshow(W[:unknown_id, :unknown_id], aspect='equal')
+plt.imshow(W, aspect='equal')
 plt.xticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)], rotation=45)
 plt.yticks(range(unknown_id), [taste_map[k] for k in range(unknown_id)])
 plt.colorbar(label='w')
@@ -6952,16 +6981,3 @@ plt.title('SPICY: drive vs thr (tolerance)')
 plt.xlabel('ms')
 plt.tight_layout()
 plt.show()
-
-
-# h) Plot dynamic taste i = 0..unknown_id-1
-for idx in range(num_tastes-1):
-    plt.figure(figsize=(10,3))
-    plt.plot(hed_mon.t/b.ms, hed_mon.taste_drive[idx], label='drive')
-    plt.plot(hed_mon.t/b.ms, hed_mon.thr_hi[idx], label='thr_hi')
-    plt.plot(hed_mon.t/b.ms, hed_mon.thr_lo[idx], label='thr_lo')
-    plt.legend(loc='upper right')
-    plt.title(f'Hedonic window for {taste_map[idx]}')
-    plt.xlabel('ms')
-    plt.tight_layout()
-    plt.show()
