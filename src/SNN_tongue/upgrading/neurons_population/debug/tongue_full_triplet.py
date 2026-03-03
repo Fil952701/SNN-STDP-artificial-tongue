@@ -1059,7 +1059,7 @@ USE_EARLY_STOP       = False            # Test 1: niente early stopping
 MIN_SEEN_FATTY       = 400   
 MIN_SEEN_SOUR        = 400
 EARLY_STOP_MIN_FRAC  = 0.7              # usa early stop solo dopo il 70% dei trial
-PATIENCE_LIMIT       = 500              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
+PATIENCE_LIMIT       = 700              # tuning it on the current setup base; with 1500 trials and soft-EMA: 100 is enough
 ETA_CONSOL           = 0.01             # slow capture rate (0..1) toward current fast weights
 DA_THR_CONSOL        = 0.35             # require enough DA to consolidate into w_slow
 BETA_MIX_TEST        = 0.10             # how much fast to keep when mixing slow→test (0..1)
@@ -1151,6 +1151,16 @@ simple_gaba_gain_neg = 0.2              # GABA smorza plasticità in generale
 simple_hun_gain      = 0.2              # fame -> spinge ad imparare di più
 simple_sat_gain      = 0.05             # tra 0.1 e 0.05  # sazietà -> riduce reward
 simple_h2o_gain      = 0.1              # sete -> plasticità per gusti "acquosi" (se vuoi usarlo globale, resta neutro)
+
+# plasticità UNKNOWN
+USE_UNKNOWN_PLASTICITY = True
+UNK_GAIN_LR_POS = 0.0025                # reward positivo per veri unknown
+UNK_GAIN_LR_NEG = 0.0010                # lieve penalità se unknown attiva quando non deve
+UNK_GAIN_MIN = 0.55
+UNK_GAIN_MAX = 1.35
+UNK_GAIN_BASE = 1.00
+UNK_GAIN_BASE_STP = 0.10
+UNK_GAIN_DECAY = 0.0002                 # piccolo richiamo verso baseline
 
 # iperparametri per la EMA dell'accuracy (indipendenti da ema_perf)
 ACC_ALPHA_SHORT      = 0.20             # reattiva (pochi trial di memoria)
@@ -1438,6 +1448,8 @@ if TRAINING_PROFILE == "stable_core":
     USE_PARTIAL_REINFORCE = True
     # full DA reward on Jacc r >= 0.67
     USE_FULL_REINFORCE = True
+    # plasticità UNKNOWN
+    USE_UNKNOWN_PLASTICITY = True
 
 # calcolo quantile e media elig traces
 def stats_elig(x):
@@ -2226,6 +2238,14 @@ def epi_update(step: int) -> bool:
     
     return True
 
+# helper per gestire plasticità di UNKNOWN
+def is_unknown_trial_label(label: str) -> bool:
+    lu = label.upper()
+    return ("NULL" in lu) or ("OOD" in lu) or ("NEAR-OOD" in lu)
+
+def predicted_unknown_from_scores(scores, unknown_id):
+    return int(np.argmax(scores)) == int(unknown_id)
+
 # Individual initialization before TRAINING loop
 INDIV_ID = 42  # seed for representing different people
 profile = sample_individual(seed=INDIV_ID)
@@ -2695,11 +2715,10 @@ else:
 S.cr_gate[:] = 1.0
 
 # UNKNOWN demand gain initialization
-#S_unk.gain_unk = 0.0
 if not USE_STP:
-    S_unk.gain_unk = 0.10  # invece di 0.30
+    S_unk.gain_unk = UNK_GAIN_BASE_STP
 else:
-    S_unk.gain_unk = 1.0   # o il valore che usi ora per “normale”
+    S_unk.gain_unk = UNK_GAIN_BASE
 
 # DA, 5-HT, NE, HI, ACh, GABA neuromodulators that decay over time
 mod = b.NeuronGroup(
@@ -2896,6 +2915,10 @@ for _ in range(4*n_repeats):
     mixture_train.append(augment_mix([0, 5], amp=240, rng=rng))
     # SWEET + SOUR
     mixture_train.append(augment_mix([0, 3], amp=240, rng=rng))
+    # BITTER + FATTY
+    mixture_train.append(augment_mix([1, 5], amp=240, rng=rng))
+    # FATTY + SPICY
+    mixture_train.append(augment_mix([5, 6], amp=240, rng=rng))
 
 # alcune triple difficili in train
 for _ in range(n_repeats):
@@ -2903,10 +2926,11 @@ for _ in range(n_repeats):
     mixture_train.append(augment_mix([2, 6, 1], amp=220, rng=rng))
     mixture_train.append(augment_mix([3, 5, 1], amp=220, rng=rng))
     mixture_train.append(augment_mix([0, 3, 5], amp=220, rng=rng))
+    mixture_train.append(augment_mix([1, 5, 6], amp=220, rng=rng))
 
 # coppie asimmetriche ad alto SNR in train
 for _ in range(n_repeats):
-    for (ia, ja) in [(0,4), (1,2), (3,5), (2,6), (0,5), (0,3)]:
+    for (ia, ja) in [(0,4), (1,2), (3,5), (2,6), (0,5), (0,3), (2,5), (5,6)]:
         va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(240, 321), rng=rng)
         va = jitter_active(va, frac=0.15, rng=rng)
         va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
@@ -2915,7 +2939,7 @@ for _ in range(n_repeats):
 
 # coppie asimmetriche focalizzate
 for _ in range(n_repeats):
-    for (ia, ja) in [(0,5), (0,3), (3,5), (3,4), (5,4)]:
+    for (ia, ja) in [(0,5), (0,3), (3,5), (3,4), (5,4), (2,5), (5,6)]:
         va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(260, 321), rng=rng)
         va = jitter_active(va, frac=0.15, rng=rng)
         va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
@@ -2937,7 +2961,7 @@ for _ in range(n_repeats):  # repeat a bit but not too much or training will be 
 
 # extremely difficult couples
 for _ in range(n_repeats):
-    for (ax,bs) in [(0,4),(0,3),(2,6),(4,6),(3,5),(0,5)]:  # SWEET-UMAMI, SWEET-SOUR, SALTY-SPICY, UMAMI-SPICY
+    for (ax,bs) in [(0,4),(0,3),(2,6),(4,6),(3,5),(0,5),(2,5),(5,6)]:  # SWEET-UMAMI, SWEET-SOUR, SALTY-SPICY, UMAMI-SPICY
         va, ids, lab = make_asymmetric_pair(ax, bs, amp_hi=rng.integers(260, 321), rng=rng)
         va = jitter_active(va, frac=0.12, rng=rng)
         va = global_gain(va, lo=0.9, hi=1.15, rng=rng)
@@ -2964,13 +2988,15 @@ for _ in range(n_repeats):
     mixture_train.append(augment_mix([0,4], amp=250, rng=rng))  # SWEET+UMAMI
     mixture_train.append(augment_mix([5,6], amp=250, rng=rng))  # SPICY+FATTY
     mixture_train.append(augment_mix([0,3], amp=250, rng=rng))  # SWEET+SOUR
+    mixture_train.append(augment_mix([2,5], amp=250, rng=rng))  # SALTY+FATTY
     mixture_train.append(augment_mix([3,4], amp=250, rng=rng))  # SOUR+UMAMI
     mixture_train.append(augment_mix([3,5], amp=250, rng=rng))  # SOUR+FATTY
     mixture_train.append(augment_mix([4,5], amp=250, rng=rng))  # UMAMI+FATTY
     mixture_train.append(augment_mix([0,5], amp=250, rng=rng))  # SWEET+FATTY
+    mixture_train.append(augment_mix([1,5], amp=250, rng=rng))  # BITTER+FATTY
 
 # Coppie asimmetriche che includano sempre 2 e/o 3
-hard_pairs = [(2,3), (2,6), (3,5), (0,3), (2,4), (0,3), (0,5)]
+hard_pairs = [(2,3), (2,6), (3,5), (0,3), (2,4), (0,3), (0,5), (2,5), (5,6)]
 for _ in range(n_repeats):
     for ia, ja in hard_pairs:
         va, ids, lab = make_asymmetric_pair(ia, ja, amp_hi=rng.integers(260, 321), rng=rng)
@@ -2983,11 +3009,12 @@ HARD_MIX_DAF = 1 # how many variants per-combo
 SPICY_MIXES = [
     (0,5,6),  # SWEET+FATTY+SPICY
     (3,5,6),  # SOUR+FATTY+SPICY
-    (3,5,0),  # SWEET+FATTY+SOUR
+    (3,5,6),  # SWEET+FATTY+SPICY
     (0,4,6),  # SWEET+UMAMI+SPICY
     (1,3,6),  # BITTER+SOUR+SPICY
     (2,5,6),  # SALTY+FATTY+SPICY
     (3,4,6),  # SOUR+UMAMI+SPICY
+    (1,5,6),  # BITTER+FATTY+SPICY
 ]
 for _ in range(HARD_MIX_DAF * n_repeats):
     for (ia, ja, ka) in SPICY_MIXES:
@@ -3016,7 +3043,44 @@ def is_hard(stimulus):
 def is_triple(stimulus):
     return count_unique(stimulus) == 3
 
-# costruzione liste in maniera incrementale
+
+# costruzione liste di OOD e NULL per mischiarli al curriculum globale
+# 1.
+# a. Solo OOD diffusi
+ood_train = []
+for _ in range(max(1, n_repeats * 2)):
+    vs, ids, lab = make_ood_diffuse()
+    ood_train.append((vs, ids, lab + " (OOD-DIFFUSE)"))
+
+# b. Solo OOD many
+for _ in range(max(1, n_repeats * 2)):
+    vs, ids, lab = make_ood_many(k=rng.integers(3, 7))
+    ood_train.append((vs, ids, lab + " (OOD-MANY)"))
+    
+# 2. Solo Near-OOD
+near_ood_train = []
+for _ in range(max(1, n_repeats)):
+    vs, ids, lab = make_near_ood()
+    near_ood_train.append((vs, ids, lab + " (NEAR-OOD)"))
+    
+# 3. Solo NULL
+null_train = []
+for _ in range(max(1, n_repeats * 2)):
+    vs, ids, lab = make_null()
+    null_train.append((vs, ids, lab + " (NULL)"))
+    
+# unione di essi
+unknown_train = []
+unknown_train += null_train
+unknown_train += ood_train
+unknown_train += near_ood_train
+rng.shuffle(unknown_train)
+
+# creazione curriculum unknown
+unk_light = random.sample(unknown_train, int(0.25 * len(unknown_train)))
+unk_mid   = random.sample(unknown_train, int(0.50 * len(unknown_train)))
+
+# costruzione liste di puri in maniera incrementale
 # 0. Warmup
 train_warmup = pure_warmup.copy()
 # 1. single
@@ -3024,7 +3088,7 @@ train_1 = pure_train.copy() # niente gusti warmup nel curriculum di train
 # 2. easy pairs and single
 easy_pairs = [stimls for stimls in mixture_train
               if is_pair(stimls) and not is_hard(stimls)]
-train_2 = train_1 + easy_pairs
+train_2 = train_1 + easy_pairs + unk_light
 # 3. easy pairs, singles and triples
 triple_pairs = [stimls for stimls in mixture_train
                 if is_triple(stimls) and not is_hard(stimls)]
@@ -3032,7 +3096,7 @@ train_3 = train_2 + triple_pairs
 # 4. all together
 hard_mix = [stimls for stimls in mixture_train
             if is_hard(stimls)]
-train_4 = train_3 + hard_mix # i pure rimangono sempre anche nella fase 3
+train_4 = train_3 + hard_mix + unk_mid # i pure rimangono sempre anche nella fase 3
 # 5. final consolidation + refining
 singles = [stimls for stimls in (pure_train + mixture_train) 
            if is_single(stimls)]
@@ -3044,13 +3108,13 @@ harden = [stimls for stimls in mixture_train
 s_early = random.sample(singles, int(0.2 * len(singles))) # 20% singoli
 c_early = random.sample(couples, int(0.3 * len(couples))) # 30% coppie
 h_early = random.sample(harden, int(0.5 * len(harden))) # 50% mix complessi
-early_5 = s_early + c_early + h_early
+early_5 = s_early + c_early + h_early + unk_light
 rng.shuffle(early_5)
 # b. Late
 s_late = random.sample(singles, int(0.45 * len(singles))) # 20% singoli
 c_late = random.sample(couples, int(0.45 * len(couples))) # 30% coppie
 h_late = random.sample(harden, int(0.1 * len(harden))) # 50% mix complessi
-late_5 = s_late + c_late + h_late
+late_5 = s_late + c_late + h_late + unk_light
 rng.shuffle(late_5)
 
 train_5 = early_5 + late_5
@@ -5048,6 +5112,33 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     hi = np.maximum(hi, lo + eps_thr)
     taste_neurons.thr_hi[:] = hi
     
+    # USE UNKNOWN PLASTICITY == True e plasticità del neurone UNKNOWN attiva
+    if PLASTIC_PHASE and USE_UNKNOWN_PLASTICITY:
+        # piccolo decay verso baseline per evitare deriva
+        g = float(S_unk.gain_unk[0])
+        g += UNK_GAIN_DECAY * (UNK_GAIN_BASE - g)
+
+        true_is_unknown = is_unknown_trial_label(label)
+        pred_is_unknown = predicted_unknown_from_scores(scores, unknown_id)
+
+        # reward: trial unknown correttamente rigettato
+        if true_is_unknown and pred_is_unknown:
+            g += UNK_GAIN_LR_POS
+
+        # penalità: known rigettato come unknown
+        elif (not true_is_unknown) and pred_is_unknown:
+            g -= UNK_GAIN_LR_NEG
+
+        # se unknown trial ma non rigettato, alzo appena appena
+        elif true_is_unknown and (not pred_is_unknown):
+            g += 0.5 * UNK_GAIN_LR_POS
+
+        S_unk.gain_unk = np.clip(g, UNK_GAIN_MIN, UNK_GAIN_MAX)
+        
+        if verbose_rewards:
+            print(f"\n[UNKNOWN PLASTICITY] → gain={g:.4f} at trial {step}")
+
+    
     # EARLY STOPPING tracking & bio-like stagnation plateau handling to avoid overfitting and optimize training duration
     if ema_perf > (best_score + IMPROVE_EPS):
         best_step  = step
@@ -6857,15 +6948,56 @@ for p in range(unknown_id):
 print("\nEnded TEST phase successfully!")
 
 # 13. Plots
-# a) Spikes over time
-plt.figure(figsize=(10,4))
-plt.plot(spike_mon.t/b.ms, spike_mon.i, '.k')
+# a) Spikes over time -> total count binning
+'''bin_ms = 200
+t_ms = np.asarray(spike_mon.t / b.ms)
+i_spk = np.asarray(spike_mon.i)
+
+bins = np.arange(0, t_ms[-1] + bin_ms, bin_ms)
+bin_centers = 0.5 * (bins[:-1] + bins[1:])
+
+plt.figure(figsize=(12, 5))
+
+for cs in range(num_tastes):
+    lo = cs * NEURONS_PER_TASTE
+    hi = (cs + 1) * NEURONS_PER_TASTE
+    cmask = (i_spk >= lo) & (i_spk < hi)
+    counts, _ = np.histogram(t_ms[cmask], bins=bins)
+    plt.plot(bin_centers, counts, label=taste_map[cs])
+
+plt.xlabel("Time (ms)")
+plt.ylabel(f"Spike count / {bin_ms} ms")
+plt.title("Population spike counts over time")
+plt.legend(ncol=4, fontsize=8)
+plt.tight_layout()
+plt.show()'''
+
+# a1) Spikes over time per-class
+# raster colorato per popolazione/classe
+window_ms = 20000
+t_ms = np.asarray(spike_mon.t / b.ms)
+i_spk = np.asarray(spike_mon.i)
+
+mask = t_ms >= (t_ms[-1] - window_ms)
+t_sel = t_ms[mask]
+i_sel = i_spk[mask]
+
+plt.figure(figsize=(12, 5))
+
+for cs in range(num_tastes):
+    lo = cs * NEURONS_PER_TASTE
+    hi = (cs + 1) * NEURONS_PER_TASTE
+    cmask = (i_sel >= lo) & (i_sel < hi)
+    plt.scatter(t_sel[cmask], i_sel[cmask], s=5, alpha=0.55, label=taste_map[cs])
+
 plt.xlabel("Time (ms)")
 plt.ylabel("Neuron index")
-plt.title("Taste neurons spikes")
+plt.title(f"Spike raster by class (last {window_ms:.0f} ms)")
+plt.legend(ncol=4, fontsize=8)
+plt.tight_layout()
 plt.show()
 
-# b) Weight trajectories for diagonal synapses (i�i)
+# b) Weight trajectories for diagonal synapses (i->i)
 plt.figure(figsize=(14,6))
 wm, syn = weight_monitors[0]  # monitor + associated synapse object
 has_labels = False  # track if we actually added any visible label
