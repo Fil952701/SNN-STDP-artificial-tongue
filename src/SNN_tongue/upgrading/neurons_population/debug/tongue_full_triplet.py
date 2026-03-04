@@ -513,6 +513,10 @@ def taste_slice(tx):
     start = tx * NEURONS_PER_TASTE
     return slice(start, start + NEURONS_PER_TASTE)
 
+#########################################################
+# PACCHETTO DI FUNZIONI PER GESTIRE UNKNOWN -> OOD/NULL
+#########################################################
+
 # True se ja ricade nella popolazione UNKNOWN
 def is_unknown_output_index(ja):
     sl = taste_slice(unknown_id)
@@ -540,9 +544,93 @@ def set_unknown_gate(pmr, gap, H, PMR_thr, gap_thr, H_thr):
     # se c'è craving alto ma evidenza debole -> preferisci UNKNOWN, evita “wishful thinking”
     if ENABLE_DESIRE == True and ((max(crave_f[:unknown_id]) > 0.80 or max(crave_s[:unknown_id]) > 0.80) and (pmr < PMR_thr or gap < gap_thr)):
         S_unk.gain_unk = max(float(S_unk.gain_unk), 1.30)
+        
+# funzione per determinare plasticità UNKNOWN a seconda del curriculum phase
+def get_unknown_phase_scale(curr_phase: int) -> float:
+    if curr_phase <= 1:
+        return 0.0
+    elif curr_phase == 2:
+        return 0.50
+    elif curr_phase == 3:
+        return 0.75
+    elif curr_phase == 4:
+        return 1.00
+    elif curr_phase == 5:
+        return 0.50
+    else:
+        return 0.0   # cooldown finale o fasi fuori range
+    
+
+# funzione per "contaminare" mix di gusti con UNKNOWN
+# background di rumore NULL a stimolo noto senza cambiarne la label effettiva
+def contaminate_null(base_vec, rng=None, strength=(0.25, 0.60)):
+    if rng is None:
+        rng = np.random.default_rng()
+        
+    stimulus = np.array(base_vec, dtype=float).copy()
+    
+    # generatore di NULL
+    null_vec, _, _ = make_null()
+    null_vec = np.array(null_vec, dtype=float)
+    
+    # coefficiente di intensità NULL
+    alpha = float(rng.uniform(*strength))
+    # costruzione degli stimoli con NULL integrato
+    stimulus = stimulus + alpha * null_vec
+    stimulus = np.clip(stimulus, 0.0, None)
+    
+    return stimulus
+
+# medesima cosa con i near-OOD ma a intensità minore
+def contaminate_near_ood(base_vec, rng=None, strength=(0.15, 0.40)):
+    if rng is None:
+        rng = np.random.default_rng()
+        
+    stimulus = np.array(base_vec, dtype=float)
+    
+    # generatore di near-OOD e codifica numpy
+    near_vec, _, _ = make_near_ood()
+    near_vec = np.array(near_vec, dtype=float)
+    
+    alpha = float(rng.uniform(*strength))
+    
+    # costruzione degli stimoli con near-ood integrato
+    stimulus = stimulus + alpha * near_vec
+    stimulus = np.clip(stimulus, 0.0, None)
+    
+    return stimulus
+
+# wrapper che gestisce il preserving di ids e label
+def wrapper_known(stimulus, mode="null", rng=None, tag=""):
+    
+    if rng is None:
+        rng = np.random.default_rng()
+        
+    # costruzione dello stimolo
+    vec, ids, lab = stimulus
+    vec = np.array(vec, dtype=float)
+    
+    # switcher che gestisce i vari nodi di decisione: se è NULL, NEAR-OOD ecc.
+    if mode == "null":
+        out = contaminate_null(vec, rng=rng)
+        suffix = " (known+NULL)"
+    elif mode == "near_ood":
+        out = contaminate_near_ood(vec, rng=rng)
+        suffix = " (known+NEAR-OOD)"
+    else:
+        raise ValueError("Must to be NULL or NEAR-OOD")
+    
+    if tag:
+        suffix = f" {tag}"
+        
+    return (out, ids, lab + suffix)
+
+
+#########################################################
     
 # collapse all the population to its relevant taste to reward it
 def population_scores_from_counts(counts):
+    
     # counts: lunghezza TOTAL_OUT (per-neurone)
     if NEURONS_PER_TASTE == 1:
         return counts.astype(float)
@@ -2241,7 +2329,7 @@ def epi_update(step: int) -> bool:
 # helper per gestire plasticità di UNKNOWN
 def is_unknown_trial_label(label: str) -> bool:
     lu = label.upper()
-    return ("NULL" in lu) or ("OOD" in lu) or ("NEAR-OOD" in lu)
+    return ("NULL" in lu) or ("OOD-MANY" in lu) or ("NEAR-OOD" in lu) or ("OOD-DIFFUSE")
 
 def predicted_unknown_from_scores(scores, unknown_id):
     return int(np.argmax(scores)) == int(unknown_id)
@@ -2856,7 +2944,7 @@ for _ in range(n_repeats):
             
 for _ in range(n_repeats):
     for taste_id in range(unknown_id):
-        if taste_id in (sweet_id, fatty_id, salty_id) and np.random.rand() < 0.35:
+        if taste_id in (sweet_id, fatty_id, salty_id, sour_id) and np.random.rand() < 0.35:
             vs, ids, lab = noisy_mix([taste_id], amp=np.random.randint(220, 301))
             pure_train.append((vs, ids, lab + " (single) (noisy)"))
 
@@ -2919,6 +3007,9 @@ for _ in range(4*n_repeats):
     mixture_train.append(augment_mix([1, 5], amp=240, rng=rng))
     # FATTY + SPICY
     mixture_train.append(augment_mix([5, 6], amp=240, rng=rng))
+    # SWEET + BITTER
+    mixture_train.append(augment_mix([0, 1], amp=240, rng=rng))
+
 
 # alcune triple difficili in train
 for _ in range(n_repeats):
@@ -2927,6 +3018,8 @@ for _ in range(n_repeats):
     mixture_train.append(augment_mix([3, 5, 1], amp=220, rng=rng))
     mixture_train.append(augment_mix([0, 3, 5], amp=220, rng=rng))
     mixture_train.append(augment_mix([1, 5, 6], amp=220, rng=rng))
+    mixture_train.append(augment_mix([0, 1, 3], amp=220, rng=rng))
+
 
 # coppie asimmetriche ad alto SNR in train
 for _ in range(n_repeats):
@@ -3080,23 +3173,93 @@ rng.shuffle(unknown_train)
 unk_light = random.sample(unknown_train, int(0.25 * len(unknown_train)))
 unk_mid   = random.sample(unknown_train, int(0.50 * len(unknown_train)))
 
+# 4. CONTAMINATED KNOWN TRAIN
+known_cont_train = []
+
+# percentuali sane
+P_NULL_CONT_SINGLE = 0.18
+P_NULL_CONT_MIX    = 0.15
+P_NEAR_CONT_SINGLE = 0.07
+P_NEAR_CONT_MIX    = 0.06
+
+# a. contaminated singles
+for stim in pure_train:
+    # NULL
+    if rng.random() < P_NULL_CONT_SINGLE:
+        known_cont_train.append(
+            wrapper_known(stim, mode="null", rng=rng, tag="(train)")
+        )
+    # NEAR-OOD
+    if rng.random() < P_NEAR_CONT_SINGLE:
+        known_cont_train.append(
+            wrapper_known(stim, mode="near_ood", rng=rng, tag="(train)")
+        )
+
+# b. contaminated mixes
+for stim in mixture_train:
+    k = count_unique(stim) # quanti gusti ci sono in tale mix
+
+    # meglio concentrarsi su coppie/triple, meno su mix enormi
+    if k in (2, 3):
+        # NULL
+        if rng.random() < P_NULL_CONT_MIX:
+            known_cont_train.append(
+                wrapper_known(stim, mode="null", rng=rng, tag="(train)")
+            )
+        # NEAR-OOD
+        if rng.random() < P_NEAR_CONT_MIX:
+            known_cont_train.append(
+                wrapper_known(stim, mode="near_ood", rng=rng, tag="(train)")
+            )
+            
+# contaminati leggeri per fase 2
+known_cont_light = [
+    stim for stim in known_cont_train
+    if ("known+NULL" in stim[2]) and (count_unique(stim) <= 2)
+]
+
+# contaminati medi per fase 3
+known_cont_mid = [
+    stim for stim in known_cont_train
+    if (count_unique(stim) <= 3)
+]
+
+# contaminati completi per fase 4-5
+known_cont_full = known_cont_train.copy()
+
+# per il refining pochissimi esempi
+cont_early = random.sample(
+    known_cont_full,
+    min(len(known_cont_full), int(0.10 * len(known_cont_full)))
+)
+
+# shuffling
+rng.shuffle(known_cont_light)
+rng.shuffle(known_cont_mid)
+rng.shuffle(known_cont_full)
+
 # costruzione liste di puri in maniera incrementale
 # 0. Warmup
 train_warmup = pure_warmup.copy()
+
 # 1. single
 train_1 = pure_train.copy() # niente gusti warmup nel curriculum di train
+
 # 2. easy pairs and single
 easy_pairs = [stimls for stimls in mixture_train
               if is_pair(stimls) and not is_hard(stimls)]
-train_2 = train_1 + easy_pairs + unk_light
+train_2 = train_1 + easy_pairs + unk_light + known_cont_light
+
 # 3. easy pairs, singles and triples
 triple_pairs = [stimls for stimls in mixture_train
                 if is_triple(stimls) and not is_hard(stimls)]
-train_3 = train_2 + triple_pairs
+train_3 = train_2 + triple_pairs + known_cont_mid
+
 # 4. all together
 hard_mix = [stimls for stimls in mixture_train
             if is_hard(stimls)]
-train_4 = train_3 + hard_mix + unk_mid # i pure rimangono sempre anche nella fase 3
+train_4 = train_3 + hard_mix + unk_mid + known_cont_full # i pure rimangono sempre anche nella fase 3
+
 # 5. final consolidation + refining
 singles = [stimls for stimls in (pure_train + mixture_train) 
            if is_single(stimls)]
@@ -3104,12 +3267,14 @@ couples = [stimls for stimls in mixture_train
            if is_pair(stimls)]
 harden = [stimls for stimls in mixture_train
            if is_hard(stimls)]
+
 # a. Early
 s_early = random.sample(singles, int(0.2 * len(singles))) # 20% singoli
 c_early = random.sample(couples, int(0.3 * len(couples))) # 30% coppie
 h_early = random.sample(harden, int(0.5 * len(harden))) # 50% mix complessi
 early_5 = s_early + c_early + h_early + unk_light
 rng.shuffle(early_5)
+
 # b. Late
 s_late = random.sample(singles, int(0.45 * len(singles))) # 20% singoli
 c_late = random.sample(couples, int(0.45 * len(couples))) # 30% coppie
@@ -3117,7 +3282,8 @@ h_late = random.sample(harden, int(0.1 * len(harden))) # 50% mix complessi
 late_5 = s_late + c_late + h_late + unk_light
 rng.shuffle(late_5)
 
-train_5 = early_5 + late_5
+# c. totale
+train_5 = early_5 + late_5 + cont_early
 
 # 5. Final cooldown
 train_6 = pure_train.copy()
@@ -3408,16 +3574,16 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
             print("\n[CURRICULUM] → FASE 1 (singoli)\n")
         if curr_phase == 1 and step_phase1 == phase1_max_steps:
             curr_phase = 2
-            print("\n[CURRICULUM] → FASE 2 (singoli + coppie)\n")
+            print("\n[CURRICULUM] → FASE 2 (singoli + coppie + OOD/NULL)\n")
         if curr_phase == 2 and step_phase2 == phase2_max_steps:
             curr_phase = 3
-            print("\n[CURRICULUM] → FASE 3 (singoli + coppie + triple)\n")
+            print("\n[CURRICULUM] → FASE 3 (singoli + coppie + triple + OOD/NULL)\n")
         if curr_phase == 3 and step_phase3 == phase3_max_steps:
             curr_phase = 4
-            print("\n[CURRICULUM] → FASE 4 (mix heavy + HARD_MIXES)\n")
+            print("\n[CURRICULUM] → FASE 4 (mix heavy + HARD_MIXES + OOD/NULL)\n")
         if curr_phase == 4 and step_phase4 == phase4_max_steps:
             curr_phase = 5
-            print("\n[CURRICULUM] → FASE 5 (refining)\n")
+            print("\n[CURRICULUM] → FASE 5 (refining + OOD/NULL)\n")
         if curr_phase == 5 and step_phase5 == phase5_max_steps:
             curr_phase = 6
             print("\n[CURRICULUM] → FASE 6 (cooldown)\n")
@@ -5113,31 +5279,39 @@ for step in range(1, TOTAL_TRAIN_STEPS + 1):
     taste_neurons.thr_hi[:] = hi
     
     # USE UNKNOWN PLASTICITY == True e plasticità del neurone UNKNOWN attiva
-    if PLASTIC_PHASE and USE_UNKNOWN_PLASTICITY:
-        # piccolo decay verso baseline per evitare deriva
-        g = float(S_unk.gain_unk[0])
-        g += UNK_GAIN_DECAY * (UNK_GAIN_BASE - g)
+    # scalo gradualmente la plasticità di UNKNOWN in base alle fasi
+    phase_scale = get_unknown_phase_scale(curr_phase)
+    # applicazione effettiva
+    if PLASTIC_PHASE and USE_UNKNOWN_PLASTICITY and (phase_scale > 0.0):
+        g = float(np.mean(S_unk.gain_unk[:]))
+
+        # piccolo decay verso baseline
+        g += phase_scale * UNK_GAIN_DECAY * (UNK_GAIN_BASE - g)
 
         true_is_unknown = is_unknown_trial_label(label)
         pred_is_unknown = predicted_unknown_from_scores(scores, unknown_id)
 
-        # reward: trial unknown correttamente rigettato
+        # reward: unknown correttamente rigettato
         if true_is_unknown and pred_is_unknown:
-            g += UNK_GAIN_LR_POS
+            g += phase_scale * UNK_GAIN_LR_POS
 
-        # penalità: known rigettato come unknown
+        # penalty: known rigettato come unknown
         elif (not true_is_unknown) and pred_is_unknown:
-            g -= UNK_GAIN_LR_NEG
+            g -= phase_scale * UNK_GAIN_LR_NEG
 
-        # se unknown trial ma non rigettato, alzo appena appena
+        # unknown vero ma non rigettato: correzione più delicata
         elif true_is_unknown and (not pred_is_unknown):
-            g += 0.5 * UNK_GAIN_LR_POS
+            g += phase_scale * (0.25 * UNK_GAIN_LR_POS)
 
-        S_unk.gain_unk = np.clip(g, UNK_GAIN_MIN, UNK_GAIN_MAX)
-        
+        g = float(np.clip(g, UNK_GAIN_MIN, UNK_GAIN_MAX))
+        S_unk.gain_unk[:] = g
+
         if verbose_rewards:
-            print(f"\n[UNKNOWN PLASTICITY] → gain={g:.4f} at trial {step}")
-
+            print(
+                f"\n[UNKNOWN GATE PLASTICITY] "
+                f"phase={curr_phase} scale={phase_scale:.2f} "
+                f"gain={g:.4f} at trial {step}\n"
+            )
     
     # EARLY STOPPING tracking & bio-like stagnation plateau handling to avoid overfitting and optimize training duration
     if ema_perf > (best_score + IMPROVE_EPS):
@@ -5719,6 +5893,8 @@ taste_neurons.ge[:] = 0 * b.nS
 taste_neurons.gi[:] = 0 * b.nS
 taste_neurons.s[:]  = 0
 taste_neurons.wfast[:] = 0 * b.mV
+
+THR_KNOWN_THRESHOLD = 0.78 # portare a 0.82 se troppo permissivo, portare a 0.74 se troppo rigido
 # Intrinsic homeostasis frozen
 taste_neurons.homeo_on = 0.0 # disable homeostasis
 # STDP OFF / clamp theta con unità coerenti (mV)
@@ -5838,25 +6014,56 @@ print("Scaled per-class thresholds:",
       {taste_map[idxs]: int(thr_per_class_test[idxs]) for idxs in range(num_tastes-1)})
 recovery_between_trials = 100 * b.ms  # refractory recovery
 
-# Per-class: final threshold = max(train-scaled, OOD-quantile, floor EMA)
-for idx in range(num_tastes-1):
-    # floor dal negativo EMA sul window di test
-    neg_mu  = float(ema_neg_m1[idx]) * float(test_duration/training_duration)
-    neg_sd  = float(ema_sd(ema_neg_m1[idx], ema_neg_m2[idx])) * float(test_duration/training_duration)
-    thr_ema_test = neg_mu + k_sigma * neg_sd
+# ============================================================
+# Dual thresholds for TEST:
+# - thr_known_test  -> per accettare classi note
+# - thr_reject_test -> per difendersi da OOD / NULL
+# ============================================================
 
-    # always growing up -> not tearing down
-    thr_per_class_test[idx] = max(
-        float(thr_per_class_test[idx]),  # train-scaled
-        float(thr_ema_test)              # EMA neg sul window di test
+# base KNOWN = solo train puro scalato nel tempo, NON la soglia già calibrata OOD
+train_thr_known_base = np.array(thr_per_class_train[:unknown_id], dtype=float) * float(test_duration / training_duration)
+
+# base REJECT = quella prudente già calibrata
+train_thr_reject_base = np.array(thr_per_class_test[:unknown_id], dtype=float)
+
+thr_known_test  = np.zeros(unknown_id, dtype=float)
+thr_reject_test = np.zeros(unknown_id, dtype=float)
+
+for idx in range(unknown_id):
+    dur_scale_local = float(test_duration / training_duration)
+
+    pos_mu = float(ema_pos_m1[idx]) * dur_scale_local
+    pos_sd = float(ema_sd(ema_pos_m1[idx], ema_pos_m2[idx])) * dur_scale_local
+
+    neg_mu = float(ema_neg_m1[idx]) * dur_scale_local
+    neg_sd = float(ema_sd(ema_neg_m1[idx], ema_neg_m2[idx])) * dur_scale_local
+    ema_neg_floor = neg_mu + k_sigma * neg_sd
+
+    ood_floor = float(ood_q[idx]) if np.ndim(ood_q) > 0 else float(ood_q)
+
+    # più permissiva: serve a promuovere known
+    thr_known_test[idx] = max(
+        0.72 * train_thr_known_base[idx],
+        0.42 * max(1.0, pos_mu),
+        float(min_spikes_for_known_test)
     )
 
-# minimum clamp = min_spikes_for_known_test
-thr_per_class_test[:unknown_id] = np.maximum(thr_per_class_test[:unknown_id],
-                                             float(min_spikes_for_known_test))
+    # non farla superare una frazione troppo alta del positivo atteso
+    thr_known_cap = max(float(min_spikes_for_known_test), 0.62 * max(1.0, pos_mu) + 0.15 * pos_sd)
+    thr_known_test[idx] = min(thr_known_test[idx], thr_known_cap)
 
-print("[DBG] Final test thresholds per-class:", {taste_map[isa]: float(thr_per_class_test[isa]) for isa in range(unknown_id)})
+    # più severa: serve a rigettare OOD
+    thr_reject_test[idx] = max(
+        train_thr_reject_base[idx],
+        ood_floor,
+        ema_neg_floor,
+        float(min_spikes_for_known_test)
+    )
 
+print("[DBG] thr_known_test:",  {taste_map[isa]: round(float(thr_known_test[isa]), 2)  for isa in range(unknown_id)})
+print("[DBG] thr_reject_test:", {taste_map[isa]: round(float(thr_reject_test[isa]), 2) for isa in range(unknown_id)})
+
+# inizializzazione dati per test
 exact_hits = 0
 total_test = len(test_stimuli)
 n_known = unknown_id                     
@@ -5984,8 +6191,9 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     scores = population_scores_from_counts(diff_counts) # neurons population management
     scores[unknown_id] = -1e9
     mx = scores.max()
-    # base: soglia di rifiuto per-classe
-    fp_gate_test = thr_per_class_test[:unknown_id].astype(float)  
+    
+    # soglia usata per considerare forte un falso positivo su OOD/NULL -> UNKNOWN rejection
+    fp_gate_test = thr_reject_test.astype(float)
 
     all_scores.append(scores[:unknown_id].astype(float))
     tgt = np.zeros(num_tastes-1, dtype=int)
@@ -6030,7 +6238,13 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # EARLY REJECT: niente attività nota → UNKNOWN e chiudi il trial subito
     global_min_E = max(4.0, 0.8 * float(min_spikes_for_known_test))   # 3 o ~60% del minimo per classe
-    if E_local < global_min_E:
+    # se è un noto debole ma con top credibile non viene buttato via subito
+    if (
+        E_local < 0.75 * global_min_E and
+        PMR < 0.85 * PMR_thr and
+        gap < 0.75 * gap_thr and
+        H > 1.00 * H_thr
+    ):
         winners = [unknown_id]
         # debug minimale coerente coi tuoi log
         print(f"[DBG] early-reject: E={E_local:.1f}, top={top:.1f} < min_known={min_spikes_for_known_test}")
@@ -6169,28 +6383,36 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         if (k_active in (2, 3)) and (mix_pmr_lo <= PMR <= mix_pmr_hi):
             frac_pos = max(0.34, frac_pos - 0.06)
 
+    # se il pattern è strutturato -> uso known acceptance
     if not is_diffuse:
-        thr_eff = np.minimum(thr_per_class_test[:unknown_id], frac_pos * pos_exp_blend)
+        # per accettare i noti uso la soglia permissiva
+        thr_eff = np.minimum(thr_known_test, frac_pos * pos_exp_blend)
         thr_eff = np.maximum(
             thr_eff,
             np.maximum(float(mix_min_abs), dyn_abs_min_frac * np.maximum(pos_expect_test, 1.0))
         )
-    else:
-        thr_eff = np.maximum(thr_per_class_test[:unknown_id], float(mix_min_abs))
-    
+    else: # altrimenti uso rejection defense
+        # in diffuso resto più prudente
+        thr_eff = np.maximum(thr_reject_test, float(mix_min_abs))
+        
     # Guardie z in funzione dello stato (base/mix/diffuse)
     z_min_guards = (z_min_mix if (is_mixture_like and not is_diffuse) else z_min_base) if (not is_diffuse) else 0.20
 
-    top_pass_strict = (
-        (scores[top_idx] >= 0.95 * thr_per_class_test[top_idx]) and
-        (z[top_idx]     >= z_min_guards) and
-        (gap            >= 0.95 * gap_thr)
-    )   
-    
-    # ABSOLUTE-PASS HARD GUARD
-    # z-guard aggiuntiva: per promuovere una classe singola, vogliamo anche z_top ≥ 1.0
-    z_top_min = 1.0
-    top_pass_strict = top_pass_strict and (z[top_idx] >= z_top_min)
+    # uso soglie acceptance
+    is_single_like = (k_est <= 1) and (not is_mixture_like)
+
+    if is_single_like:
+        top_pass_strict = (
+            (scores[top_idx] >= 0.72 * thr_known_test[top_idx]) and
+            (z[top_idx]     >= 0.08) and
+            (PMR            >= 0.78 * PMR_thr)
+        )
+    else:
+        top_pass_strict = (
+            (scores[top_idx] >= 0.85 * thr_known_test[top_idx]) and
+            (z[top_idx]     >= z_min_guards) and
+            (gap            >= 0.70 * gap_thr)
+        )
 
     # Se il top NON passa il controllo assoluto, NON promuovere nulla.
     # Se NON è "mixture-like", chiudi subito il trial in UNKNOWN.
@@ -6246,49 +6468,22 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         z_top1 = float(z[top_idx])
 
         # soglia z un po' più alta rispetto a z_min_base (0.12–0.15)
-        z_min_single = 0.15
+        z_min_single = 0.10
         # eventuali guardie extra su separazione / PMR per sicurezza
-        sep_ok  = (gap >= 0.55 * gap_thr)
-        pmr_ok  = (PMR >= 0.90 * PMR_thr)
+        sep_ok  = (gap >= 0.45 * gap_thr)
+        pmr_ok  = (PMR >= 0.85 * PMR_thr)
 
-        # soglia assoluta per i singoli: usa thr_eff ma non più bassa di ~80% del thr di training
-        if top_idx == spicy_id:
-            thr_single = float(max(
-                1.02 * thr_eff[top_idx],
-                0.92 * thr_per_class_test[top_idx],
-                z_min_single * pos_expect_test[top_idx]
-            ))
-            use_sep_ok = sep_ok and pmr_ok
-        elif top_idx in (umami_id, fatty_id):
-            thr_single = max(
-                0.84 * thr_eff[top_idx],
-                0.76 * thr_per_class_test[top_idx],
-                z_min_single * pos_expect_test[top_idx]
-            )
-        elif top_idx == sweet_id:
-            thr_single = max(
-                0.86 * thr_eff[top_idx],
-                0.78 * thr_per_class_test[top_idx],
-                z_min_single * pos_expect_test[top_idx]
-            )
-        # ulteriore rilassamento se il top non è SPICY per prova
-        else:
-            thr_single = max(
-                0.88 * thr_eff[top_idx],
-                0.78 * thr_per_class_test[top_idx],
-                z_min_single * pos_expect_test[top_idx]  # opzionale: guardia in z-assoluto
-            )
-            use_sep_ok = sep_ok and pmr_ok
-        # to relax a bit the first one winner in case it is pure but it is confused as noise
-        totally_clean = (scores[top_idx] >= 1.00 * thr_single) and (z_top1 >= 1.2 * z_min_single)
-        
-        if totally_clean:
+        # rilassamento soglia per i gusti noti con acceptance
+        thr_single = max(
+            0.78 * thr_eff[top_idx],
+            0.72 * thr_known_test[top_idx],
+            z_min_single * pos_expect_test[top_idx]
+        )
+         
+        if (scores[top_idx] >= thr_single) and (z_top1 >= z_min_single) and sep_ok and pmr_ok:
             winners = [top_idx]
         else:
-            if (scores[top_idx] >= thr_single) and (z_top1 >= z_min_single) and use_sep_ok:
-                winners = [top_idx]
-            else:
-                winners = [unknown_id]
+            winners = [unknown_id]
 
         # chiudiamo qui il trial (come negli altri early-return)
         expected  = [taste_map[idxs] for idxs in true_ids]
@@ -6312,6 +6507,7 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
 
     # B) mixture shortcut (non diffuso)
     top_known = (scores[top_idx] >= thr_eff[top_idx]) and (sep >= gap_thr)
+    
     if top_known and (not is_diffuse) and is_mixture_like:
         # riusa second_idx se utile
         mixture_shortcut = []
@@ -6382,12 +6578,12 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
         unsup_labels = []
         unsup_log = None
         may_allow_k5 = (is_mixture_like and ((gap >= 1.00*gap_thr) or (PMR >= 1.10*PMR_thr)))
-        abs_floor_vec = np.maximum(0.22*pos_expect_test, 0.18*cop_expect_test)
-        # for everyone
-        abs_floor_strict = np.maximum(ood_q, abs_floor_vec)
-        # for weak mixes
-        abs_floor_lite   = np.maximum(0.50*ood_q, 0.70*abs_floor_vec)
-    
+        abs_floor_vec = np.maximum(0.22 * thr_known_test, 0.18 * cop_expect_test)
+        # for everyone meno della reject
+        abs_floor_strict = np.maximum(thr_reject_test, abs_floor_vec)
+        # for weak mixes più permissiva ma non troppo
+        abs_floor_lite = np.maximum(0.65 * thr_known_test, 0.70 * abs_floor_vec) 
+   
         # log monitor for NNLS
         def why_skipped():
             reasons = []
@@ -6515,18 +6711,14 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     (scores[top_idx] < max(min_spikes_for_known_test, 0.6*thr_eff[top_idx])) and \
     (E_local < 0.45 * np.maximum(1.0, pos_expect_test.sum())):
         winners = [unknown_id]
-
-    # F) Fallback finale (niente argsort, niente tie-bias)
-    if len(winners) == 0:
-        winners = [top_idx] if (scores[top_idx] >= min_spikes_for_known_test) else [unknown_id]
-
-    # G) Cap finale su k
+       
+    # F) Cap finale su k
     if len(winners) > k_cap:
         rest = [isa for isa in winners if isa != top_idx]
         rest.sort(key=lambda ia: scores[ia], reverse=True)
         winners = [top_idx] + rest[:max(0, k_cap-1)]
 
-    # H) Veto rapido NNLS su tanti attivi diffusi
+    # G) Veto rapido NNLS su tanti attivi diffusi
     if k_est != 1 and NNLS_ACTIVE:
         nnls_k = len(winners) if (did_unsup_relabel and winners and winners[0] != unknown_id) else 0
         
@@ -6575,28 +6767,35 @@ for step, (rates_vec, true_ids, label) in enumerate(test_stimuli, start=1):
     if is_spicy_present and drv_now > thr_now:
         mod.HT[:] += 0.1
         
-    # I) Veto FP in non-mix: se c’è un solo gusto davvero forte, fai WTA
+    # H) Veto FP in non-mix: se c’è un solo gusto davvero forte, fai WTA
     if (not is_mixture_like) and len(winners) > 1:
         cleaned = []
 
         for idx in winners:
-            # se supera la soglia TP, è un candidato “vero forte”
-            if scores[idx] >= tp_gate[idx]:
+            if scores[idx] >= thr_known_test[idx]:
                 cleaned.append(idx)
-            # se è sotto sia TP che FP, è un co-winner debole: lo butto
-            elif scores[idx] < fp_gate[idx]:
+            elif scores[idx] < 0.85 * thr_reject_test[idx]:
                 continue
             else:
-                # zona grigia: tiene il comportamento attuale
                 cleaned.append(idx)
 
-        # se dopo il filtro c’è un singolo forte => WTA
         if len(cleaned) == 1:
             winners = cleaned
-    
-    # L) Veto finale rifiuto UNKNOWN
-    if float(np.max(scores[:unknown_id])) < float(min_spikes_for_known_test):
-        winners = [unknown_id]
+            
+    # I) veto finale solo se davvero non c'è evidenza known
+    '''if (
+        float(scores[top_idx]) < float(0.65 * thr_known_test[top_idx]) and
+        PMR < PMR_thr and
+        H > H_thr
+    ):
+        winners = [unknown_id]'''
+        
+    # I) Fallback finale (niente argsort, niente tie-bias)
+    if len(winners) == 0:
+        if scores[top_idx] >= 0.72 * thr_known_test[top_idx]:
+            winners = [top_idx]
+        else:
+            winners = [unknown_id]
 
     # debug prints
     if verbose_rewards:
